@@ -8,17 +8,27 @@ untouched.
 
 ## Scope
 
-Two independently shippable pieces:
+Two independently shippable pieces, plus a phasing note on backends:
 
 1. `mcp-servers/local-coder/` — a new, source-controlled FastMCP server that
-   wraps pluggable coding-agent backends (Aider now; Codex/Gemini/OpenRouter
-   stubbed) behind three MCP tools: `delegate_implementation`, `configure`,
-   and `list_available_models`.
+   wraps pluggable coding-agent backends behind three MCP tools:
+   `delegate_implementation`, `configure`, and `list_available_models`.
 2. A modification to `skills/subagent-driven-development/` so its per-task
    implementer subagent calls local-coder instead of editing files itself,
    with the subagent's tool access structurally restricted at the harness
    level (a new `.claude/agents/local-coder-implementer.md` definition), not
    just instructed via prompt.
+
+**Backend phasing:** Aider is implemented in this phase (Phase 1) — it's
+the only backend this design is initially built and smoke-tested against.
+Codex and Gemini are fully designed in this spec (concrete CLI invocation,
+auth, change-detection, and failure handling — see "Codex and Gemini
+backends" below) but implemented in a later phase; until then, `CodexBackend`
+and `GeminiBackend` are stubs raising `NotImplementedError`, same as
+`OpenRouterBackend` (which is not designed in this pass at all). Designing
+Codex/Gemini now, even though they ship later, is what surfaced the
+`self_commits` distinction in the adapter interface below — without it, the
+interface built from aider alone would not actually generalize to them.
 
 Out of scope: `brainstorming`, `writing-plans`, `requesting-code-review`,
 `executing-plans` (the parallel-session alternative flow), and the review
@@ -35,11 +45,14 @@ mcp-servers/local-coder/
   ollama.py              # `ollama list` wrapper shared by configure + list_available_models
   config.yaml            # default config (checked in)
   backends/
-    base.py              # BackendAdapter ABC + CompletionResult dataclass
-    aider.py              # real adapter
-    codex.py               # stub, NotImplementedError
-    gemini.py               # stub, NotImplementedError
-    openrouter.py            # stub, NotImplementedError
+    base.py              # BackendAdapter ABC, CompletionResult, self_commits flag
+    common.py             # shared branch setup + idle/stall monitoring, used by every backend
+    aider.py               # real adapter (Phase 1), self_commits=True
+    codex.py                # stub in Phase 1 (NotImplementedError); designed, not yet built —
+                             # see "Codex and Gemini backends"; self_commits=False when built
+    gemini.py                # stub in Phase 1 (NotImplementedError); designed, not yet built —
+                              # see "Codex and Gemini backends"; self_commits=False when built
+    openrouter.py             # stub, NotImplementedError; not designed this round
   README.md
 ```
 
@@ -70,6 +83,10 @@ class CompletionResult:
     error: str | None = None
 
 class BackendAdapter(ABC):
+    self_commits: bool  # True: backend's own subprocess creates commits (aider).
+                         # False: backend only edits files; run_backend must
+                         # commit the working-tree diff itself before returning.
+
     @abstractmethod
     def run_backend(self, task: str, repo_path: str, branch: str, config: dict, model: str | None = None) -> CompletionResult: ...
 ```
@@ -80,12 +97,25 @@ class BackendAdapter(ABC):
 shares this signature so the server can drive failover uniformly regardless
 of which backend is configured.
 
-`AiderBackend.run_backend`:
+**Why `self_commits` exists:** researching Codex CLI and Gemini CLI (see
+"Codex and Gemini backends" below) surfaced a real difference from aider,
+not just a naming detail. Aider auto-commits each edit itself; Codex CLI and
+Gemini CLI only edit files in the working tree and leave committing to the
+caller. A single `run_backend` contract that assumed auto-commit (as an
+earlier draft of this spec did, using a pure commit-log diff to detect
+changes) would silently report `success=False, error="no commits"` for a
+Codex/Gemini run that actually did the work — the flag makes this explicit
+in the interface instead of hiding it in each backend's implementation.
+
+**Branch setup and idle/stall monitoring are shared, backend-agnostic
+steps** (implemented once, in `mcp-servers/local-coder/backends/common.py`,
+and called by every backend's `run_backend` rather than duplicated):
 1. `git -C repo_path rev-parse --verify branch` to check if the branch
    exists; `git checkout branch` if so, else `git checkout -b branch`.
-2. Record `pre_head = git rev-parse HEAD`.
-3. Run `aider --model {model} --yes --message "{task}" {*extra_backend_args}`
-   as a subprocess in `repo_path`, relying on aider's own auto-commit.
+2. Record `pre_head = git rev-parse HEAD` and a working-tree snapshot
+   (`git status --porcelain`, expected clean at this point since each task
+   starts from a committed state).
+3. Run the backend's subprocess in `repo_path`.
 4. While the subprocess runs, a background thread does two independent
    things on every `idle_notify_interval_seconds` tick: (a) calls FastMCP's
    `ctx.report_progress()` (best-effort — harmless no-op if the client isn't
@@ -96,16 +126,100 @@ of which backend is configured.
    no-activity counter, and once that counter's elapsed time exceeds
    `stall_timeout_seconds`, kills the subprocess and raises a stall
    condition (see "Failover" below) rather than continuing to wait.
-5. On subprocess exit: `post_head = git rev-parse HEAD`. If unchanged →
-   `success=False`, `error="aider made no commits"`. Otherwise
-   `files_changed = git diff --name-only pre_head post_head`,
-   `commit_sha = post_head`, `success=True`.
-6. Non-zero aider exit code → `success=False`, `error` = captured stderr tail.
-7. Killed for stalling → `success=False`, `error="stalled: no output for
+5. Killed for stalling → `success=False`, `error="stalled: no output for
    {stall_timeout_seconds}s"`.
+6. Non-zero subprocess exit code → `success=False`, `error` = captured
+   stderr tail (or, per-backend, a parsed error from `--json`/`--output-format
+   json` output where the backend supports it — see per-backend notes).
 
-`CodexBackend`, `GeminiBackend`, `OpenRouterBackend`: same `run_backend`
-signature, body raises `NotImplementedError("<name> backend not yet implemented")`.
+**Detecting changes and committing is where `self_commits` branches:**
+- `self_commits=True` (aider): after subprocess exit, `post_head = git
+  rev-parse HEAD`. If unchanged → `success=False, error="aider made no
+  commits"`. Otherwise `files_changed = git diff --name-only pre_head
+  post_head`, `commit_sha = post_head`, `success=True`.
+- `self_commits=False` (Codex, Gemini): after subprocess exit (exit code
+  0), diff the working tree instead of the commit log — `git status
+  --porcelain` / `git diff --name-only` against `pre_head`. If empty →
+  `success=False, error="<backend> made no file changes"` (exit 0 with no
+  changes is a documented failure mode for both tools — see per-backend
+  notes — so this is not a hypothetical edge case). Otherwise stage
+  everything the diff reported (`git add` those specific paths, not `-A`,
+  so the adapter never accidentally commits pre-existing unrelated
+  untracked files) and `git commit -m "{task}"`; `files_changed` = the
+  diffed paths, `commit_sha` = the new commit, `success=True`.
+
+`AiderBackend`: `self_commits=True`. Runs
+`aider --model {model} --yes --message "{task}" {*extra_backend_args}`.
+
+### Codex and Gemini backends
+
+Designed now (interface, invocation, auth, and failure handling fully
+specified) for implementation in a later phase — see Part 1's phased
+scope below. Both share the `self_commits=False` path above.
+
+**`CodexBackend`** (`self_commits=False`):
+- Invocation: `codex exec --sandbox workspace-write --skip-git-repo-check
+  --model {model} --output-format json {*extra_backend_args} "{task}"`,
+  run in `repo_path`. `--sandbox workspace-write` is required — Codex's
+  default sandbox is read-only, and there is no separate "auto-approve"
+  flag; the sandbox level itself is what allows unattended file edits with
+  no interactive prompt.
+- Model string: for local models, Codex's own `model_providers` /ollama
+  built-in provider config must already be set up in `~/.codex/config.toml`
+  on the machine running local-coder (out of scope for local-coder to
+  manage) — `config["model"]` for this backend is Codex's model identifier
+  under that provider, not the `ollama/...` string aider expects. This is a
+  real asymmetry between backends (see "Model string format" below).
+- Auth: `OPENAI_API_KEY` env var, inherited from the local-coder server's
+  own process environment — local-coder does not manage or store this key,
+  the README documents that it must already be set in the environment
+  the MCP server runs in.
+- Change detection: exit 0 does not guarantee edits were made (a known
+  Codex CLI behavior) — always diff the working tree per the shared logic
+  above, never trust exit code alone as a "did work happen" signal.
+- Local-model support: yes, via Codex's own provider config — this backend
+  CAN point at Ollama, unlike Gemini CLI below.
+
+**`GeminiBackend`** (`self_commits=False`):
+- Invocation: `gemini -p "{task}" --approval-mode=yolo --model {model}
+  --output-format json {*extra_backend_args}`, run in `repo_path`.
+  `--approval-mode=yolo` is required for unattended use (auto-approves file
+  edits and shell commands; the default mode prompts interactively, which
+  would hang a subprocess with no TTY attached).
+- Auth: `GEMINI_API_KEY` env var, inherited the same way as Codex's
+  `OPENAI_API_KEY` above — not managed by local-coder.
+- Change detection: same working-tree diff as Codex, for the same
+  reason (exit code alone is not a reliable "made changes" signal, and
+  non-interactive mode has documented cases of hanging when a tool call
+  needs approval outside what `--approval-mode` granted — the shared
+  stall-timeout logic in step 4/5 above is what protects against that
+  specific failure mode for this backend particularly).
+- Local-model support: **no.** Gemini CLI is Google-Gemini-only as of this
+  design's research — there is no built-in provider abstraction for
+  Ollama or other local/self-hosted endpoints. If `config["backend"] ==
+  "gemini"` and `config["model"]` starts with `"ollama/"`, `configure`
+  rejects the combination at write time with an error explaining Gemini
+  CLI has no local-model support (same validation layer as the existing
+  `ollama list` check, extended to also check backend/model compatibility,
+  not just whether an `ollama/` model is pulled).
+
+**Model string format (a cross-backend inconsistency, stated plainly rather
+than hidden):** aider's `model` config is a LiteLLM-style string
+(`ollama/qwen3-coder:30b`) that encodes both provider and model in one
+value. Codex and Gemini each have their own model-naming conventions tied
+to their own provider config, unrelated to LiteLLM's format. This means
+`fallback_models` entries are only interchangeable within the same
+backend — switching `backend` in `configure` effectively requires
+reviewing `model`/`fallback_models` for that backend's format too.
+`configure` does not attempt to validate Codex/Gemini model strings against
+a live list (no equivalent of `ollama list` exists for either), consistent
+with the existing "accepted as-is with no local validation" behavior for
+non-Ollama model strings.
+
+`OpenRouterBackend`: remains a stub (`NotImplementedError`) — not
+researched or designed in this pass, since it wasn't part of what you asked
+to have designed end-to-end this round. `self_commits` is not yet
+determined for it.
 
 ### Model selection and failover
 
@@ -324,6 +438,14 @@ mitigation, not a guarantee.
   requires stopping execution, reconfiguring, and resuming — there's no live
   per-task override while the plan is running.
 - `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` note as above.
+- (Added when Codex/Gemini ship in a later phase, not Phase 1) Per-backend
+  prerequisites: Codex needs `codex` on PATH and `OPENAI_API_KEY` set in the
+  environment the local-coder server runs in (or a prior `codex login`);
+  Gemini needs `gemini` on PATH and `GEMINI_API_KEY` similarly set. Neither
+  key is stored or managed by local-coder — it only inherits the process
+  environment. A note that Gemini CLI cannot target local/Ollama models
+  (Codex can, via its own `model_providers` config, separate from
+  local-coder's own config).
 
 ## Part 2 — Rewiring `subagent-driven-development`
 
@@ -447,6 +569,14 @@ optional and left to you to run ad hoc if you want to see it live.
 - No new tests needed for the skill-file changes themselves (they're prompt
   content); Part 3's manual smoke test is the acceptance check for the
   rewired flow.
+- When Codex/Gemini move from stub to implementation in a later phase, their
+  test suites must cover the `self_commits=False` path specifically: exit 0
+  with an empty working-tree diff (no false-positive success), exit 0 with
+  changes present (staged and committed correctly, only the diffed paths —
+  never a broad `git add -A`), and non-zero exit (treated as a failed
+  attempt, same as aider's non-zero exit today). This isn't built in Phase
+  1, but the design commits to it so Phase 2 doesn't have to re-derive the
+  contract.
 
 ## Error handling
 
@@ -466,6 +596,13 @@ optional and left to you to run ad hoc if you want to see it live.
 - Codex/Gemini/OpenRouter selected via `configure` before they're
   implemented → `delegate_implementation` surfaces the adapter's
   `NotImplementedError` message as a clean `error` field, not a stack trace.
+- (Once implemented) Codex or Gemini exits 0 but the working-tree diff is
+  empty → treated as a failed attempt (`error="<backend> made no file
+  changes"`), same failover behavior as aider's "no commits" case.
+- `configure` called with `backend: "gemini"` and a `model`/`fallback_models`
+  entry starting with `"ollama/"` → rejected before writing `config.yaml`,
+  error explains Gemini CLI has no local-model support (Codex has no such
+  restriction and is not rejected this way).
 - `configure` called with an `ollama/`-prefixed `model` or `fallback_models`
   entry that `ollama list` doesn't show as pulled → rejected before writing
   `config.yaml`, error names the requested model and what IS available.
