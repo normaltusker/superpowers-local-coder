@@ -12,7 +12,8 @@ Two independently shippable pieces:
 
 1. `mcp-servers/local-coder/` — a new, source-controlled FastMCP server that
    wraps pluggable coding-agent backends (Aider now; Codex/Gemini/OpenRouter
-   stubbed) behind two MCP tools.
+   stubbed) behind three MCP tools: `delegate_implementation`, `configure`,
+   and `list_available_models`.
 2. A modification to `skills/subagent-driven-development/` so its per-task
    implementer subagent calls local-coder instead of editing files itself,
    with the subagent's tool access structurally restricted at the harness
@@ -29,8 +30,9 @@ subagent — none of these change.
 
 ```
 mcp-servers/local-coder/
-  server.py            # FastMCP app; delegate_implementation, configure
+  server.py            # FastMCP app; delegate_implementation, configure, list_available_models
   config.py             # load/save config.yaml, partial-merge logic
+  ollama.py              # `ollama list` wrapper shared by configure + list_available_models
   config.yaml            # default config (checked in)
   backends/
     base.py              # BackendAdapter ABC + CompletionResult dataclass
@@ -123,7 +125,8 @@ per-plan pass-through today, it's pulled from config at call time.)
 The `configure` tool remains the only way to change `model`, `backend`, or
 `fallback_models`, at any time (including standalone use of local-coder
 outside SDD, where reconfiguring between individual calls is fine since
-there's a human in the loop between them).
+there's a human in the loop between them). `list_available_models` (below)
+is how you discover what's pulled before choosing.
 
 **Failover shortlist:** `config.yaml`'s `fallback_models` is an explicitly
 curated, ordered list (empty by default — failover is opt-in), maintained via
@@ -135,10 +138,15 @@ fallback_models:
   - "ollama/deepseek-coder-v2:16b"
 ```
 
-This is a fixed list you control — not auto-discovered via `ollama list` —
-so an unattended run can never pick up a model you haven't vetted for this
-purpose (a huge/slow model auto-selected as a "fallback" could otherwise
-hang for a very long time).
+You choose this list yourself (typically after calling
+`list_available_models` to see what's actually pulled) — the server never
+adds to it on its own, and at runtime it never expands the list dynamically
+or substitutes a model you didn't put there. `configure` validates each
+`ollama/`-prefixed entry against `ollama list` at write time (see "MCP
+tools" below) purely to reject typos/unpulled models up front; it does not
+auto-populate the list. So an unattended run can never pick up a model you
+haven't explicitly vetted for this purpose (a huge/slow model silently
+becoming a "fallback" could otherwise hang for a very long time).
 
 **Failover sequence in `delegate_implementation`:** build the attempt order
 as `[config["model"]] + config["fallback_models"]`. Try each in order via
@@ -180,7 +188,48 @@ the list actually completed the task.
 
 Merges only the provided keys into `config.yaml` (untouched keys keep their
 current value), writes it back, returns the full resulting config so the
-caller can confirm what changed.
+caller can confirm what changed. If `model` or any entry in `fallback_models`
+is provided and starts with the `"ollama/"` prefix, `configure` runs
+`ollama list` and rejects the call with a clear error naming the missing
+model and the models that ARE available, if that model isn't actually
+pulled — before writing anything to `config.yaml`. Model strings for other
+backends (e.g. `openrouter/...`, or future Codex/Gemini model ids) are
+accepted as-is with no local validation, since the server has no way to
+verify what's valid for a remote API.
+
+**`list_available_models() -> dict`**
+
+Runs `ollama list`, parses it, and returns
+`{"models": ["ollama/qwen3-coder:30b", "ollama/qwen2.5-coder:14b", ...]}`
+(each entry already prefixed to match the format `model`/`fallback_models`
+expect, so the output can be copy-pasted straight into a `configure` call).
+Read-only — makes no changes. If Ollama isn't running or `ollama` isn't on
+PATH, returns a clear error instead of an empty list, so "no models" isn't
+confused with "Ollama unreachable."
+
+### How configuration actually happens
+
+Both tools above are regular MCP tools — you never edit `config.yaml` by
+hand and never run anything outside Claude Code. The intended flow is
+entirely in chat:
+
+```
+You: what models do I have available for local-coder?
+Claude Code: [calls mcp__local-coder__list_available_models]
+             "You have 3 pulled: qwen3-coder:30b, qwen2.5-coder:14b, deepseek-coder-v2:16b"
+You: use qwen2.5-coder:14b as primary, deepseek as fallback
+Claude Code: [calls mcp__local-coder__configure(
+                model="ollama/qwen2.5-coder:14b",
+                fallback_models=["ollama/deepseek-coder-v2:16b"])]
+             "Updated. Current config: model=ollama/qwen2.5-coder:14b, fallback_models=[...]"
+```
+
+This removes the manual-YAML-editing failure mode entirely: you can't
+typo a path or leave the YAML malformed, because you're never touching the
+file — Claude Code calls the tool, the tool validates against what's
+actually pulled, and the tool reports back the resulting full config so you
+can confirm the change landed correctly before starting (or resuming) a
+`subagent-driven-development` plan.
 
 ### Repo path resolution
 
@@ -242,8 +291,11 @@ mitigation, not a guarantee.
   (Ollama + the configured model, and every model listed in
   `fallback_models`, pulled — for the default config), `gh` CLI
   authenticated (`gh auth status`).
-- How to reconfigure: use the `configure` MCP tool (example calls), not
-  manual YAML edits. Includes an example of setting `fallback_models`.
+- How to discover and set models entirely from chat: call
+  `list_available_models` to see what's pulled, then `configure(model=...,
+  fallback_models=[...])` to select primary/fallbacks — never edit
+  `config.yaml` by hand. Includes the example conversation from "How
+  configuration actually happens" above.
 - A note that `model`/`backend`/`fallback_models` are pre-run settings for
   an in-progress `subagent-driven-development` plan: `configure` must be
   called *before* starting the plan to take effect; changing it mid-plan
@@ -353,7 +405,11 @@ optional and left to you to run ad hoc if you want to see it live.
 ## Testing approach
 
 - `mcp-servers/local-coder/` gets unit tests for: config partial-merge
-  (`configure`, including `fallback_models`), the Aider adapter's
+  (`configure`, including `fallback_models`), `configure`'s `ollama list`
+  validation (mocked: accepts a pulled `ollama/` model, rejects an unpulled
+  one with a clear error, ignores non-`ollama/` prefixes entirely),
+  `list_available_models` (mocked `ollama list` output parsed and prefixed
+  correctly; clear error when `ollama` isn't reachable), the Aider adapter's
   branch-create-vs-checkout logic and success/failure detection (mocking the
   subprocess call), the stall-detection timer (mocking elapsed time and
   subprocess output activity, not real sleeps), the failover sequence in
@@ -361,8 +417,8 @@ optional and left to you to run ad hoc if you want to see it live.
   all models fail → aggregated error naming each), and the
   `delegate_implementation` PR-guard logic (`open_pr` off, `open_pr` on with
   no existing PR, `open_pr` on with an existing PR) — using Python's
-  `unittest`/`pytest` with subprocess, time, and `gh`/`git` calls mocked,
-  not live.
+  `unittest`/`pytest` with subprocess, time, and `gh`/`git`/`ollama` calls
+  mocked, not live.
 - No new tests needed for the skill-file changes themselves (they're prompt
   content); Part 3's manual smoke test is the acceptance check for the
   rewired flow.
@@ -385,3 +441,9 @@ optional and left to you to run ad hoc if you want to see it live.
 - Codex/Gemini/OpenRouter selected via `configure` before they're
   implemented → `delegate_implementation` surfaces the adapter's
   `NotImplementedError` message as a clean `error` field, not a stack trace.
+- `configure` called with an `ollama/`-prefixed `model` or `fallback_models`
+  entry that `ollama list` doesn't show as pulled → rejected before writing
+  `config.yaml`, error names the requested model and what IS available.
+- `list_available_models` called while Ollama isn't running/reachable →
+  clear error, not an empty list (avoids reading "no models pulled" when the
+  real problem is "Ollama isn't up").
