@@ -114,7 +114,8 @@ and called by every backend's `run_backend` rather than duplicated):
    exists; `git checkout branch` if so, else `git checkout -b branch`.
 2. Record `pre_head = git rev-parse HEAD` and a working-tree snapshot
    (`git status --porcelain`, expected clean at this point since each task
-   starts from a committed state).
+   starts from a committed state). `self_commits=False` backends diff
+   against this exact snapshot for change detection — see below.
 3. Run the backend's subprocess in `repo_path`.
 4. While the subprocess runs, a background thread does two independent
    things on every `idle_notify_interval_seconds` tick: (a) calls FastMCP's
@@ -138,15 +139,23 @@ and called by every backend's `run_backend` rather than duplicated):
   commits"`. Otherwise `files_changed = git diff --name-only pre_head
   post_head`, `commit_sha = post_head`, `success=True`.
 - `self_commits=False` (Codex, Gemini): after subprocess exit (exit code
-  0), diff the working tree instead of the commit log — `git status
-  --porcelain` / `git diff --name-only` against `pre_head`. If empty →
-  `success=False, error="<backend> made no file changes"` (exit 0 with no
-  changes is a documented failure mode for both tools — see per-backend
-  notes — so this is not a hypothetical edge case). Otherwise stage
-  everything the diff reported (`git add` those specific paths, not `-A`,
-  so the adapter never accidentally commits pre-existing unrelated
-  untracked files) and `git commit -m "{task}"`; `files_changed` = the
-  diffed paths, `commit_sha` = the new commit, `success=True`.
+  0), compare the post-run `git status --porcelain` output against the
+  pre-run snapshot recorded in shared step 2 — **not** `git diff
+  --name-only pre_head`, which only detects changes to already-tracked
+  content and silently misses newly created files. Since a coding-agent
+  backend creating a new file (a new source file, a new test) is an
+  entirely normal outcome, this distinction matters: any path whose
+  `git status --porcelain` line is new relative to the pre-run snapshot —
+  modified (`" M"`/`"M "`) tracked files or new untracked (`"??"`)
+  files — counts as changed. If none → `success=False, error="<backend>
+  made no file changes"` (exit 0 with no changes is a documented failure
+  mode for both tools — see per-backend notes — so this is not a
+  hypothetical edge case). Otherwise stage exactly those detected paths
+  (`git add <path> <path> ...`, never `-A`, so the adapter never
+  accidentally commits pre-existing unrelated untracked files that were
+  already sitting in the working tree before this run) and `git commit -m
+  "{task}"`; `files_changed` = the detected paths, `commit_sha` = the new
+  commit, `success=True`.
 
 `AiderBackend`: `self_commits=True`. Runs
 `aider --model {model} --yes --message "{task}" {*extra_backend_args}`.
@@ -299,14 +308,28 @@ the list actually completed the task.
 3. Build the model attempt order (`config["model"]`, then
    `config["fallback_models"]` in order) and try each via `run_backend`
    until one succeeds or all fail (see "Model selection and failover").
-4. On success: `git push -u origin branch`. If `config["open_pr"]` is true
-   AND `gh pr view branch` finds no existing open PR, run
-   `gh pr create --fill --head branch --base {pr_base_branch}` and capture
-   its URL; otherwise `pr_url` is `null`.
+4. On success, check whether the repo has an `origin` remote first
+   (`git remote` — or `git remote get-url origin`) before attempting
+   anything network-facing. `target_repo_path` is an arbitrary local repo,
+   not guaranteed to have any remote configured, so this cannot be assumed:
+   - **No `origin` remote:** skip push and PR creation entirely (not a
+     failure — the commit already exists locally, on the correct branch,
+     which is the actual deliverable for a local-only repo). Return
+     success with `pr_url: null` and a `note` field explaining no remote
+     was configured so nothing was pushed.
+   - **`origin` exists:** `git push -u origin branch`. If the push itself
+     fails (e.g. rejected, network error — a different failure mode from
+     "no remote configured"), return `{"success": false, "error": "..."}`;
+     the commit still exists locally (see "Error handling" below). If the
+     push succeeds and `config["open_pr"]` is true AND `gh pr view branch`
+     finds no existing open PR, run `gh pr create --fill --head branch
+     --base {pr_base_branch}` and capture its URL; otherwise `pr_url` is
+     `null`.
 5. Return `{"pr_url": ..., "branch": ..., "files_changed": [...], "model_used": ..., "summary": "..."}`
-   on success. On total failure (every model in the attempt order failed),
-   return `{"success": false, "error": "..."}` (error lists each model tried
-   and why) with no push/PR attempted.
+   on success (`pr_url` may be `null` per above). On total failure (every
+   model in the attempt order failed, or a configured push failed), return
+   `{"success": false, "error": "..."}` (error lists each model tried and
+   why, for the model-failure case) with no PR attempted.
 
 **`configure(backend=None, model=None, target_repo_path=None, open_pr=None, **overrides) -> dict`**
 
@@ -393,7 +416,9 @@ this:
 
 - `config.yaml` ships with `open_pr: false` by default.
 - `delegate_implementation` always pushes the branch on success regardless
-  of `open_pr`.
+  of `open_pr`, provided the repo has an `origin` remote configured (see
+  "MCP tools" above) — a local-only `target_repo_path` with no remote is
+  not an error, it just means nothing to push.
 - `open_pr: true` remains fully supported for standalone/non-SDD use of the
   tool (e.g. someone invoking local-coder directly outside a Superpowers
   plan) — the guard against duplicate PRs (`gh pr view` check) covers that
@@ -563,17 +588,22 @@ optional and left to you to run ad hoc if you want to see it live.
   `delegate_implementation` (first model stalls → second model succeeds;
   all models fail → aggregated error naming each), and the
   `delegate_implementation` PR-guard logic (`open_pr` off, `open_pr` on with
-  no existing PR, `open_pr` on with an existing PR) — using Python's
-  `unittest`/`pytest` with subprocess, time, and `gh`/`git`/`ollama` calls
-  mocked, not live.
+  no existing PR, `open_pr` on with an existing PR), and the `origin`-remote
+  check (mocked `git remote`: no remote → success with `pr_url: null` and no
+  push attempted; remote present → push attempted; push failure with a
+  remote present → returned as failure, distinct from the no-remote case)
+  — using Python's `unittest`/`pytest` with subprocess, time, and
+  `gh`/`git`/`ollama` calls mocked, not live.
 - No new tests needed for the skill-file changes themselves (they're prompt
   content); Part 3's manual smoke test is the acceptance check for the
   rewired flow.
 - When Codex/Gemini move from stub to implementation in a later phase, their
   test suites must cover the `self_commits=False` path specifically: exit 0
-  with an empty working-tree diff (no false-positive success), exit 0 with
-  changes present (staged and committed correctly, only the diffed paths —
-  never a broad `git add -A`), and non-zero exit (treated as a failed
+  with no `git status --porcelain` changes relative to the pre-run snapshot
+  (no false-positive success), exit 0 with only newly created untracked
+  files (must be detected and committed — this is the specific gap a
+  `git diff --name-only`-only check would miss), exit 0 with only modified
+  tracked files, exit 0 with both, and non-zero exit (treated as a failed
   attempt, same as aider's non-zero exit today). This isn't built in Phase
   1, but the design commits to it so Phase 2 doesn't have to re-derive the
   contract.
@@ -590,9 +620,15 @@ optional and left to you to run ad hoc if you want to see it live.
 - `fallback_models` is empty (the default) → no failover occurs; a single
   failed/stalled attempt on the primary model fails the call immediately,
   same as today's single-model behavior.
-- `git push` failure (e.g. remote rejected) → returned as failure; the
-  commit still exists locally, so the controller can inspect and retry
-  manually rather than losing work.
+- No `origin` remote configured on `target_repo_path` → not an error; push
+  and PR creation are skipped, the call still returns success with
+  `pr_url: null` and a `note` explaining why (the commit is the real
+  deliverable for a local-only repo).
+- `git push` failure when `origin` DOES exist (e.g. remote rejected,
+  network error) → returned as failure; the commit still exists locally, so
+  the controller can inspect and retry manually rather than losing work.
+  This is a distinct case from "no remote configured" above — the former
+  is expected/benign, this one is a real failure worth surfacing.
 - Codex/Gemini/OpenRouter selected via `configure` before they're
   implemented → `delegate_implementation` surfaces the adapter's
   `NotImplementedError` message as a clean `error` field, not a stack trace.
