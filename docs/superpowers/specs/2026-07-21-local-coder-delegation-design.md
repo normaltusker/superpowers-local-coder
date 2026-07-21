@@ -71,8 +71,11 @@ class BackendAdapter(ABC):
     def run_backend(self, task: str, repo_path: str, branch: str, config: dict, model: str | None = None) -> CompletionResult: ...
 ```
 
-`model` defaults to `config["model"]` when not passed (see "Model selection"
-below) — every backend, including the stubs, shares this signature.
+`model` is an internal parameter the server passes on each failover attempt
+(see "Model selection and failover" below) — it is not exposed as a
+`delegate_implementation` argument; every backend, including the stubs,
+shares this signature so the server can drive failover uniformly regardless
+of which backend is configured.
 
 `AiderBackend.run_backend`:
 1. `git -C repo_path rev-parse --verify branch` to check if the branch
@@ -103,12 +106,24 @@ signature, body raises `NotImplementedError("<name> backend not yet implemented"
 
 ### Model selection and failover
 
-**Per-call override:** `delegate_implementation` accepts an optional `model`
-argument. When provided, it is a plain string you (via Claude Code) supply
-directly in the tool call — there is no discovery or auto-detection, exactly
-like `target_repo_path` today. It overrides `config["model"]` for that call
-only; `config.yaml` is not modified. Omit it and the call uses whatever
-`configure` last set as the persistent default.
+**Model is a pre-run config setting, not a per-call argument.** Once
+`subagent-driven-development` is executing a plan, dispatch is autonomous —
+the implementer subagent calls `delegate_implementation` on its own, with no
+point in the loop where you're present to inject a value into that specific
+call. So `delegate_implementation` does **not** take a `model` parameter.
+The model in effect for an entire plan run is whatever `config.yaml` held
+when execution started. To use a different model, set it with
+`configure(model=...)` **before** kicking off `subagent-driven-development`;
+to change it mid-plan, you must interrupt/stop the running skill, reconfigure,
+and resume — there is no live override path while it's running. (This
+differs from `target_repo_path`, which the controller — not the subagent —
+resolves once per plan and passes explicitly; `model` has no equivalent
+per-plan pass-through today, it's pulled from config at call time.)
+
+The `configure` tool remains the only way to change `model`, `backend`, or
+`fallback_models`, at any time (including standalone use of local-coder
+outside SDD, where reconfiguring between individual calls is fine since
+there's a human in the loop between them).
 
 **Failover shortlist:** `config.yaml`'s `fallback_models` is an explicitly
 curated, ordered list (empty by default — failover is opt-in), maintained via
@@ -126,8 +141,8 @@ purpose (a huge/slow model auto-selected as a "fallback" could otherwise
 hang for a very long time).
 
 **Failover sequence in `delegate_implementation`:** build the attempt order
-as `[explicit model-arg or config["model"]] + config["fallback_models"]`.
-Try each in order via `run_backend`. An attempt fails over to the next
+as `[config["model"]] + config["fallback_models"]`. Try each in order via
+`run_backend`. An attempt fails over to the next
 model when `run_backend` returns `success=False` for **either** reason:
 a stall (killed after `stall_timeout_seconds` of no output, per step 4/7
 above) or a hard backend error (non-zero exit, subprocess launch failure).
@@ -143,13 +158,13 @@ the list actually completed the task.
 
 ### MCP tools
 
-**`delegate_implementation(task: str, branch: str, target_repo_path: str | None = None, model: str | None = None) -> dict`**
+**`delegate_implementation(task: str, branch: str, target_repo_path: str | None = None) -> dict`**
 
 1. Resolve repo path: argument if given, else `config["target_repo_path"]`,
    else raise a clear error (no silent cwd guessing — see "Repo path
    resolution").
 2. Load full config, instantiate the configured backend adapter.
-3. Build the model attempt order (`model` arg or `config["model"]`, then
+3. Build the model attempt order (`config["model"]`, then
    `config["fallback_models"]` in order) and try each via `run_backend`
    until one succeeds or all fail (see "Model selection and failover").
 4. On success: `git push -u origin branch`. If `config["open_pr"]` is true
@@ -229,8 +244,11 @@ mitigation, not a guarantee.
   authenticated (`gh auth status`).
 - How to reconfigure: use the `configure` MCP tool (example calls), not
   manual YAML edits. Includes an example of setting `fallback_models`.
-- How to override the model for a single call without touching config: pass
-  `model=` directly to `delegate_implementation`.
+- A note that `model`/`backend`/`fallback_models` are pre-run settings for
+  an in-progress `subagent-driven-development` plan: `configure` must be
+  called *before* starting the plan to take effect; changing it mid-plan
+  requires stopping execution, reconfiguring, and resuming — there's no live
+  per-task override while the plan is running.
 - `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` note as above.
 
 ## Part 2 — Rewiring `subagent-driven-development`
