@@ -49,6 +49,7 @@ mcp-servers/local-coder/
 backend: "aider"
 model: "ollama/qwen3-coder:30b"
 fallback_models: []         # tried in order on stall/error before giving up — see "Failover" below
+max_fallback_models: 3      # configure rejects a longer fallback_models list — see "Failover" below
 stall_timeout_seconds: 300  # no subprocess output for this long = stalled, kill and try next model
 target_repo_path: null     # no hardcoded default — see "Repo path resolution" below
 branch_prefix: "local-coder/"
@@ -129,7 +130,11 @@ there's a human in the loop between them). `list_available_models` (below)
 is how you discover what's pulled before choosing.
 
 **Failover shortlist:** `config.yaml`'s `fallback_models` is an explicitly
-curated, ordered list (empty by default — failover is opt-in), maintained via
+curated, ordered list (empty by default — failover is opt-in, uncapped
+length would let one bad run cost `stall_timeout_seconds` per entry before
+`delegate_implementation` gives up, so `configure` caps the list at
+`max_fallback_models`, default 3 — the cap itself is changeable via
+`configure(max_fallback_models=...)` if you want more), maintained via
 `configure(fallback_models=[...])`, e.g.:
 
 ```yaml
@@ -137,6 +142,11 @@ fallback_models:
   - "ollama/qwen2.5-coder:14b"
   - "ollama/deepseek-coder-v2:16b"
 ```
+
+At default settings (`stall_timeout_seconds: 300`, `max_fallback_models: 3`),
+the worst case before `delegate_implementation` gives up entirely is
+primary + 3 fallbacks all stalling ≈ 20 minutes; a hard error on any attempt
+fails over immediately, without waiting out the stall timeout.
 
 You choose this list yourself (typically after calling
 `list_available_models` to see what's actually pulled) — the server never
@@ -195,7 +205,11 @@ model and the models that ARE available, if that model isn't actually
 pulled — before writing anything to `config.yaml`. Model strings for other
 backends (e.g. `openrouter/...`, or future Codex/Gemini model ids) are
 accepted as-is with no local validation, since the server has no way to
-verify what's valid for a remote API.
+verify what's valid for a remote API. If `fallback_models` is provided with
+more entries than the current `max_fallback_models` (default 3), `configure`
+rejects the call with an error stating the limit and how to raise it
+(`configure(max_fallback_models=...)`), rather than silently truncating the
+list.
 
 **`list_available_models() -> dict`**
 
@@ -223,6 +237,14 @@ Claude Code: [calls mcp__local-coder__configure(
                 fallback_models=["ollama/deepseek-coder-v2:16b"])]
              "Updated. Current config: model=ollama/qwen2.5-coder:14b, fallback_models=[...]"
 ```
+
+There is no checkbox UI — MCP tools are function calls, not rendered forms,
+so Claude Code cannot show clickable checkboxes for model selection. The
+numbered/named list from `list_available_models`, answered in plain
+language, is the closest equivalent this environment supports, and it's
+what the flow above already provides: Claude Code presents the options,
+you pick by name, Claude Code translates the pick into the `configure(...)`
+call.
 
 This removes the manual-YAML-editing failure mode entirely: you can't
 typo a path or leave the YAML malformed, because you're never touching the
@@ -405,7 +427,10 @@ optional and left to you to run ad hoc if you want to see it live.
 ## Testing approach
 
 - `mcp-servers/local-coder/` gets unit tests for: config partial-merge
-  (`configure`, including `fallback_models`), `configure`'s `ollama list`
+  (`configure`, including `fallback_models`), `configure`'s `max_fallback_models`
+  cap enforcement (a `fallback_models` list at the cap is accepted; one
+  entry over is rejected with no write; raising `max_fallback_models` first
+  permits a longer list), `configure`'s `ollama list`
   validation (mocked: accepts a pulled `ollama/` model, rejects an unpulled
   one with a clear error, ignores non-`ollama/` prefixes entirely),
   `list_available_models` (mocked `ollama list` output parsed and prefixed
@@ -447,3 +472,6 @@ optional and left to you to run ad hoc if you want to see it live.
 - `list_available_models` called while Ollama isn't running/reachable →
   clear error, not an empty list (avoids reading "no models pulled" when the
   real problem is "Ollama isn't up").
+- `configure` called with `fallback_models` longer than `max_fallback_models`
+  → rejected before writing `config.yaml`, error states the limit and that
+  `configure(max_fallback_models=...)` raises it.
