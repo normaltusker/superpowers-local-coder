@@ -29,26 +29,26 @@ the original design spec against what Phase 1 actually shipped (Codex/
 Gemini/OpenRouter backends excluded — those remain their own later
 phase, not part of this Phase 2 pass):
 
-1. **Run the Part 3 manual smoke test for real.** Design spec's own
-   acceptance check — brainstorm → plan → SDD dispatches
-   `local-coder-implementer` → `delegate_implementation` actually invokes
-   aider against local Ollama → a commit lands on the shared branch → the
-   implementer verifies via Read and reports DONE → task reviewer
-   approves → `finishing-a-development-branch` opens the PR — has **never
-   been run end-to-end**. Every Phase 1 review cycle exercised
-   `restore_working_tree` and friends via unit tests and manual repros in
-   isolation, but nobody has watched the real `delegate_implementation` →
-   aider → Ollama path fire inside a live SDD run. This is the highest-
-   priority Phase 2 item: everything else so far is "verified by tests
-   and code reading," this is the one check that verifies the whole
-   chain actually works together.
-2. **Fresh-clone / plugin-install bootstrap provisioning.** `.mcp.json`
-   points at `mcp-servers/local-coder/.venv/bin/python`, but nothing
-   creates that venv automatically. A user installing this plugin fresh
-   (not the dev machine that already has the venv from Phase 1
-   implementation) gets a broken MCP server on first launch. Raised by
-   cubic-dev-ai on PR #2, closed there as won't-fix (scoped out of
-   Phase 1), now explicitly Phase 2 scope.
+1. **Run the Part 3 manual smoke test for real — STARTED, BLOCKED, see
+   below.** Design spec's own acceptance check — brainstorm → plan → SDD
+   dispatches `local-coder-implementer` → `delegate_implementation`
+   actually invokes aider against local Ollama → a commit lands on the
+   shared branch → the implementer verifies via Read and reports DONE →
+   task reviewer approves → `finishing-a-development-branch` opens the
+   PR — has **still never been run end-to-end**. Attempting it on
+   2026-07-22 surfaced a real, more-fundamental-than-expected blocker —
+   see "Item 1 attempt — findings and next step" immediately below.
+2. **Fresh-clone / plugin-install bootstrap provisioning — TURNS OUT TO
+   BLOCK ITEM 1, NOT JUST FRESH INSTALLS.** `.mcp.json` uses
+   `${CLAUDE_PLUGIN_ROOT}`, a variable Claude Code only sets when the
+   repo is loaded as an **installed plugin** — not when it's a plain
+   project checkout (which is how this session and this worktree are
+   normally used). This isn't only a "fresh clone" problem as originally
+   scoped from the cubic-dev-ai finding; it means the local-coder MCP
+   tools are **unreachable in the very session doing Phase 2
+   development**, unless that session specifically has this fork
+   installed as a plugin. See the item 1 findings below for the concrete
+   repro and the exact install steps to unblock it.
 3. **Windows support.** Currently impossible as-is: `config.py`'s file
    locking uses `fcntl` (POSIX-only, no Windows equivalent), and
    `.mcp.json`'s hardcoded `.venv/bin/python` path doesn't resolve on
@@ -76,11 +76,63 @@ phase, not part of this Phase 2 pass):
    practice (e.g. during item 1's smoke test) — don't preemptively
    redesign it.
 
-None of items 1-5 have been started as of this handoff being written.
-Suggested order: **do item 1 first** — it's the cheapest to attempt and
-will likely surface whether items 2-5 (or something not yet identified)
-actually block real usage, rather than guessing at priority from the
-design doc alone.
+### Item 1 attempt — findings and next step (2026-07-22)
+
+Verified environment was ready first: `ollama list` has `qwen3-coder:30b`
+pulled (the config default), `aider` 0.86.2 on PATH, `gh` authenticated,
+the server's venv (`mcp-servers/local-coder/.venv/`) has fastmcp 3.4.4
+installed and `server.py` imports cleanly. None of that was the problem.
+
+**The actual blocker:** `claude mcp list` in this session shows:
+```
+local-coder: ${CLAUDE_PLUGIN_ROOT}/mcp-servers/local-coder/.venv/bin/python ... - ⏸ Pending approval
+```
+and the diagnostics report `Missing environment variables:
+CLAUDE_PLUGIN_ROOT` for `.mcp.json`. Confirmed with `env | grep
+CLAUDE_PLUGIN_ROOT` (empty). This session has the **official**
+`superpowers@claude-plugins-official` plugin installed (see
+`~/.claude/settings.json`'s `enabledPlugins`), not this fork — so
+`CLAUDE_PLUGIN_ROOT` never points at this checkout, and the
+`mcp__local-coder__*` tools are not available to call (confirmed via
+`ToolSearch`, no match).
+
+This can't be fixed by exporting the env var in a shell — Claude Code
+resolves `.mcp.json` once, before/outside the running session, so a
+`export CLAUDE_PLUGIN_ROOT=...` in Bash has no effect on the
+already-resolved MCP client config. Manually running
+`server.py`'s `_delegate_implementation_impl` directly via a Python
+script was considered and explicitly rejected: it would prove the
+backend logic works (already covered by the 101-test suite), but would
+**not** test the actual thing Part 3 verifies — Claude Code's real
+subagent-dispatch → tool-restricted implementer → MCP call chain. Faking
+that with a script would produce a false "smoke test passed" result.
+
+**Confirmed fix path — this repo IS structured to self-install:**
+`.claude-plugin/marketplace.json` at repo root defines a `superpowers-dev`
+marketplace with one plugin (`superpowers`, `source: "./"`) — this fork
+ships everything needed to install itself locally. **This requires a
+FRESH Claude Code session** (a plugin install needs a session restart to
+take effect, and the smoke test itself needs to be the acceptance test
+described in root `CLAUDE.md` — a clean session). Exact steps for that
+fresh session:
+
+```bash
+claude plugin marketplace add /Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder/.worktrees/local-coder-impl --scope project
+claude plugin install superpowers@superpowers-dev --scope project
+```
+Then restart/start a new `claude` session from
+`.worktrees/local-coder-impl/`, confirm `claude mcp list` shows
+`local-coder` connected (not "Pending approval" / missing env var), then
+run the actual Part 3 smoke test: ask it to brainstorm+plan+implement a
+one-line change (e.g. "add a one-line comment to README.md") via
+`subagent-driven-development`, and confirm `delegate_implementation` is
+what implements it, not direct Edit/Write.
+
+**This item is NOT complete.** It's blocked on being run in a fresh
+session with this fork installed as a plugin — the current/main
+Phase 2 session cannot do this to itself. See the resume prompt at the
+bottom of this file, or hand the two commands above plus the smoke-test
+ask to a fresh session directly.
 
 ### Housekeeping for Phase 2
 
@@ -100,6 +152,25 @@ design doc alone.
   test surfaces a NEW bug in that function — see the explicit escalation
   note in the archive about not auto-patching a 6th time), just no
   longer the first thing a resuming session needs to read.
+
+### Resume prompt (paste this if a session ends mid-work / hits its limit)
+
+```
+Read docs/superpowers/handoff/2026-07-21-local-coder-handoff.md in the
+superpowers-local-coder repo (worktree at .worktrees/local-coder-impl/,
+branch local-coder-impl) and resume Phase 2 work from exactly where it
+left off, per the "Where things stand NOW" section at the top. Don't
+re-derive context from git log or re-read the design spec/plan from
+scratch — the handoff doc is the current source of truth for what's
+done, what's in progress, and what's next. Keep the handoff doc updated
+as you go, the same way it's been maintained so far.
+```
+
+If the blocker in "Item 1 attempt — findings and next step" above is
+still unresolved, that resume prompt alone is enough — the doc already
+contains the exact `claude plugin marketplace add` / `claude plugin
+install` commands and the fresh-session smoke-test steps needed to
+unblock it.
 
 ---
 
