@@ -82,16 +82,69 @@ Fixed with an unconditional `reset --mixed` before cleanup, verified with
 its own repro (reproduced the exact corruption pre-fix, confirmed closed
 post-fix). **95/95 tests passing now.**
 
-**Current state: PR #2 is open. 51 of 56 total review threads resolved;
+**A further cubic-dev-ai pass then found 3 more real bugs, all caused by
+or adjacent to the P1/P2 fix above** (the same "fourth fix to the same
+function" pattern — each fix round to `restore_working_tree` has
+surfaced a new edge case): (P0) the previous round's two-command split
+(`git checkout --` / `git clean -fd --`) passed filenames as literal
+git arguments without disabling pathspec magic — a file named
+`:(glob)victim*` caused `git clean -fd --` to delete an unrelated
+`victim.txt` instead of the malicious file itself. (P1) the unconditional
+`git reset --mixed` added to fix the staged-edits bug in the prior round
+unstages **every** staged path in the index, not just the failed
+attempt's — pre-existing user work staged before delegation started got
+silently unstaged by "restoration." (P2) a directory already untracked
+before the attempt began collapses to one `?? dirname/` porcelain line in
+both the pre- and post-attempt snapshots under default `git status`,
+hiding new files the attempt added inside it. **All three verified via
+manual repro in scratch directories before writing any fix**, not just
+trusted from the finding text. Fixing these required a genuine redesign,
+not another patch: `git reset --mixed` (blanket) is now
+`git reset --soft` (moves HEAD only, doesn't touch the index) followed by
+**per-path** `git restore --source=pre_head --staged --worktree --
+<paths>` for only the paths this attempt actually touched;
+`GIT_LITERAL_PATHSPECS=1` is now set on every path-taking git subprocess
+call; both status calls now pass `--untracked-files=all`. **While
+implementing this, found and fixed 2 more bugs of my own**, both caught
+before commit: (a) restoring only the new path of a git rename left the
+old path still marked deleted in the index (fixed by having the `-z`
+porcelain parser surface both halves of a rename record — the old path
+under a synthetic `"D "` code); (b) a test regressed because the HEAD-reset
+step had been dropped entirely while focused on the index-preservation
+fix — added back as `git reset --soft pre_head` for the case where the
+attempt actually committed before failing. Committed as `f4aaadb`. Given
+this was the fourth consecutive fix to this one function, dispatched a
+maximally adversarial review (most capable model) specifically told to
+hunt for a fifth bug, including checking a gap I'd personally flagged
+(an attempt further modifying a file that was *already* dirty before the
+attempt started). Verdict: no fifth bug, no regression; that one gap is
+real but **pre-existing across every version of this function**, and the
+redesign is strictly no worse (better on index-preservation than the
+blanket-reset version it replaced) — recommended documenting it as a
+known limitation rather than chasing a fifth fix. Docstring updated
+accordingly, no further code/test changes. Committed as `5a58bdb`.
+**99/99 tests passing now** (4 new TDD tests this round, 3 of 4 verified
+genuinely RED-before/GREEN-after; the rename-bug test only ever failed
+within an uncommitted intermediate edit, never against pushed history).
+All 3 threads from this round (comment IDs `3629411569` P0,
+`3629411575` P1, `3629411577` P2) replied to with fix explanations and
+are resolved on GitHub (this repo resolves threads automatically once
+the PR owner replies — no separate `resolveReviewThread` mutation was
+needed).
+
+**Current state: PR #2 is open. 54 of 59 total review threads resolved;
 5 left open intentionally** (the acknowledge-only scope findings from the
 first cubic round — do not resolve these without the repo owner's
-say-so, they represent open design questions, not defects). If resuming:
-check `gh pr view 2 --repo normaltusker/superpowers-local-coder` for any
-NEW review activity since this handoff was written before assuming
-there's nothing left to do — CI/review bots may have posted more since.
-If truly nothing new beyond the 5 intentionally-open threads, this work
-is done; merging the PR is the human's call, not something to do
-unprompted.
+say-so, they represent open design questions, not defects). `restore_working_tree`
+has now been through 4 review-driven fix rounds and is believed stable —
+if a 5th finding shows up against this same function, treat that as a
+signal to step back and reconsider the approach more fundamentally rather
+than patching again. If resuming: check
+`gh pr view 2 --repo normaltusker/superpowers-local-coder` for any NEW
+review activity since this handoff was written before assuming there's
+nothing left to do — CI/review bots may have posted more since. If truly
+nothing new beyond the 5 intentionally-open threads, this work is done;
+merging the PR is the human's call, not something to do unprompted.
 
 **Plan file note:** `docs/superpowers/plans/2026-07-21-local-coder-phase1.md`
 now has a "Task 6.5" section inserted between Task 6 and Task 7 — this
