@@ -171,21 +171,34 @@ on reply, so `resolveReviewThread` was called explicitly on each
 either behavior going forward, always verify resolution state after
 replying rather than assuming it happened.
 
-**Current state: PR #2 is open. 57 of 62 total review threads resolved;
-5 left open intentionally** (the acknowledge-only scope findings from the
-first cubic round — do not resolve these without the repo owner's
-say-so, they represent open design questions, not defects).
-`restore_working_tree` has now been through 5 review-driven fix rounds.
-**If a 6th finding shows up against this same function, stop and raise
-it with the repo owner before fixing** — don't keep patching
-indefinitely; either the function needs a more fundamental rethink, or
-review-bot findings on it should stop being auto-actioned without a
-cost/benefit check first. If resuming: check
-`gh pr view 2 --repo normaltusker/superpowers-local-coder` for any NEW
-review activity since this handoff was written before assuming there's
-nothing left to do — CI/review bots may have posted more since. If truly
-nothing new beyond the 5 intentionally-open threads, this work is done;
-merging the PR is the human's call, not something to do unprompted.
+**The repo owner then explicitly asked to close out the 5 remaining
+open threads as won't-fix**, rather than leave them open indefinitely —
+the review-bot cycle had gone on long enough that "leave it open forever
+as an unresolved design question" stopped being useful. Posted a
+won't-fix reply to each with the actual reasoning (not just "acknowledged,
+skipping"): venv bootstrap/packaging is out of Phase 1's dev-env-only
+scope; TDD-under-delegation is an inherent MCP-boundary trade-off already
+documented in implementer-prompt.md's Report Format section; the SDD
+rewiring is intentionally fork-specific, making it conditional is a
+bigger architectural change than this PR; Windows support was never in
+scope for this phase (consistent with `config.py`'s POSIX-only `fcntl`
+usage elsewhere in the same PR); the missing skill-eval evidence is a
+real gap but belongs in its own dedicated eval-harness pass, not bundled
+into a review-fix cycle. All 5 resolved via `resolveReviewThread`.
+**62/62 review threads now resolved. Zero open threads on PR #2.**
+
+**Current state: PR #2 is open, all review threads resolved, 101/101
+tests passing.** `restore_working_tree` went through 5 review-driven fix
+rounds this session. **If any NEW finding shows up against that same
+function in a future session, stop and raise it with the repo owner
+before fixing** — don't keep patching indefinitely; either the function
+needs a more fundamental rethink, or review-bot findings on it should
+stop being auto-actioned without a cost/benefit check first. If resuming:
+check `gh pr view 2 --repo normaltusker/superpowers-local-coder` for any
+NEW review activity since this handoff was written before assuming
+there's nothing left to do — CI/review bots may post more later. If
+truly nothing new, this work is done; merging the PR is the human's
+call, not something to do unprompted.
 
 **Plan file note:** `docs/superpowers/plans/2026-07-21-local-coder-phase1.md`
 now has a "Task 6.5" section inserted between Task 6 and Task 7 — this
