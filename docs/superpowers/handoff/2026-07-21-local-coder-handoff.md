@@ -11,8 +11,9 @@ session end — a stale handoff is worse than none.
 implementation plan via `superpowers:subagent-driven-development`,
 task-by-task.** Check the progress ledger (see below) for exactly which
 tasks are done — trust it and `git log` over this prose if they conflict.
-As of this update: Tasks 1-2 complete and reviewed clean (Task 1 needed
-one fix round — see "Gotchas hit during execution" below); Task 3 dispatched.
+As of this update: Tasks 1-4 complete and reviewed clean; Task 5 fixed
+after one review round and awaiting re-review. See "Gotchas hit during
+execution" below for the specifics of every fix round so far.
 
 ## Gotchas hit during execution (read before dispatching later tasks)
 
@@ -35,6 +36,43 @@ one fix round — see "Gotchas hit during execution" below); Task 3 dispatched.
   implementer NOT to create this file, since it's an easy default
   reflex ("tests dirs usually get an __init__.py") that contradicts this
   specific plan's convention.
+- **Task 3's implementer found and fixed a real bug in the plan's own
+  reference code** for `run_monitored_subprocess` (in `backends/common.py`):
+  the plan's exact code used a blocking `process.stdout.readline()` as the
+  loop's first statement, which blocks for the entire subprocess lifetime
+  when the subprocess produces zero stdout output (e.g. `sleep 0.3`,
+  which the plan's own tests use) — meaning the tick/stall-detection
+  checks later in the loop never actually ran. Fixed with a
+  `selectors`-based non-blocking poll; the reviewer independently
+  reproduced the original bug in isolation before approving the fix. The
+  public interface (signature, `StallError`, tick cadence, return type)
+  is unchanged, so this doesn't affect how Task 4+ call the function.
+- **Task 5's implementer weakened `configure_with_validation`'s
+  validation** (silently, not maliciously — it read as a plausible
+  "avoid re-validating unchanged config" optimization) by gating
+  `_validate_ollama_model` calls on whether `model`/`fallback_models`
+  were present in the `overrides` dict passed to a given `configure()`
+  call, rather than validating the merged/effective values unconditionally
+  as the plan specifies. Practical effect: a stale/removed Ollama model
+  already sitting in a persisted config could survive later, unrelated
+  `configure()` calls without being re-checked. Caught by task review
+  (the reviewer noted this gap was invisible to the original test suite,
+  since every original test happened to pass `model`/`fallback_models`
+  via `overrides` whenever it mattered) — fixed to match the plan's exact
+  unconditional form, plus a new regression test specifically covering
+  the previously-uncovered case. Re-review pending as of this handoff
+  update.
+- **A checked-in file (`config.yaml`) got silently mutated on disk**
+  during Task 5's fix work — quoted YAML strings (`"aider"`) became
+  unquoted (`aider`), same values, no functional change, but real
+  uncommitted drift on a tracked file. Cause not fully diagnosed (likely
+  some test path writing through the real `CONFIG_PATH` instead of the
+  isolated temp-file fixture at some point), but it was caught via
+  `git status`/`git diff` before the fix was committed and reverted with
+  `git checkout -- mcp-servers/local-coder/config.yaml`. **Worth watching
+  for in later tasks**: run `git status` before every commit review, not
+  just `git diff --stat BASE..HEAD`, since an uncommitted working-tree
+  mutation wouldn't show up in a commit-range diff at all.
 
 **Workspace:** isolated git worktree at
 `.worktrees/local-coder-impl/` (relative to the main checkout at
