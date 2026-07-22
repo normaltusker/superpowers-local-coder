@@ -155,8 +155,10 @@ end to end.
 **Workspace:** isolated git worktree at
 `.worktrees/local-coder-impl/` (relative to the main repo checkout root),
 on branch `local-coder-impl`, pushed to `origin`, tracking `origin/dev`.
-**No PR opened yet for this branch** — that happens after all 9 tasks +
-final review are complete, per `finishing-a-development-branch`.
+**PR #2 is open** (`local-coder-impl` → `dev`) — see line 16 above for
+the link and current status. The worktree stays alive for iterating on
+review feedback; `finishing-a-development-branch`'s Option 2 ("push and
+create PR") is what opened it, and that step is already done.
 
 If resuming in a fresh session: `cd .worktrees/local-coder-impl` (or if
 that worktree doesn't exist in your checkout, `git worktree list` from the
@@ -274,7 +276,10 @@ match this, that's a bug — the plan's every code sample already does.
 
 ## Execution mode
 
-`superpowers:subagent-driven-development` — fresh implementer subagent per
-task, task-scoped reviewer after each, final whole-branch review after
-Task 9, then `superpowers:finishing-a-development-branch` (which will
-open the actual PR for this branch against `dev`).
+`superpowers:subagent-driven-development` was used to build all 9 tasks +
+the Task 6.5 addendum — fresh implementer subagent per task, task-scoped
+reviewer after each, final whole-branch review, then
+`superpowers:finishing-a-development-branch`, which opened PR #2. **All of
+this is done.** Any further work on this branch (e.g. responding to new
+review comments) happens as direct fix-and-reply cycles against the open
+PR, not another full SDD pass.
