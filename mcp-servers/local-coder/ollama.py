@@ -8,10 +8,12 @@ class OllamaUnavailableError(Exception):
 def list_ollama_models() -> list[str]:
     try:
         result = subprocess.run(
-            ["ollama", "list"], capture_output=True, text=True
+            ["ollama", "list"], capture_output=True, text=True, timeout=10
         )
     except FileNotFoundError as e:
         raise OllamaUnavailableError("ollama is not on PATH") from e
+    except subprocess.TimeoutExpired as e:
+        raise OllamaUnavailableError("ollama list timed out") from e
 
     if result.returncode != 0:
         raise OllamaUnavailableError(

@@ -1,7 +1,15 @@
+import re
 import selectors
 import subprocess
 import time
 from typing import Callable
+
+# Branch names must start with an alphanumeric character and may only
+# contain alphanumerics, `.`, `_`, `/`, and `-` after that. This rejects
+# names starting with `-` (e.g. `--orphan`, `-x`), which git would
+# otherwise interpret as a flag rather than a ref name when passed as a
+# bare positional argument.
+_VALID_BRANCH_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 
 
 class StallError(Exception):
@@ -10,7 +18,17 @@ class StallError(Exception):
         super().__init__(f"stalled: no output for {stall_timeout_seconds}s")
 
 
+def validate_branch_name(branch: str) -> None:
+    if not branch or not _VALID_BRANCH_NAME.match(branch):
+        raise ValueError(
+            f"Invalid branch name: {branch!r}. Branch names must start "
+            "with an alphanumeric character and contain only letters, "
+            "digits, '.', '_', '/', or '-'."
+        )
+
+
 def ensure_branch(repo_path: str, branch: str) -> None:
+    validate_branch_name(branch)
     verify = subprocess.run(
         ["git", "-C", repo_path, "rev-parse", "--verify", branch],
         capture_output=True,
@@ -94,6 +112,12 @@ def run_monitored_subprocess(
                 raise StallError(stall_timeout_seconds)
     finally:
         selector.close()
+        if process.poll() is None:
+            # An unexpected exception (e.g. from on_tick, or from
+            # selector.select()/readline()) left the subprocess running.
+            # Don't leak it — kill and reap it here.
+            process.kill()
+            process.wait()
 
     returncode = process.wait()
     return subprocess.CompletedProcess(

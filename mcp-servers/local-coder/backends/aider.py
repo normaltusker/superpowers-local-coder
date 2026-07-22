@@ -17,6 +17,10 @@ class AiderBackend(BackendAdapter):
         model: str | None = None,
         on_tick: Callable[[], None] | None = None,
     ) -> CompletionResult:
+        model = model or config.get("model")
+        if not model:
+            return CompletionResult(success=False, error="no model specified")
+
         common.ensure_branch(repo_path, branch)
         pre_head, _ = common.snapshot_working_tree(repo_path)
 

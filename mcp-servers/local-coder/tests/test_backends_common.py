@@ -41,6 +41,26 @@ def test_ensure_branch_checks_out_existing_branch(git_repo):
     assert result.stdout.strip() == "existing-branch"
 
 
+def test_ensure_branch_rejects_branch_name_starting_with_dash(git_repo):
+    with pytest.raises(ValueError, match="[Ii]nvalid branch name"):
+        common.ensure_branch(str(git_repo), "--orphan")
+
+
+def test_ensure_branch_rejects_short_flag_like_branch_name(git_repo):
+    with pytest.raises(ValueError, match="[Ii]nvalid branch name"):
+        common.ensure_branch(str(git_repo), "-x")
+
+
+def test_ensure_branch_accepts_normal_branch_name(git_repo):
+    # sanity check the validator doesn't reject legitimate names
+    common.ensure_branch(str(git_repo), "feature/valid-branch_1.0")
+    result = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=git_repo,
+        capture_output=True, text=True, check=True,
+    )
+    assert result.stdout.strip() == "feature/valid-branch_1.0"
+
+
 def test_snapshot_working_tree_returns_head_and_clean_status(git_repo):
     pre_head, porcelain = common.snapshot_working_tree(str(git_repo))
 
@@ -83,3 +103,31 @@ def test_run_monitored_subprocess_raises_stall_error_when_no_output():
             ["sleep", "2"], cwd=".",
             stall_timeout_seconds=0.2, idle_notify_interval_seconds=0.05,
         )
+
+
+def test_run_monitored_subprocess_kills_process_when_on_tick_raises():
+    captured_pid = {}
+    real_popen = subprocess.Popen
+
+    def spying_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        captured_pid["pid"] = proc.pid
+        captured_pid["proc"] = proc
+        return proc
+
+    def blowup_on_tick():
+        raise RuntimeError("on_tick blew up")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(subprocess, "Popen", spying_popen)
+        with pytest.raises(RuntimeError, match="on_tick blew up"):
+            common.run_monitored_subprocess(
+                ["sleep", "5"], cwd=".",
+                stall_timeout_seconds=5, idle_notify_interval_seconds=0.05,
+                on_tick=blowup_on_tick,
+            )
+
+    # give the OS a moment to reap; poll() returns None while still running
+    proc = captured_pid["proc"]
+    proc.wait(timeout=2)
+    assert proc.poll() is not None  # process must have been killed, not leaked

@@ -41,3 +41,22 @@ def test_list_ollama_models_raises_when_command_fails():
     with patch("subprocess.run", return_value=mock_result):
         with pytest.raises(ollama.OllamaUnavailableError):
             ollama.list_ollama_models()
+
+
+def test_list_ollama_models_raises_when_command_times_out():
+    import subprocess as subprocess_module
+
+    with patch(
+        "subprocess.run",
+        side_effect=subprocess_module.TimeoutExpired(cmd=["ollama", "list"], timeout=10),
+    ):
+        with pytest.raises(ollama.OllamaUnavailableError, match="timed out"):
+            ollama.list_ollama_models()
+
+
+def test_list_ollama_models_passes_timeout_to_subprocess_run():
+    mock_result = MagicMock(returncode=0, stdout=SAMPLE_OLLAMA_LIST_OUTPUT)
+    with patch("subprocess.run", return_value=mock_result) as mock_run:
+        ollama.list_ollama_models()
+
+    assert mock_run.call_args.kwargs.get("timeout") == 10

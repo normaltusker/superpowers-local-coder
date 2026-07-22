@@ -116,6 +116,41 @@ def test_run_backend_forwards_on_tick_to_run_monitored_subprocess(git_repo):
     assert captured["on_tick"] is my_on_tick
 
 
+def test_run_backend_falls_back_to_config_model_when_model_arg_is_none(git_repo):
+    captured = {}
+
+    def fake_run(cmd, cwd, stall_timeout_seconds, idle_notify_interval_seconds, on_tick=None):
+        captured["cmd"] = cmd
+        (git_repo / "new_file.py").write_text("# new\n")
+        subprocess.run(["git", "add", "new_file.py"], cwd=git_repo, check=True)
+        subprocess.run(["git", "commit", "-m", "aider commit"], cwd=git_repo, check=True, capture_output=True)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    config_with_model = {**BASE_CONFIG, "model": "ollama/qwen3-coder:30b"}
+    backend = AiderBackend()
+    with patch.object(common, "run_monitored_subprocess", side_effect=fake_run):
+        result = backend.run_backend(
+            task="add a file", repo_path=str(git_repo), branch="test-branch",
+            config=config_with_model, model=None,
+        )
+
+    assert result.success is True
+    assert "ollama/qwen3-coder:30b" in captured["cmd"]
+
+
+def test_run_backend_returns_clean_error_when_no_model_available(git_repo):
+    backend = AiderBackend()
+    with patch.object(common, "run_monitored_subprocess") as mock_run:
+        result = backend.run_backend(
+            task="add a file", repo_path=str(git_repo), branch="test-branch",
+            config=BASE_CONFIG, model=None,
+        )
+
+    assert result.success is False
+    assert "no model specified" in result.error
+    mock_run.assert_not_called()
+
+
 def test_run_backend_creates_branch_if_missing(git_repo):
     def fake_run(cmd, cwd, stall_timeout_seconds, idle_notify_interval_seconds, on_tick=None):
         subprocess.run(["git", "commit", "--allow-empty", "-m", "aider commit"], cwd=git_repo, check=True, capture_output=True)
