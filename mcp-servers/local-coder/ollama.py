@@ -10,10 +10,16 @@ def list_ollama_models() -> list[str]:
         result = subprocess.run(
             ["ollama", "list"], capture_output=True, text=True, timeout=10
         )
-    except FileNotFoundError as e:
-        raise OllamaUnavailableError("ollama is not on PATH") from e
     except subprocess.TimeoutExpired as e:
         raise OllamaUnavailableError("ollama list timed out") from e
+    except OSError as e:
+        # FileNotFoundError (ollama not on PATH) is itself a subclass of
+        # OSError, so this also naturally covers that case. Catching the
+        # broader OSError additionally covers e.g. a PermissionError if
+        # `ollama` exists but isn't executable — without this, such an
+        # error would leak as a raw OSError instead of the documented
+        # OllamaUnavailableError.
+        raise OllamaUnavailableError(f"could not run ollama: {e}") from e
 
     if result.returncode != 0:
         raise OllamaUnavailableError(

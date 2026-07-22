@@ -36,6 +36,16 @@ def test_list_ollama_models_raises_when_ollama_not_on_path():
             ollama.list_ollama_models()
 
 
+def test_list_ollama_models_raises_when_generic_os_error():
+    # e.g. a PermissionError if `ollama` exists on PATH but isn't
+    # executable — a broader OSError than the FileNotFoundError case, but
+    # should still be converted to the documented OllamaUnavailableError
+    # rather than leaking as a raw OSError.
+    with patch("subprocess.run", side_effect=PermissionError("not executable")):
+        with pytest.raises(ollama.OllamaUnavailableError):
+            ollama.list_ollama_models()
+
+
 def test_list_ollama_models_raises_when_command_fails():
     mock_result = MagicMock(returncode=1, stdout="", stderr="connection refused")
     with patch("subprocess.run", return_value=mock_result):

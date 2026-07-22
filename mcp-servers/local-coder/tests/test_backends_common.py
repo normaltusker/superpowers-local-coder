@@ -5,6 +5,26 @@ import time
 import pytest
 
 from backends import common
+from backends.base import BackendAdapter, CompletionResult
+
+
+def test_backend_adapter_subclass_missing_self_commits_fails_at_definition_time():
+    with pytest.raises(TypeError, match="self_commits"):
+        class IncompleteBackend(BackendAdapter):
+            def run_backend(self, task, repo_path, branch, config, model=None, on_tick=None):
+                return CompletionResult(success=True)
+
+
+def test_backend_adapter_subclass_with_self_commits_defines_cleanly():
+    class CompleteBackend(BackendAdapter):
+        self_commits = True
+
+        def run_backend(self, task, repo_path, branch, config, model=None, on_tick=None):
+            return CompletionResult(success=True)
+
+    assert CompleteBackend.self_commits is True
+    backend = CompleteBackend()
+    assert backend.run_backend("t", "r", "b", {}).success is True
 
 # git_repo fixture is shared via conftest.py
 
