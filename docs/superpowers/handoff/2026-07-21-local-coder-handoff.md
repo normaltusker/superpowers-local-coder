@@ -11,9 +11,11 @@ session end — a stale handoff is worse than none.
 implementation plan via `superpowers:subagent-driven-development`,
 task-by-task.** Check the progress ledger (see below) for exactly which
 tasks are done — trust it and `git log` over this prose if they conflict.
-As of this update: Tasks 1-4 complete and reviewed clean; Task 5 fixed
-after one review round and awaiting re-review. See "Gotchas hit during
-execution" below for the specifics of every fix round so far.
+As of this update: Tasks 1-5 complete, reviewed clean. Task 6 implemented
+(40/40 full suite passing) and awaiting review — but Task 6 required a
+**binding plan correction** before it could even be attempted the second
+time (see the FastMCP `**kwargs` entry below — this changes `configure`'s
+actual signature going forward, not just a workaround).
 
 ## Gotchas hit during execution (read before dispatching later tasks)
 
@@ -60,8 +62,30 @@ execution" below for the specifics of every fix round so far.
   since every original test happened to pass `model`/`fallback_models`
   via `overrides` whenever it mattered) — fixed to match the plan's exact
   unconditional form, plus a new regression test specifically covering
-  the previously-uncovered case. Re-review pending as of this handoff
-  update.
+  the previously-uncovered case. Approved on re-review.
+- **Task 6's original `configure`/`_configure_impl` signature used
+  `**overrides` to reach config fields not in the named parameter list
+  (mirroring the design spec's own documented signature) — but the
+  installed `fastmcp` (3.4.4) raises `ValueError: Functions with **kwargs
+  are not supported as tools` at `@mcp.tool()` DECORATION time (module
+  import), before any test or call can even happen.** This isn't a bug in
+  implementer code — it's a real incompatibility between the design
+  spec/plan's specified signature and the actual FastMCP version
+  installed. The first Task 6 dispatch correctly identified this, refused
+  to unilaterally patch a public API signature, and reported BLOCKED with
+  three resolution options. **Decision made: enumerate all 11 config.yaml
+  keys as explicit named parameters on `configure`/`_configure_impl`,
+  dropping `**overrides` entirely** — the key set is fixed/closed, so
+  nothing is actually lost, and MCP clients get a properly typed schema
+  per field. **This is now the plan's binding, committed signature for
+  `configure`** (see `docs/superpowers/plans/2026-07-21-local-coder-phase1.md`,
+  Task 6 section, and commit `7c2af76`) — if you're implementing Codex/
+  Gemini/OpenRouter in a later phase and see any reference elsewhere
+  (design spec, memory) to `configure(..., **overrides)`, that's now
+  stale; the actual `configure` tool takes named parameters only.
+  `config.py`'s internal `configure_with_validation(overrides: dict)`
+  from Task 5 is UNAFFECTED — it's never `@mcp.tool()`-decorated and can
+  keep taking a plain dict; only the two MCP-facing functions changed.
 - **A checked-in file (`config.yaml`) got silently mutated on disk**
   during Task 5's fix work — quoted YAML strings (`"aider"`) became
   unquoted (`aider`), same values, no functional change, but real

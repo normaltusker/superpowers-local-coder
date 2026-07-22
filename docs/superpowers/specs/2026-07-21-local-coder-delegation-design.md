@@ -368,7 +368,17 @@ the list actually completed the task.
    `{"success": false, "error": "..."}` (error lists each model tried and
    why, for the model-failure case) with no PR attempted.
 
-**`configure(backend=None, model=None, target_repo_path=None, open_pr=None, **overrides) -> dict`**
+**`configure(backend=None, model=None, fallback_models=None, max_fallback_models=None, stall_timeout_seconds=None, target_repo_path=None, branch_prefix=None, open_pr=None, pr_base_branch=None, idle_notify_interval_seconds=None, extra_backend_args=None) -> dict`**
+
+**Correction (discovered during Phase 1 implementation, see the plan's
+Task 6 section):** every `config.yaml` key is now an explicit named
+parameter — no `**overrides` catch-all. The installed FastMCP (3.4.4)
+rejects any `@mcp.tool()`-decorated function with a `**kwargs`-style
+parameter at decoration time; since the config-key set is fixed and
+known (11 keys), enumerating them explicitly loses nothing and gives MCP
+clients a properly typed schema per field instead of an opaque
+passthrough. Any other reference in this document implying a catch-all
+`**overrides` is superseded by this signature.
 
 Merges only the provided keys into `config.yaml` (untouched keys keep their
 current value), writes it back, returns the full resulting config so the
