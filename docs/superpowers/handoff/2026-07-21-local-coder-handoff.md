@@ -11,12 +11,19 @@ session end — a stale handoff is worse than none.
 implementation plan via `superpowers:subagent-driven-development`,
 task-by-task.** Check the progress ledger (see below) for exactly which
 tasks are done — trust it and `git log` over this prose if they conflict.
-As of this update: Tasks 1-7 AND Task 6.5 all complete and reviewed
-clean. The whole `mcp-servers/local-coder/` server is built, tested
-(43/43), and its README/MCP registration are verified accurate. Task 8
-(subagent definition + SDD skill rewiring) implemented and awaiting
-review. Only Task 9 (final verification checkpoint, no new code) remains
-after Task 8's review closes.
+**ALL 9 PLAN TASKS + THE TASK 6.5 ADDENDUM ARE COMPLETE AND REVIEWED
+CLEAN.** Task 9 (verification-only, no code) also done — 43/43 full
+suite passing, no stray `general-purpose` references, fork-divergence
+markers confirmed in both rewired skill files. **Currently: the final
+whole-branch code review is dispatched (on the most capable model), per
+`subagent-driven-development`'s process — this is the last gate before
+`finishing-a-development-branch`.** If resuming and this review hasn't
+completed yet, check for its result before doing anything else; if it
+already completed with findings, those need a fix round + re-review
+before merge. If it came back clean, the next and final step is inviting
+`superpowers:finishing-a-development-branch` to decide how this branch
+gets proposed for merge (a new PR from `local-coder-impl` into `dev`, most
+likely — no PR exists for this branch yet).
 
 **Plan file note:** `docs/superpowers/plans/2026-07-21-local-coder-phase1.md`
 now has a "Task 6.5" section inserted between Task 6 and Task 7 — this
