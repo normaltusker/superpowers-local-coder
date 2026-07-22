@@ -32,13 +32,43 @@ GitHub. A dedicated review of just this fix batch (most capable model,
 7 specific correctness checks with file:line evidence) came back clean.
 **55/55 tests passing now** (12 new TDD tests from this round).
 
-**Current state: PR #2 is open, all review rounds clean, nothing else
-pending.** If resuming: check `gh pr view 2 --repo
+**After that, cubic-dev-ai reviewed the PR and found 36 more findings.**
+Per explicit direction from the repo owner: 5 acknowledged as scope/process
+trade-offs (Phase 1's dev-env-only scope, no Windows support, TDD becoming
+brief-dependent under delegation, SDD's hard dependency on the local-coder
+MCP tool being available, missing formal skill-eval evidence for the
+SKILL.md/implementer-prompt.md changes) — **left open on GitHub
+deliberately**, not fixed, not resolved. 2 skipped with documented reason
+(delegating branch validation to `git check-ref-format`; splitting
+requirements.txt into prod/dev files). **29 fixed** across 13 commits,
+including a genuinely investigated correctness bug (aider's
+`apply_updates()`/`auto_commit()` are non-atomic — a stall-kill mid-run
+could leave partial uncommitted writes for the next failover model to run
+on top of; fixed with scoped working-tree restoration) and a real behavior
+change (`branch_prefix` config is now actually applied, was previously
+dead). A dedicated review of the largest fix batch (most capable model)
+empirically verified the three highest-risk changes — not just read the
+code, actually ran tests confirming multi-byte UTF-8 correctly reassembles
+across a subprocess read boundary, and that pre-existing dirty working-tree
+state survives the new cleanup logic untouched. **Two findings were missed
+in the original triage and one was incorrectly marked fixed** (caught
+during a self-audit of my own reply batch, not by an external reviewer) —
+corrected in a follow-up round: `stall_timeout_seconds`/
+`idle_notify_interval_seconds` now validated as strictly positive,
+unbounded subprocess-output memory accumulation now bounded to a tail
+buffer, and the implementer-prompt.md's "what to do when verification
+finds a gap" instruction gap fixed. **92/92 tests passing** (up from 43 at
+merge-ready, 55 after CodeRabbit, 87 after the first cubic batch).
+
+**Current state: PR #2 is open. 49 of 54 total review threads resolved;
+5 left open intentionally** (the acknowledge-only scope findings above —
+do not resolve these without the repo owner's say-so, they represent open
+design questions, not defects). If resuming: check `gh pr view 2 --repo
 normaltusker/superpowers-local-coder` for any NEW review activity since
 this handoff was written before assuming there's nothing left to do —
-CI/review bots may have posted more since. If truly nothing new, this
-work is done; merging the PR is the human's call, not something to do
-unprompted.
+CI/review bots may have posted more since. If truly nothing new beyond
+the 5 intentionally-open threads, this work is done; merging the PR is
+the human's call, not something to do unprompted.
 
 **Plan file note:** `docs/superpowers/plans/2026-07-21-local-coder-phase1.md`
 now has a "Task 6.5" section inserted between Task 6 and Task 7 — this
