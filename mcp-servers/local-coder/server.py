@@ -1,0 +1,177 @@
+import subprocess
+
+from fastmcp import FastMCP
+
+import config as config_module
+from backends.aider import AiderBackend
+from backends.codex import CodexBackend
+from backends.gemini import GeminiBackend
+from backends.openrouter import OpenRouterBackend
+
+mcp = FastMCP("local-coder")
+
+BACKENDS = {
+    "aider": AiderBackend,
+    "codex": CodexBackend,
+    "gemini": GeminiBackend,
+    "openrouter": OpenRouterBackend,
+}
+
+
+def _has_origin_remote(repo_path: str) -> bool:
+    result = subprocess.run(
+        ["git", "-C", repo_path, "remote"],
+        capture_output=True, text=True,
+    )
+    return "origin" in result.stdout.split()
+
+
+def _has_open_pr(repo_path: str, branch: str) -> bool:
+    result = subprocess.run(
+        ["gh", "pr", "view", branch],
+        cwd=repo_path, capture_output=True, text=True,
+    )
+    return result.returncode == 0
+
+
+def _delegate_implementation_impl(
+    task: str, branch: str, target_repo_path: str | None = None
+) -> dict:
+    cfg = config_module.load_config()
+    repo_path = target_repo_path or cfg.get("target_repo_path")
+    if not repo_path:
+        return {"success": False, "error": "target_repo_path not provided and not set in config"}
+
+    backend_name = cfg["backend"]
+    backend_cls = BACKENDS.get(backend_name)
+    if backend_cls is None:
+        return {"success": False, "error": f"unknown backend: {backend_name}"}
+    backend = backend_cls()
+
+    attempt_models = [cfg["model"], *cfg.get("fallback_models", [])]
+    attempt_errors = []
+
+    for model in attempt_models:
+        try:
+            result = backend.run_backend(task, repo_path, branch, cfg, model=model)
+        except NotImplementedError as e:
+            return {"success": False, "error": str(e)}
+
+        if result.success:
+            note = None
+            pr_url = None
+            if _has_origin_remote(repo_path):
+                push = subprocess.run(
+                    ["git", "-C", repo_path, "push", "-u", "origin", branch],
+                    capture_output=True, text=True,
+                )
+                if push.returncode != 0:
+                    return {"success": False, "error": f"git push failed: {push.stderr.strip()}"}
+
+                if cfg.get("open_pr") and not _has_open_pr(repo_path, branch):
+                    pr = subprocess.run(
+                        ["gh", "pr", "create", "--fill", "--head", branch,
+                         "--base", cfg["pr_base_branch"]],
+                        cwd=repo_path, capture_output=True, text=True,
+                    )
+                    if pr.returncode == 0:
+                        pr_url = pr.stdout.strip()
+            else:
+                note = "no origin remote configured; commit created locally, nothing pushed"
+
+            return {
+                "success": True,
+                "pr_url": pr_url,
+                "branch": branch,
+                "files_changed": result.files_changed,
+                "model_used": model,
+                "summary": f"Implemented via {backend_name} ({model})",
+                **({"note": note} if note else {}),
+            }
+
+        attempt_errors.append(f"{model}: {result.error}")
+
+    return {
+        "success": False,
+        "error": "all models failed — " + "; ".join(attempt_errors),
+    }
+
+
+def _configure_impl(
+    backend: str | None = None,
+    model: str | None = None,
+    fallback_models: list[str] | None = None,
+    max_fallback_models: int | None = None,
+    stall_timeout_seconds: float | None = None,
+    target_repo_path: str | None = None,
+    branch_prefix: str | None = None,
+    open_pr: bool | None = None,
+    pr_base_branch: str | None = None,
+    idle_notify_interval_seconds: float | None = None,
+    extra_backend_args: list[str] | None = None,
+) -> dict:
+    all_overrides = {
+        "backend": backend,
+        "model": model,
+        "fallback_models": fallback_models,
+        "max_fallback_models": max_fallback_models,
+        "stall_timeout_seconds": stall_timeout_seconds,
+        "target_repo_path": target_repo_path,
+        "branch_prefix": branch_prefix,
+        "open_pr": open_pr,
+        "pr_base_branch": pr_base_branch,
+        "idle_notify_interval_seconds": idle_notify_interval_seconds,
+        "extra_backend_args": extra_backend_args,
+    }
+    all_overrides = {k: v for k, v in all_overrides.items() if v is not None}
+
+    try:
+        return config_module.configure_with_validation(all_overrides)
+    except config_module.ConfigValidationError as e:
+        return {"success": False, "error": str(e)}
+
+
+def _list_available_models_impl() -> dict:
+    try:
+        models = config_module.list_available_models_with_prefix()
+    except Exception as e:
+        return {"error": str(e)}
+    return {"models": models}
+
+
+@mcp.tool()
+def delegate_implementation(
+    task: str, branch: str, target_repo_path: str | None = None
+) -> dict:
+    return _delegate_implementation_impl(task, branch, target_repo_path)
+
+
+@mcp.tool()
+def configure(
+    backend: str | None = None,
+    model: str | None = None,
+    fallback_models: list[str] | None = None,
+    max_fallback_models: int | None = None,
+    stall_timeout_seconds: float | None = None,
+    target_repo_path: str | None = None,
+    branch_prefix: str | None = None,
+    open_pr: bool | None = None,
+    pr_base_branch: str | None = None,
+    idle_notify_interval_seconds: float | None = None,
+    extra_backend_args: list[str] | None = None,
+) -> dict:
+    return _configure_impl(
+        backend, model, fallback_models, max_fallback_models,
+        stall_timeout_seconds, target_repo_path, branch_prefix,
+        open_pr, pr_base_branch, idle_notify_interval_seconds,
+        extra_backend_args,
+    )
+
+
+@mcp.tool()
+def list_available_models() -> dict:
+    return _list_available_models_impl()
+
+
+if __name__ == "__main__":
+    mcp.run()
