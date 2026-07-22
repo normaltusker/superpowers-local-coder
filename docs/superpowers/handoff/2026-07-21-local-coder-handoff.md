@@ -302,25 +302,85 @@ worktree.**
 **Do NOT hand-edit `config.yaml` while a `delegate_implementation`/
 `configure` call may still be in flight against it** — the running
 server process owns reads/writes to this file mid-call; editing it
-concurrently risks a race. **Once the retry has fully finished (check
-`ps aux | grep aider` is clear first): revert `target_repo_path` back
-to `null` before committing** (per explicit decision — a hardcoded
-personal absolute machine path doesn't belong in shared `dev` history),
-**but keep the `fallback_models: [ollama/qwen2.5-coder:7b]` change**
-(a real, useful default for this environment going forward). Then
-`git add`/commit/push from the worktree as usual.
+concurrently risks a race. (This was respected: the config cleanup
+below only happened after confirming via `ps aux` that nothing was
+still running against it — see "`config.yaml` cleanup — DONE" further
+down for the final outcome, which ended up reverting BOTH fields, not
+just `target_repo_path` as originally planned here.)
 
-**If resuming and the retry's result is now known:** update this section
-with what happened (did the primary model succeed this time now that
-it's presumably warm/loaded from the first attempt? did it fail over to
-the 7b fallback? did EITHER complete — file written, commit landed, on
-what branch? did the reviewer approve? was a PR offered?) before doing
-anything else, then decide whether item 1 is COMPLETE. **If resuming and
-this result is NOT yet known**, re-send the exact retry instruction
-above in the repo-root session (`local-coder` connected there) — don't
-regenerate a different instruction, use this one so the record stays
-consistent. Also re-check `ps aux | grep -E "aider|ollama"` first in
-case it's still mid-run rather than actually stuck.
+**Retry outcome: INCONCLUSIVE — interrupted deliberately, not a failure
+or a stall.** The retry (primary `qwen3-coder:30b`, fallback
+`qwen2.5-coder:7b`) was mid-run — confirmed via `ps aux` it had actually
+failed over to `qwen2.5-coder:7b` (the process's own argv showed
+`--model ollama/qwen2.5-coder:7b`, proving the failover path fired for
+real) — when the user raised a legitimate concern: **running aider fully
+headless, with zero live visibility into what it's doing, is genuinely
+concerning, not just a minor inconvenience.** User chose to stop that
+run and fix visibility before continuing rather than let it finish and
+get today's pass/fail signal. `README.md` was never modified by either
+attempt, so item 1 is still not complete — but this is now considered
+correctly paused, not stalled/broken.
+
+**Visibility gap — FIXED, commit `870cb9a`.** Root cause: aider's
+stdout/stderr was fully captured by `run_monitored_subprocess` (bounded
+20K-char tail) but never surfaced anywhere live — not to a terminal, not
+to the MCP client, not even via the existing `on_tick` progress hook
+(which only ever printed a generic "still running" heartbeat with no
+access to the actual output). The only visibility was the tail dumped
+into an error message after the whole call already finished or failed.
+
+**Fix implemented, full TDD (106/106 tests passing):** added
+`on_output: Callable[[str], None] | None` to
+`run_monitored_subprocess` in `backends/common.py`, fired with each
+decoded chunk as it's read (main loop + the post-exit drain loop) —
+additive, backward-compatible, existing callers unaffected. Threaded
+through `BackendAdapter.run_backend`'s abstract interface and all 4
+backend implementations/stubs (aider real, codex/gemini/openrouter
+stubs). Wired in `server.py`'s `make_on_output` factory (mirroring the
+existing `make_on_tick`) to `print()` each chunk to the **local-coder
+MCP server's own stderr** immediately, prefixed with the model name
+(`[local-coder:ollama/qwen3-coder:30b] <chunk>`), alongside the existing
+on_tick heartbeat. Manually verified end-to-end with a real subprocess
+(not just unit tests) that chunks stream through as they arrive, not
+buffered until exit.
+
+**OPEN QUESTION, not yet answered: how do you actually WATCH the
+local-coder MCP server's stderr live in this Claude Code setup?** The
+mechanism (chunks reaching stderr) is proven; where that stderr actually
+surfaces to a human watching — a log file, a Claude Code UI panel, a
+`tail -f` target — was NOT verified, to avoid documenting an unconfirmed
+guess. `~/Library/Logs/Claude/` exists but appeared to be the desktop
+app's own logs, not obviously the MCP subprocess's stderr; no MCP-
+specific log file was found via search. **Next real attempt at item 1
+should specifically check where this output lands** (try
+`claude mcp list`'s own surrounding UI, ask Claude Code directly "where
+can I see the local-coder MCP server's stderr", or check for a
+`--verbose`/`--debug` flag on the `claude` CLI that surfaces subprocess
+stderr) and record the answer here once confirmed — don't assume it
+works until someone has actually watched a real chunk arrive live.
+
+**`config.yaml` cleanup — DONE.** Confirmed via `ps aux` that no
+`aider`/subprocess was running before touching the file (the interrupted
+retry had already been killed/exited). Reverted BOTH
+`fallback_models` (back to `[]`) AND `target_repo_path` (back to
+`null`) — the earlier plan was to keep `fallback_models` as
+`qwen2.5-coder:7b`, but that got revisited: 6 tests hardcode the
+original empty-list default via the `isolated_config` fixture (which
+copies the LIVE `config.yaml`, not a fixed baseline — a real fragility
+in that fixture, not touched here since it's pre-existing and out of
+scope for this fix), and rather than update 6 tests for what was really
+just a local convenience, the decision was to keep the shipped default
+as-is. `git diff config.yaml` now shows zero changes — fully reverted to
+match `dev`.
+
+**If resuming: item 1 (the smoke test) has still never completed
+successfully.** The next attempt should (a) first resolve the "where do
+I watch stderr" open question above, (b) re-send the same Quick
+Reference task (text preserved above under "Smoke test attempt #2") to
+the repo-root session where `local-coder` is connected, (c) actually
+watch it run this time instead of waiting blind, (d) record the
+outcome. Don't re-litigate the visibility fix — it's done and tested;
+only the "where do I watch it" question remains.
 
 ### Housekeeping for Phase 2
 
@@ -380,23 +440,25 @@ and paste this:
 ```
 Read docs/superpowers/handoff/2026-07-21-local-coder-handoff.md in the
 superpowers-local-coder repo and resume Phase 2 work from exactly where
-it left off, per the "Where things stand NOW" section at the top —
-specifically "Smoke test attempt #2," which has a task already sent to
-a local-coder-connected session but whose result was never recorded.
-First check whether that task's outcome is visible in this session's
-own prior turns (scroll back / check for a delegate_implementation tool
-call and its result); if so, report what happened and update the
-handoff doc's "Smoke test attempt #2" section with the actual outcome.
-If not (this is a genuinely fresh session with no memory of sending
-that task), re-send the exact task text from that section to test
-subagent-driven-development + local-coder end-to-end. Don't re-derive
-context from git log or re-read the design spec/plan from scratch — the
-handoff doc is the current source of truth. Keep the handoff doc updated
-as you go, the same way it's been maintained so far. Note: this session
-is on `dev` directly at the repo root — do not commit anything here
-without switching to an appropriate branch first; actual code/doc
-commits belong in the worktree at .worktrees/local-coder-impl/ on branch
-local-coder-impl.
+it left off, per the "Where things stand NOW" section at the top. The
+live-output visibility fix (on_output streaming to the local-coder MCP
+server's stderr) is DONE and tested (commit 870cb9a) — do not redo it.
+What's still open: (1) figure out exactly where/how to watch that
+server's stderr live in this Claude Code setup — the doc has a specific
+"OPEN QUESTION" note on this, answer it empirically (ask Claude Code
+directly, check for CLI flags, etc.) and record the answer in the doc;
+(2) once that's answered, re-send the Quick Reference smoke-test task
+(exact text preserved in the doc under "Smoke test attempt #2") to the
+repo-root session where local-coder is connected, and this time actually
+watch it run instead of waiting blind; (3) record whether item 1 (the
+Part 3 smoke test) finally completes. Don't re-derive context from git
+log or re-read the design spec/plan from scratch — the handoff doc is
+the current source of truth. Keep it updated as you go. Note: the
+repo-root session sits on `dev` directly — do not commit anything there
+without switching branches first; actual code/doc commits belong in the
+worktree at .worktrees/local-coder-impl/ on branch local-coder-impl,
+which is also where the LIVE config.yaml actually lives (see the doc's
+note on CLAUDE_PLUGIN_ROOT resolving to the worktree, not the repo root).
 ```
 
 If the plugin-connection blocker somehow regresses (e.g. `local-coder`
