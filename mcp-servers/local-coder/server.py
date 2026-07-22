@@ -115,6 +115,7 @@ async def _delegate_implementation_impl(
 
     attempt_models = [cfg["model"], *cfg.get("fallback_models", [])]
     attempt_errors = []
+    last_output_tail = ""
 
     def make_on_tick(model_name: str):
         def on_tick():
@@ -247,14 +248,17 @@ async def _delegate_implementation_impl(
                 "files_changed": result.files_changed,
                 "model_used": model,
                 "summary": f"Implemented via {backend_name} ({model})",
+                "output_tail": result.output_tail,
                 **({"note": note} if note else {}),
             }
 
         attempt_errors.append(f"{model}: {result.error}")
+        last_output_tail = result.output_tail
 
     return {
         "success": False,
         "error": "all models failed — " + "; ".join(attempt_errors),
+        "output_tail": last_output_tail,
     }
 
 

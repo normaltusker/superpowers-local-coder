@@ -541,3 +541,39 @@ def test_list_available_models_returns_clean_error_when_unreachable(isolated_con
         result = server._list_available_models_impl()
     assert "error" in result
     assert "models" not in result or result.get("models") is None
+
+
+async def test_delegate_implementation_success_includes_output_tail(isolated_config, git_repo_no_remote):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+        return CompletionResult(
+            success=True, files_changed=["a.py"], commit_sha="abc123",
+            output_tail="full aider transcript here",
+        )
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        result = await server._delegate_implementation_impl(
+            task="add a.py", branch="feature-branch",
+            target_repo_path=str(git_repo_no_remote), ctx=None,
+        )
+
+    assert result["success"] is True
+    assert result["output_tail"] == "full aider transcript here"
+
+
+async def test_delegate_implementation_all_failed_includes_last_output_tail(isolated_config, git_repo_no_remote):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+        return CompletionResult(
+            success=False, error=f"{model} failed",
+            output_tail=f"transcript from {model}",
+        )
+
+    # config has one primary model, no fallbacks (isolated_config default)
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        result = await server._delegate_implementation_impl(
+            task="add a.py", branch="feature-branch",
+            target_repo_path=str(git_repo_no_remote), ctx=None,
+        )
+
+    assert result["success"] is False
+    assert "output_tail" in result
+    assert result["output_tail"].startswith("transcript from ")
