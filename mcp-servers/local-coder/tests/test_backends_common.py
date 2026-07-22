@@ -231,6 +231,95 @@ def test_restore_working_tree_handles_filenames_with_spaces(git_repo):
     assert not (git_repo / "file with space.py").exists()
 
 
+def test_restore_working_tree_cleans_new_file_inside_already_untracked_directory(git_repo):
+    # Default `git status` collapses a whole untracked directory into one
+    # "?? dirname/" entry. If that directory was ALREADY untracked before
+    # the attempt started, both the pre- and post-attempt snapshots report
+    # the identical single collapsed entry -- a new file the attempt adds
+    # inside that same directory is invisible to the set-difference this
+    # function relies on, and never gets cleaned.
+    pre_existing_dir = git_repo / "already_untracked_dir"
+    pre_existing_dir.mkdir()
+    (pre_existing_dir / "existing.txt").write_text("pre-existing\n")
+
+    pre_head, pre_porcelain = common.snapshot_working_tree(str(git_repo))
+
+    (pre_existing_dir / "new_from_attempt.txt").write_text("added during failed attempt\n")
+
+    common.restore_working_tree(str(git_repo), pre_head, pre_porcelain)
+
+    assert (pre_existing_dir / "existing.txt").exists()
+    assert not (pre_existing_dir / "new_from_attempt.txt").exists()
+
+
+def test_restore_working_tree_preserves_pre_existing_staged_work(git_repo):
+    # A user may have staged changes (git add, not yet committed) before
+    # ever delegating to local-coder. A failed attempt's cleanup must not
+    # touch that pre-existing staged state, even though HEAD never moved.
+    user_staged_path = git_repo / "user_work.txt"
+    user_staged_path.write_text("pre-existing staged work\n")
+    subprocess.run(["git", "add", "user_work.txt"], cwd=git_repo, check=True)
+
+    pre_head, pre_porcelain = common.snapshot_working_tree(str(git_repo))
+    assert any("user_work.txt" in p for p in pre_porcelain)
+
+    (git_repo / "new_from_attempt.txt").write_text("added during failed attempt\n")
+
+    common.restore_working_tree(str(git_repo), pre_head, pre_porcelain)
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=git_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout
+    # user_work.txt must still be staged (index entry "A "), not reverted
+    # to untracked or unstaged.
+    assert "A  user_work.txt" in status
+    assert not (git_repo / "new_from_attempt.txt").exists()
+
+
+def test_restore_working_tree_rejects_pathspec_magic_in_filenames(git_repo):
+    # A file whose NAME is itself valid git pathspec magic syntax (e.g.
+    # starts with ":(glob)") can make git interpret that name as a glob
+    # pattern instead of a literal path when passed to checkout/clean --
+    # potentially matching and deleting an unrelated pre-existing file.
+    victim_path = git_repo / "victim.txt"
+    victim_path.write_text("pre-existing untracked file that must survive\n")
+
+    pre_head, pre_porcelain = common.snapshot_working_tree(str(git_repo))
+    assert any("victim.txt" in p for p in pre_porcelain)
+
+    # A maliciously/accidentally-named file whose glob would match victim.txt.
+    (git_repo / ":(glob)victim*").write_text("attempt-created file\n")
+
+    common.restore_working_tree(str(git_repo), pre_head, pre_porcelain)
+
+    assert victim_path.exists()
+    assert victim_path.read_text() == "pre-existing untracked file that must survive\n"
+
+
+def test_restore_working_tree_discards_staged_rename(git_repo):
+    # A rename marks the OLD path as deleted in the index. Restoring only
+    # the new path back to pre_head content leaves the old path missing
+    # unless both halves of the rename are addressed.
+    tracked_path = git_repo / "README.md"
+    original_content = tracked_path.read_text()
+
+    pre_head, pre_porcelain = common.snapshot_working_tree(str(git_repo))
+
+    subprocess.run(["git", "mv", "README.md", "RENAMED.md"], cwd=git_repo, check=True)
+
+    common.restore_working_tree(str(git_repo), pre_head, pre_porcelain)
+
+    assert tracked_path.exists()
+    assert tracked_path.read_text() == original_content
+    assert not (git_repo / "RENAMED.md").exists()
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=git_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert status.strip() == ""
+
+
 def test_run_monitored_subprocess_returns_completed_process_on_success():
     result = common.run_monitored_subprocess(
         ["echo", "hello"], cwd=".",

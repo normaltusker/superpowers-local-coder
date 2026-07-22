@@ -64,10 +64,16 @@ def _parse_porcelain_z(status_z: str) -> dict[str, str]:
     default mode's display-escaping (quoting paths with spaces, tabs,
     non-ASCII, etc.) — parsing the default mode's quoted text as a literal
     filesystem path silently fails to match such files at cleanup time.
+
     A rename/copy record (status code starting with R or C) is two
-    NUL-terminated fields — new path, then old path — rather than one;
-    only the new path is tracked here, since that's the one that exists
-    on disk after the rename and is what cleanup needs to act on.
+    NUL-terminated fields — new path, then old path — rather than one.
+    BOTH are included in the result: the new path under its real status
+    code (e.g. "R "), and the old path under a synthetic "D " (deleted)
+    code. This matters for restore_working_tree's cleanup — a rename
+    marks the OLD path as deleted in the index; restoring only the new
+    path back to pre_head content leaves the old path still missing.
+    Both halves of the rename need to be restored for the working tree to
+    genuinely return to its pre-attempt state.
     """
     fields = status_z.split("\0")
     result: dict[str, str] = {}
@@ -81,11 +87,47 @@ def _parse_porcelain_z(status_z: str) -> dict[str, str]:
         path = record[3:]
         result[path] = code
         if code[0] in ("R", "C"):
-            # Rename/copy records carry the old path as a second field;
-            # consume it without tracking it as a "changed" path.
+            # Rename/copy records carry the old path as a second field.
+            # For a rename (R), the old path is now genuinely absent from
+            # the working tree, so it needs restoring too — treat it as
+            # a synthetic deletion. For a copy (C), the old path is
+            # untouched (the copy created a NEW path, the original still
+            # exists as it was), so no entry is needed for it.
             i += 1
+            if i < len(fields) and code[0] == "R":
+                old_path = fields[i]
+                result[old_path] = "D "
         i += 1
     return result
+
+
+def _git_status_z(repo_path: str) -> str:
+    # --untracked-files=all reports every file inside an untracked
+    # directory individually, rather than collapsing the whole directory
+    # into one "?? dirname/" entry. Without this, a directory that was
+    # already untracked before an attempt started (so it's in
+    # pre_porcelain as a single collapsed entry) hides any NEW file the
+    # attempt adds inside that same directory — both the pre- and
+    # post-attempt snapshots report the identical single directory entry,
+    # so the set-difference this function relies on never sees the new
+    # file at all.
+    return subprocess.run(
+        ["git", "-C", repo_path, "status", "--porcelain", "-z", "--untracked-files=all"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+
+
+# Forces git to treat every pathspec argument as a literal path rather than
+# parsing pathspec "magic" syntax (e.g. a filename that happens to start
+# with `:(glob)` or `:(exclude)`). Without this, a backend-created file
+# whose name is itself valid pathspec magic can make `git clean`/`checkout`
+# interpret that filename as a glob pattern instead of a literal path —
+# verified empirically: a file named `:(glob)victim*` passed to
+# `git clean -fd --` deleted an unrelated pre-existing `victim.txt`, not
+# the maliciously-named file itself. Applied via env var (not a CLI flag —
+# older git versions don't support `--literal-pathspecs`) to every
+# subprocess call in this function that takes attempt-supplied paths.
+_LITERAL_PATHSPECS_ENV = {"GIT_LITERAL_PATHSPECS": "1"}
 
 
 def snapshot_working_tree(repo_path: str) -> tuple[str, set[str]]:
@@ -94,12 +136,7 @@ def snapshot_working_tree(repo_path: str) -> tuple[str, set[str]]:
         capture_output=True, text=True, check=True,
     ).stdout.strip()
 
-    status_z = subprocess.run(
-        ["git", "-C", repo_path, "status", "--porcelain", "-z"],
-        capture_output=True, text=True, check=True,
-    ).stdout
-
-    porcelain = set(_parse_porcelain_z(status_z).keys())
+    porcelain = set(_parse_porcelain_z(_git_status_z(repo_path)).keys())
     return pre_head, porcelain
 
 
@@ -110,64 +147,79 @@ def restore_working_tree(repo_path: str, pre_head: str, pre_porcelain: set[str])
     backend that writes files before committing, killed mid-way by a stall
     timeout).
 
-    Only undoes changes attributable to THIS attempt: HEAD is reset back to
-    `pre_head` (a no-op if the attempt never committed, which is the normal
-    case for a failure), and only paths NOT already present in
-    `pre_porcelain` are discarded — anything that was already
-    modified/untracked before the attempt started is left alone rather than
-    being blindly wiped by e.g. an unscoped `git reset --hard`.
+    Only undoes changes attributable to THIS attempt — anything already
+    present in `pre_porcelain` (modified, staged, or untracked before the
+    attempt started) is left completely alone, including its staged
+    state. This function does NOT run a blanket `git reset --mixed`: an
+    earlier version did, to handle the case of a failed attempt leaving
+    staged-but-uncommitted corruption, but a blanket reset unstages
+    EVERY staged path in the index, not just the ones this attempt
+    touched — silently discarding work the user had already staged
+    before delegation even started. Instead, each new/changed path this
+    attempt is responsible for is individually restored to its `pre_head`
+    content via `git restore --source=pre_head --staged --worktree`,
+    which resets only that path's index+worktree entry, leaving every
+    other path's index state untouched.
 
     `pre_porcelain` is a set of bare paths (from `snapshot_working_tree`,
-    which parses `-z` output), not raw porcelain lines — status codes are
-    re-fetched fresh here rather than reused from the snapshot, since a
-    path's status can change between snapshot time and restore time (e.g.
-    a file that was untracked before the attempt could have been staged
-    by the attempt itself).
+    which parses `-z --untracked-files=all` output), not raw porcelain
+    lines — status codes are re-fetched fresh here rather than reused
+    from the snapshot, since a path's status can change between snapshot
+    time and restore time (e.g. a file that was untracked before the
+    attempt could have been staged by the attempt itself).
 
-    The `reset --mixed pre_head` below runs unconditionally, even if HEAD
-    never moved (the normal case for a failure). This is required, not
-    redundant: `git checkout -- <path>` restores a path's content from the
-    INDEX, not from HEAD. If a failed attempt staged an edit to a tracked
-    file without ever committing it (e.g. killed mid-stall right after
-    `git add`, before `git commit`), the index still holds the corrupted
-    content — `checkout --` would "restore" the working tree from that
-    same corrupted staged content, doing nothing. `reset --mixed` clears
-    the index back to `pre_head`'s tree first, so the subsequent
-    `checkout --` has clean, pre-attempt content to restore from.
+    If the attempt DID commit (e.g. aider's own auto-commit) before later
+    failing, HEAD itself has moved and must be moved back — but with
+    `--soft`, which only repoints the branch and leaves the index and
+    worktree exactly as they are. This is deliberately different from
+    `--mixed`: a `--mixed` reset here would touch the index the same way
+    the removed blanket reset did. `--soft` just makes the commit's
+    changes show up as staged (as if `git add` had been run against
+    pre_head's tree) — the per-path `restore`/`clean` calls below then
+    naturally discard them like anything else new, without a separate
+    code path.
     """
-    subprocess.run(
-        ["git", "-C", repo_path, "reset", "--mixed", pre_head],
-        check=True, capture_output=True,
-    )
-
-    status_z = subprocess.run(
-        ["git", "-C", repo_path, "status", "--porcelain", "-z"],
+    current_head = subprocess.run(
+        ["git", "-C", repo_path, "rev-parse", "HEAD"],
         capture_output=True, text=True, check=True,
-    ).stdout
-    current_entries = _parse_porcelain_z(status_z)
+    ).stdout.strip()
+    if current_head != pre_head:
+        subprocess.run(
+            ["git", "-C", repo_path, "reset", "--soft", pre_head],
+            check=True, capture_output=True,
+        )
+
+    current_entries = _parse_porcelain_z(_git_status_z(repo_path))
 
     new_paths = {p: code for p, code in current_entries.items() if p not in pre_porcelain}
     if not new_paths:
         return
 
-    # Untracked paths ("??") can't be passed to `git checkout --` (it only
-    # accepts paths git already knows about) — mixing the two in one
-    # command makes the WHOLE command fail on the untracked entries,
-    # silently leaving tracked modifications uncleaned too. Split into two
-    # separate, independently-run commands instead, so one path class's
-    # cleanup can never mask the other's.
+    # A tracked-in-HEAD path (anything git already knows about, i.e. not
+    # "??") is restored to its pre_head content in both the index and the
+    # worktree — this is what correctly discards staged-but-uncommitted
+    # corruption without touching any OTHER path's staged state.
+    # Untracked ("??") paths have no HEAD content to restore from — those
+    # go through `git clean` instead, which is the only tool that can
+    # remove a path git has no history for.
     tracked_modified = [p for p, code in new_paths.items() if code != "??"]
     untracked = [p for p, code in new_paths.items() if code == "??"]
 
     if tracked_modified:
         subprocess.run(
-            ["git", "-C", repo_path, "checkout", "--", *tracked_modified],
+            [
+                "git", "-C", repo_path, "restore",
+                f"--source={pre_head}", "--staged", "--worktree", "--",
+                *tracked_modified,
+            ],
             cwd=repo_path, capture_output=True,
+            env={**os.environ, **_LITERAL_PATHSPECS_ENV},
         )
     if untracked:
         subprocess.run(
             ["git", "-C", repo_path, "clean", "-fd", "--", *untracked],
             cwd=repo_path, capture_output=True,
+            env={**os.environ, **_LITERAL_PATHSPECS_ENV},
         )
 
 
