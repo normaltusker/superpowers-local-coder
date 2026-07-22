@@ -9,6 +9,7 @@ from backends.aider import AiderBackend
 from backends.codex import CodexBackend
 from backends.gemini import GeminiBackend
 from backends.openrouter import OpenRouterBackend
+from backends.common import validate_branch_name
 
 mcp = FastMCP("local-coder")
 
@@ -40,6 +41,11 @@ async def _delegate_implementation_impl(
     task: str, branch: str, target_repo_path: str | None = None,
     ctx: Context | None = None,
 ) -> dict:
+    try:
+        validate_branch_name(branch)
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
     cfg = config_module.load_config()
     repo_path = target_repo_path or cfg.get("target_repo_path")
     if not repo_path:
@@ -72,26 +78,46 @@ async def _delegate_implementation_impl(
             )
         except NotImplementedError as e:
             return {"success": False, "error": str(e)}
+        except Exception as e:
+            # Any other unexpected exception from a backend attempt (e.g. an
+            # uncaught CalledProcessError from a backend's own git calls)
+            # shouldn't crash the whole tool call — treat it like a failed
+            # attempt and continue the failover loop to the next model.
+            attempt_errors.append(f"{model}: {e}")
+            continue
 
         if result.success:
             note = None
             pr_url = None
-            if _has_origin_remote(repo_path):
-                push = subprocess.run(
-                    ["git", "-C", repo_path, "push", "-u", "origin", branch],
-                    capture_output=True, text=True,
+            has_remote = await anyio.to_thread.run_sync(_has_origin_remote, repo_path)
+            if has_remote:
+                push = await anyio.to_thread.run_sync(
+                    lambda: subprocess.run(
+                        ["git", "-C", repo_path, "push", "-u", "origin", branch],
+                        capture_output=True, text=True,
+                    )
                 )
                 if push.returncode != 0:
-                    return {"success": False, "error": f"git push failed: {push.stderr.strip()}"}
+                    return {
+                        "success": False,
+                        "error": f"git push failed: {push.stderr.strip()}",
+                        "files_changed": result.files_changed,
+                        "commit_sha": result.commit_sha,
+                        "model_used": model,
+                    }
 
-                if cfg.get("open_pr") and not _has_open_pr(repo_path, branch):
-                    pr = subprocess.run(
-                        ["gh", "pr", "create", "--fill", "--head", branch,
-                         "--base", cfg["pr_base_branch"]],
-                        cwd=repo_path, capture_output=True, text=True,
-                    )
-                    if pr.returncode == 0:
-                        pr_url = pr.stdout.strip()
+                if cfg.get("open_pr"):
+                    has_open_pr = await anyio.to_thread.run_sync(_has_open_pr, repo_path, branch)
+                    if not has_open_pr:
+                        pr = await anyio.to_thread.run_sync(
+                            lambda: subprocess.run(
+                                ["gh", "pr", "create", "--fill", "--head", branch,
+                                 "--base", cfg["pr_base_branch"]],
+                                cwd=repo_path, capture_output=True, text=True,
+                            )
+                        )
+                        if pr.returncode == 0:
+                            pr_url = pr.stdout.strip()
             else:
                 note = "no origin remote configured; commit created locally, nothing pushed"
 

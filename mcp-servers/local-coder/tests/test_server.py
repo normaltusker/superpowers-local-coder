@@ -196,6 +196,78 @@ async def test_delegate_implementation_on_tick_logs_to_stderr_without_ctx(isolat
     assert "still running" in captured.err
 
 
+async def test_delegate_implementation_rejects_invalid_branch_name(isolated_config, git_repo_no_remote):
+    with patch("subprocess.run") as mock_run:
+        result = await server._delegate_implementation_impl(
+            task="add a.py", branch="--force",
+            target_repo_path=str(git_repo_no_remote),
+        )
+
+    assert result["success"] is False
+    assert "error" in result
+    mock_run.assert_not_called()
+
+
+async def test_delegate_implementation_generic_backend_exception_does_not_crash_and_continues_failover(isolated_config, git_repo_no_remote):
+    config_module.merge_config({"fallback_models": ["ollama/qwen2.5-coder:14b"]})
+    success_result = CompletionResult(success=True, files_changed=["a.py"], commit_sha="def456")
+
+    with patch(
+        "backends.aider.AiderBackend.run_backend",
+        side_effect=[RuntimeError("boom"), success_result],
+    ):
+        result = await server._delegate_implementation_impl(
+            task="add a.py", branch="feature-branch",
+            target_repo_path=str(git_repo_no_remote),
+        )
+
+    assert result["success"] is True
+    assert result["model_used"] == "ollama/qwen2.5-coder:14b"
+
+
+async def test_delegate_implementation_generic_exception_all_models_returns_clean_error(isolated_config, git_repo_no_remote):
+    with patch(
+        "backends.aider.AiderBackend.run_backend",
+        side_effect=RuntimeError("boom"),
+    ):
+        result = await server._delegate_implementation_impl(
+            task="add a.py", branch="feature-branch",
+            target_repo_path=str(git_repo_no_remote),
+        )
+
+    assert result["success"] is False
+    assert "error" in result
+    assert "boom" in result["error"]
+
+
+async def test_delegate_implementation_push_failure_includes_evidence(isolated_config, git_repo_with_remote):
+    subprocess.run(
+        ["git", "-C", str(git_repo_with_remote), "checkout", "-b", "feature-branch"],
+        check=True, capture_output=True,
+    )
+    fake_result = CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    real_run = subprocess.run
+
+    def fake_subprocess_run(cmd, *args, **kwargs):
+        if "push" in cmd:
+            return MagicMock(returncode=1, stdout="", stderr="rejected: non-fast-forward")
+        return real_run(cmd, *args, **kwargs)
+
+    with patch("backends.aider.AiderBackend.run_backend", return_value=fake_result):
+        with patch("subprocess.run", side_effect=fake_subprocess_run):
+            result = await server._delegate_implementation_impl(
+                task="add a.py", branch="feature-branch",
+                target_repo_path=str(git_repo_with_remote),
+            )
+
+    assert result["success"] is False
+    assert "push failed" in result["error"]
+    assert result["files_changed"] == ["a.py"]
+    assert result["commit_sha"] == "abc123"
+    assert result["model_used"] == "ollama/qwen3-coder:30b"
+
+
 def test_configure_returns_full_config(isolated_config):
     with patch("ollama.list_ollama_models", return_value=["qwen2.5-coder:14b"]):
         result = server._configure_impl(model="ollama/qwen2.5-coder:14b")

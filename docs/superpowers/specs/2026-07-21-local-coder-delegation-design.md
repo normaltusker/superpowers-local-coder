@@ -355,17 +355,20 @@ the list actually completed the task.
      was configured so nothing was pushed.
    - **`origin` exists:** `git push -u origin branch`. If the push itself
      fails (e.g. rejected, network error — a different failure mode from
-     "no remote configured"), return `{"success": false, "error": "..."}`;
-     the commit still exists locally (see "Error handling" below). If the
-     push succeeds and `config["open_pr"]` is true AND `gh pr view branch`
-     finds no existing open PR, run `gh pr create --fill --head branch
-     --base {pr_base_branch}` and capture its URL; otherwise `pr_url` is
-     `null`.
+     "no remote configured"), return `{"success": false, "error": "...",
+     "files_changed": [...], "commit_sha": "...", "model_used": "..."}` —
+     the commit still exists locally (see "Error handling" below), and the
+     extra fields let the caller confirm the implementation itself
+     succeeded without shelling out to `git log`. If the push succeeds and
+     `config["open_pr"]` is true AND `gh pr view branch` finds no existing
+     open PR, run `gh pr create --fill --head branch --base
+     {pr_base_branch}` and capture its URL; otherwise `pr_url` is `null`.
 5. Return `{"pr_url": ..., "branch": ..., "files_changed": [...], "model_used": ..., "summary": "..."}`
    on success (`pr_url` may be `null` per above). On total failure (every
-   model in the attempt order failed, or a configured push failed), return
-   `{"success": false, "error": "..."}` (error lists each model tried and
-   why, for the model-failure case) with no PR attempted.
+   model in the attempt order failed), return `{"success": false, "error":
+   "..."}` (error lists each model tried and why) with no PR attempted. On
+   a push failure specifically, the failure response additionally carries
+   `files_changed`, `commit_sha`, and `model_used` (see above).
 
 **`configure(backend=None, model=None, fallback_models=None, max_fallback_models=None, stall_timeout_seconds=None, target_repo_path=None, branch_prefix=None, open_pr=None, pr_base_branch=None, idle_notify_interval_seconds=None, extra_backend_args=None) -> dict`**
 
@@ -679,7 +682,11 @@ optional and left to you to run ad hoc if you want to see it live.
   network error) → returned as failure; the commit still exists locally, so
   the controller can inspect and retry manually rather than losing work.
   This is a distinct case from "no remote configured" above — the former
-  is expected/benign, this one is a real failure worth surfacing.
+  is expected/benign, this one is a real failure worth surfacing. The
+  failure response also includes `files_changed`, `commit_sha`, and
+  `model_used` alongside `error`, so the caller has direct evidence the
+  implementation itself succeeded locally even though `success: false`,
+  without having to shell out to `git log` to discover it.
 - Codex/Gemini/OpenRouter selected via `configure` before they're
   implemented → `delegate_implementation` surfaces the adapter's
   `NotImplementedError` message as a clean `error` field, not a stack trace.
