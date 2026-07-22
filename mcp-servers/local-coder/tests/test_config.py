@@ -98,10 +98,11 @@ def test_configure_with_validation_accepts_fallback_list_at_cap(isolated_config)
 
 
 def test_configure_with_validation_rejects_gemini_with_ollama_model(isolated_config):
-    with pytest.raises(config_module.ConfigValidationError, match="[Gg]emini"):
-        config_module.configure_with_validation({
-            "backend": "gemini", "model": "ollama/qwen3-coder:30b"
-        })
+    with patch.object(ollama_module, "list_ollama_models", return_value=["qwen3-coder:30b"]):
+        with pytest.raises(config_module.ConfigValidationError, match="[Gg]emini"):
+            config_module.configure_with_validation({
+                "backend": "gemini", "model": "ollama/qwen3-coder:30b"
+            })
 
 
 def test_configure_with_validation_revalidates_existing_model_not_just_overrides(isolated_config):
@@ -116,6 +117,55 @@ def test_configure_with_validation_revalidates_existing_model_not_just_overrides
     with patch.object(ollama_module, "list_ollama_models", return_value=[]):
         with pytest.raises(config_module.ConfigValidationError, match="not pulled|not found|unavailable"):
             config_module.configure_with_validation({"max_fallback_models": 5})
+
+
+def test_configure_with_validation_rejects_duplicate_fallback_models(isolated_config):
+    with pytest.raises(config_module.ConfigValidationError, match="[Dd]uplicate"):
+        config_module.configure_with_validation({
+            "fallback_models": ["openrouter/a", "openrouter/a"]
+        })
+
+
+def test_configure_with_validation_rejects_fallback_model_matching_primary(isolated_config):
+    with pytest.raises(config_module.ConfigValidationError, match="[Dd]uplicate"):
+        config_module.configure_with_validation({
+            "model": "openrouter/a", "fallback_models": ["openrouter/a"]
+        })
+
+
+def test_configure_with_validation_rejects_empty_string_model(isolated_config):
+    with pytest.raises(config_module.ConfigValidationError, match="empty|whitespace"):
+        config_module.configure_with_validation({"model": ""})
+
+
+def test_configure_with_validation_rejects_whitespace_only_model(isolated_config):
+    with pytest.raises(config_module.ConfigValidationError, match="empty|whitespace"):
+        config_module.configure_with_validation({"model": "   "})
+
+
+def test_configure_with_validation_rejects_empty_string_fallback_model(isolated_config):
+    with pytest.raises(config_module.ConfigValidationError, match="empty|whitespace"):
+        config_module.configure_with_validation({"fallback_models": ["openrouter/a", ""]})
+
+
+def test_configure_with_validation_rejects_unknown_backend(isolated_config):
+    with pytest.raises(config_module.ConfigValidationError, match="[Uu]nknown backend|backend"):
+        config_module.configure_with_validation({"backend": "aidee"})
+
+
+def test_configure_with_validation_accepts_known_backends(isolated_config):
+    # Use a non-ollama model throughout so this doesn't collide with the
+    # separate gemini+ollama incompatibility check.
+    config_module.configure_with_validation({"model": "openrouter/some-model"})
+    for name in ("aider", "codex", "gemini", "openrouter"):
+        result = config_module.configure_with_validation({"backend": name})
+        assert result["backend"] == name
+
+
+def test_configure_with_validation_clears_target_repo_path(isolated_config):
+    config_module.configure_with_validation({"target_repo_path": "/some/path"})
+    result = config_module.configure_with_validation({"target_repo_path": config_module.CLEAR_FIELD})
+    assert result["target_repo_path"] is None
 
 
 def test_list_available_models_with_prefix_prefixes_correctly(isolated_config):

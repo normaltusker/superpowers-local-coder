@@ -9,7 +9,7 @@ from backends.aider import AiderBackend
 from backends.codex import CodexBackend
 from backends.gemini import GeminiBackend
 from backends.openrouter import OpenRouterBackend
-from backends.common import validate_branch_name
+from backends.common import KNOWN_BACKENDS, validate_branch_name
 
 mcp = FastMCP("local-coder")
 
@@ -19,6 +19,11 @@ BACKENDS = {
     "gemini": GeminiBackend,
     "openrouter": OpenRouterBackend,
 }
+
+assert set(BACKENDS) == set(KNOWN_BACKENDS), (
+    "server.py's BACKENDS dict and backends.common.KNOWN_BACKENDS have "
+    "drifted apart — keep them in sync."
+)
 
 
 def _has_origin_remote(repo_path: str) -> bool:

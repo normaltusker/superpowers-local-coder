@@ -13,6 +13,11 @@ from typing import Callable
 # bare positional argument.
 _VALID_BRANCH_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 
+# The single authoritative list of backend names local-coder knows about.
+# server.py's BACKENDS dict and config.py's configure_with_validation both
+# reference this so the two can't drift out of sync.
+KNOWN_BACKENDS = ("aider", "codex", "gemini", "openrouter")
+
 
 class StallError(Exception):
     def __init__(self, stall_timeout_seconds: float):

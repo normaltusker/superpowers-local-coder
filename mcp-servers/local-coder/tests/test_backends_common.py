@@ -30,8 +30,18 @@ def test_ensure_branch_creates_new_branch(git_repo):
 
 
 def test_ensure_branch_checks_out_existing_branch(git_repo):
+    # Don't hardcode "main" — the git_repo fixture does a bare `git init`
+    # without setting init.defaultBranch, so the actual default branch name
+    # depends on the system's git config/version (could be "master" on an
+    # older git or one without init.defaultBranch set). Capture the real
+    # default branch name instead of assuming "main".
+    default_branch = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=git_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
     subprocess.run(["git", "checkout", "-b", "existing-branch"], cwd=git_repo, check=True, capture_output=True)
-    subprocess.run(["git", "checkout", "main"], cwd=git_repo, check=True, capture_output=True)
+    subprocess.run(["git", "checkout", default_branch], cwd=git_repo, check=True, capture_output=True)
 
     common.ensure_branch(str(git_repo), "existing-branch")
 
