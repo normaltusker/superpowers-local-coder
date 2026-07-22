@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import time
 
 import pytest
@@ -49,6 +50,46 @@ def test_ensure_branch_rejects_branch_name_starting_with_dash(git_repo):
 def test_ensure_branch_rejects_short_flag_like_branch_name(git_repo):
     with pytest.raises(ValueError, match="[Ii]nvalid branch name"):
         common.ensure_branch(str(git_repo), "-x")
+
+
+def test_ensure_branch_creates_new_branch_when_name_collides_with_tag(git_repo):
+    # A tag named the same as a not-yet-existing branch resolves fine with
+    # `git rev-parse --verify <name>`, but it is NOT a branch. ensure_branch
+    # must still create a new branch, not check out the tag (which would
+    # leave the repo in detached HEAD).
+    subprocess.run(["git", "tag", "release-1.0"], cwd=git_repo, check=True, capture_output=True)
+
+    common.ensure_branch(str(git_repo), "release-1.0")
+
+    result = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=git_repo,
+        capture_output=True, text=True, check=True,
+    )
+    assert result.stdout.strip() == "release-1.0"
+    # confirm we are NOT in detached HEAD (branch --show-current is empty
+    # when detached, but assert explicitly for clarity)
+    symbolic = subprocess.run(
+        ["git", "symbolic-ref", "-q", "HEAD"], cwd=git_repo,
+        capture_output=True, text=True,
+    )
+    assert symbolic.returncode == 0
+
+
+def test_ensure_branch_creates_new_branch_when_name_collides_with_commit_sha(git_repo):
+    # A branch name that happens to equal an existing commit SHA also
+    # resolves via `git rev-parse --verify <name>`, but is not a branch.
+    commit_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=git_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    common.ensure_branch(str(git_repo), commit_sha)
+
+    result = subprocess.run(
+        ["git", "branch", "--show-current"], cwd=git_repo,
+        capture_output=True, text=True, check=True,
+    )
+    assert result.stdout.strip() == commit_sha
 
 
 def test_ensure_branch_accepts_normal_branch_name(git_repo):
@@ -103,6 +144,30 @@ def test_run_monitored_subprocess_raises_stall_error_when_no_output():
             ["sleep", "2"], cwd=".",
             stall_timeout_seconds=0.2, idle_notify_interval_seconds=0.05,
         )
+
+
+def test_run_monitored_subprocess_ticks_during_partial_line_with_no_newline():
+    # A subprocess that writes a partial line (no trailing newline) and then
+    # goes quiet without closing its stdout pipe must not block readline()
+    # past the next poll interval — on_tick must still fire during the gap,
+    # and the stall check must still be evaluated.
+    script = (
+        "import sys, time\n"
+        "sys.stdout.write('partial-line-no-newline')\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(0.6)\n"
+    )
+    ticks = []
+    result = common.run_monitored_subprocess(
+        [sys.executable, "-c", script], cwd=".",
+        stall_timeout_seconds=5, idle_notify_interval_seconds=0.1,
+        on_tick=lambda: ticks.append(time.monotonic()),
+    )
+    assert result.returncode == 0
+    assert "partial-line-no-newline" in result.stdout
+    # on_tick should have fired multiple times during the 0.6s quiet period
+    # after the partial write (idle_notify_interval_seconds=0.1).
+    assert len(ticks) >= 3
 
 
 def test_run_monitored_subprocess_kills_process_when_on_tick_raises():
