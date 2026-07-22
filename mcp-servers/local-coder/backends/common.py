@@ -123,16 +123,22 @@ def restore_working_tree(repo_path: str, pre_head: str, pre_porcelain: set[str])
     path's status can change between snapshot time and restore time (e.g.
     a file that was untracked before the attempt could have been staged
     by the attempt itself).
+
+    The `reset --mixed pre_head` below runs unconditionally, even if HEAD
+    never moved (the normal case for a failure). This is required, not
+    redundant: `git checkout -- <path>` restores a path's content from the
+    INDEX, not from HEAD. If a failed attempt staged an edit to a tracked
+    file without ever committing it (e.g. killed mid-stall right after
+    `git add`, before `git commit`), the index still holds the corrupted
+    content — `checkout --` would "restore" the working tree from that
+    same corrupted staged content, doing nothing. `reset --mixed` clears
+    the index back to `pre_head`'s tree first, so the subsequent
+    `checkout --` has clean, pre-attempt content to restore from.
     """
-    current_head = subprocess.run(
-        ["git", "-C", repo_path, "rev-parse", "HEAD"],
-        capture_output=True, text=True, check=True,
-    ).stdout.strip()
-    if current_head != pre_head:
-        subprocess.run(
-            ["git", "-C", repo_path, "reset", "--mixed", pre_head],
-            check=True, capture_output=True,
-        )
+    subprocess.run(
+        ["git", "-C", repo_path, "reset", "--mixed", pre_head],
+        check=True, capture_output=True,
+    )
 
     status_z = subprocess.run(
         ["git", "-C", repo_path, "status", "--porcelain", "-z"],

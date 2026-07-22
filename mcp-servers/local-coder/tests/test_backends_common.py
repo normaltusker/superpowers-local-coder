@@ -194,6 +194,30 @@ def test_restore_working_tree_discards_mixed_tracked_and_untracked_changes(git_r
     assert not (git_repo / "new_from_attempt.py").exists()
 
 
+def test_restore_working_tree_discards_staged_but_uncommitted_changes(git_repo):
+    # A failed attempt that `git add`s an edit but is killed before
+    # `git commit` (e.g. a stall-kill mid-write) leaves the corrupted
+    # content STAGED, not just in the working tree. `git checkout --`
+    # restores from the index, so if the index itself still holds the
+    # staged corruption, checkout is a no-op and the corruption survives.
+    tracked_path = git_repo / "README.md"
+    pre_head, pre_porcelain = common.snapshot_working_tree(str(git_repo))
+    original_tracked_content = tracked_path.read_text()
+
+    tracked_path.write_text("corrupted during failed attempt\n")
+    subprocess.run(["git", "add", "README.md"], cwd=git_repo, check=True)
+    # Deliberately no commit — this is the "killed before committing" case.
+
+    common.restore_working_tree(str(git_repo), pre_head, pre_porcelain)
+
+    assert tracked_path.read_text() == original_tracked_content
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=git_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert status.strip() == ""
+
+
 def test_restore_working_tree_handles_filenames_with_spaces(git_repo):
     # git status's default output display-escapes (quotes) paths containing
     # spaces/special characters — treating that quoted text as the literal
