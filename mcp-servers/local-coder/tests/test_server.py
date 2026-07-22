@@ -29,6 +29,63 @@ def isolated_config(tmp_path, monkeypatch):
 # git_repo_with_remote / git_repo_no_remote fixtures are shared via conftest.py
 
 
+async def test_delegate_implementation_applies_configured_branch_prefix(isolated_config, git_repo_no_remote):
+    # config.yaml's default branch_prefix is "local-coder/" — a caller
+    # passing a bare branch name should end up on the prefixed branch.
+    captured = {}
+
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None):
+        captured["branch"] = branch
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        result = await server._delegate_implementation_impl(
+            task="add a.py", branch="my-task",
+            target_repo_path=str(git_repo_no_remote),
+        )
+
+    assert result["success"] is True
+    assert captured["branch"] == "local-coder/my-task"
+    assert result["branch"] == "local-coder/my-task"
+
+
+async def test_delegate_implementation_does_not_double_prefix_branch(isolated_config, git_repo_no_remote):
+    # A caller that already includes the configured prefix must not get it
+    # applied twice.
+    captured = {}
+
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None):
+        captured["branch"] = branch
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        result = await server._delegate_implementation_impl(
+            task="add a.py", branch="local-coder/my-task",
+            target_repo_path=str(git_repo_no_remote),
+        )
+
+    assert result["success"] is True
+    assert captured["branch"] == "local-coder/my-task"
+
+
+async def test_delegate_implementation_skips_prefix_when_configured_empty(isolated_config, git_repo_no_remote):
+    config_module.merge_config({"branch_prefix": ""})
+    captured = {}
+
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None):
+        captured["branch"] = branch
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        result = await server._delegate_implementation_impl(
+            task="add a.py", branch="my-task",
+            target_repo_path=str(git_repo_no_remote),
+        )
+
+    assert result["success"] is True
+    assert captured["branch"] == "my-task"
+
+
 async def test_delegate_implementation_missing_repo_path_returns_error(isolated_config):
     result = await server._delegate_implementation_impl(task="do something", branch="test-branch", target_repo_path=None)
     assert result["success"] is False
@@ -54,15 +111,18 @@ async def test_delegate_implementation_pushes_when_remote_exists(isolated_config
     # real side effect of creating/checking out the target branch (see
     # backends.common.ensure_branch). Create it here so the branch exists
     # locally before _delegate_implementation_impl attempts to push it.
+    # Passed already carrying the config's branch_prefix so this test's
+    # branch setup is independent of the prefix-application logic under
+    # test elsewhere (test_delegate_implementation_applies_branch_prefix*).
     subprocess.run(
-        ["git", "-C", str(git_repo_with_remote), "checkout", "-b", "feature-branch"],
+        ["git", "-C", str(git_repo_with_remote), "checkout", "-b", "local-coder/feature-branch"],
         check=True, capture_output=True,
     )
     fake_result = CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
     with patch("backends.aider.AiderBackend.run_backend", return_value=fake_result):
         with patch("subprocess.run", wraps=subprocess.run) as spy:
             result = await server._delegate_implementation_impl(
-                task="add a.py", branch="feature-branch",
+                task="add a.py", branch="local-coder/feature-branch",
                 target_repo_path=str(git_repo_with_remote),
             )
 
@@ -293,8 +353,10 @@ def test_has_open_pr_raises_on_ambiguous_gh_failure():
 
 
 async def test_delegate_implementation_ambiguous_pr_status_skips_pr_create_with_note(isolated_config, git_repo_with_remote):
+    # Passed already carrying the config's branch_prefix — see the note on
+    # test_delegate_implementation_pushes_when_remote_exists above.
     subprocess.run(
-        ["git", "-C", str(git_repo_with_remote), "checkout", "-b", "feature-branch"],
+        ["git", "-C", str(git_repo_with_remote), "checkout", "-b", "local-coder/feature-branch"],
         check=True, capture_output=True,
     )
     config_module.merge_config({"open_pr": True})
@@ -312,7 +374,7 @@ async def test_delegate_implementation_ambiguous_pr_status_skips_pr_create_with_
     with patch("backends.aider.AiderBackend.run_backend", return_value=fake_result):
         with patch("subprocess.run", side_effect=fake_subprocess_run):
             result = await server._delegate_implementation_impl(
-                task="add a.py", branch="feature-branch",
+                task="add a.py", branch="local-coder/feature-branch",
                 target_repo_path=str(git_repo_with_remote),
             )
 
@@ -323,8 +385,10 @@ async def test_delegate_implementation_ambiguous_pr_status_skips_pr_create_with_
 
 
 async def test_delegate_implementation_pr_create_failure_reported_as_note_not_silent(isolated_config, git_repo_with_remote):
+    # Passed already carrying the config's branch_prefix — see the note on
+    # test_delegate_implementation_pushes_when_remote_exists above.
     subprocess.run(
-        ["git", "-C", str(git_repo_with_remote), "checkout", "-b", "feature-branch"],
+        ["git", "-C", str(git_repo_with_remote), "checkout", "-b", "local-coder/feature-branch"],
         check=True, capture_output=True,
     )
     config_module.merge_config({"open_pr": True})
@@ -334,7 +398,7 @@ async def test_delegate_implementation_pr_create_failure_reported_as_note_not_si
 
     def fake_subprocess_run(cmd, *args, **kwargs):
         if "gh" in cmd and "view" in cmd:
-            return MagicMock(returncode=1, stdout="", stderr='no pull requests found for branch "feature-branch"\n')
+            return MagicMock(returncode=1, stdout="", stderr='no pull requests found for branch "local-coder/feature-branch"\n')
         if "gh" in cmd and "create" in cmd:
             return MagicMock(returncode=1, stdout="", stderr="pull request create failed: already exists")
         return real_run(cmd, *args, **kwargs)
@@ -342,7 +406,7 @@ async def test_delegate_implementation_pr_create_failure_reported_as_note_not_si
     with patch("backends.aider.AiderBackend.run_backend", return_value=fake_result):
         with patch("subprocess.run", side_effect=fake_subprocess_run):
             result = await server._delegate_implementation_impl(
-                task="add a.py", branch="feature-branch",
+                task="add a.py", branch="local-coder/feature-branch",
                 target_repo_path=str(git_repo_with_remote),
             )
 

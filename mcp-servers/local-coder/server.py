@@ -76,6 +76,19 @@ async def _delegate_implementation_impl(
     if not repo_path:
         return {"success": False, "error": "target_repo_path not provided and not set in config"}
 
+    # Apply the configured branch_prefix if the caller-supplied branch name
+    # doesn't already carry it. This is the only point where `branch` is
+    # actually used (branch creation, push, PR), so applying it here makes
+    # branch_prefix take effect for every call, transparently to whatever
+    # constructed the raw branch name upstream (e.g. the SDD skill).
+    branch_prefix = cfg.get("branch_prefix") or ""
+    if branch_prefix and not branch.startswith(branch_prefix):
+        branch = f"{branch_prefix}{branch}"
+        try:
+            validate_branch_name(branch)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
     backend_name = cfg["backend"]
     backend_cls = BACKENDS.get(backend_name)
     if backend_cls is None:
