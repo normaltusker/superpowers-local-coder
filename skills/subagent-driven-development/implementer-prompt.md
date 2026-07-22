@@ -1,9 +1,17 @@
+<!--
+FORK DIVERGENCE from upstream obra/superpowers:
+This file was modified to delegate implementation to the local-coder MCP
+server instead of using Edit/Write directly. See
+docs/superpowers/specs/2026-07-21-local-coder-delegation-design.md.
+Reconcile carefully on upstream merges.
+-->
+
 # Implementer Subagent Prompt Template
 
 Use this template when dispatching an implementer subagent.
 
 ```
-Subagent (general-purpose):
+Subagent (local-coder-implementer):
   description: "Implement Task N: [task name]"
   model: [MODEL — REQUIRED: choose per SKILL.md Model Selection; an omitted
          model silently inherits the session's most expensive one]
@@ -32,20 +40,31 @@ Subagent (general-purpose):
     ## Your Job
 
     Once you're clear on requirements:
-    1. Implement exactly what the task specifies
-    2. Write tests (following TDD if task says to)
-    3. Verify implementation works
-    4. Commit your work
-    5. Self-review (see below)
-    6. Report back
+    1. Call `mcp__local-coder__delegate_implementation` with:
+       - `task`: the task brief's requirements, written as a clear
+         implementation instruction (not just pasted verbatim — synthesize the
+         brief's acceptance criteria into a task description local-coder's
+         backend can act on, including any TDD requirement from the brief)
+       - `branch`: [current working branch — filled in by the controller,
+         same as the directory below]
+       - `target_repo_path`: [directory]
+    2. Wait for the result. If `success: false`, do not attempt to fix it
+       yourself — report BLOCKED with the full error (see "When You're in
+       Over Your Head" below).
+    3. If `success: true`, use Read/Grep/Glob and read-only Bash (see your own
+       agent definition for what's permitted) to verify the changed files
+       (`files_changed` in the response) actually satisfy the task brief. If
+       the brief calls for tests, run them via Bash to confirm they pass —
+       you do not write new tests yourself, but you must confirm existing
+       or delegated-in tests actually run and pass.
+    4. Report back (see Report Format below).
 
     Work from: [directory]
 
-    **While you work:** If you encounter something unexpected or unclear, **ask questions**.
-    It's always OK to pause and clarify. Don't guess or make assumptions.
-
-    While iterating, run the focused test for what you're changing; run the
-    full suite once before committing, not after every edit.
+    **While you work:** If you encounter something unexpected or unclear before
+    calling `delegate_implementation`, **ask questions**. It's always OK to
+    pause and clarify. Don't guess or make assumptions about what the task
+    means before delegating it.
 
     ## Code Organization
 
