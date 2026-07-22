@@ -76,7 +76,10 @@ def test_configure_with_validation_skips_check_for_non_ollama_prefix(isolated_co
 
 
 def test_configure_with_validation_rejects_fallback_list_over_cap(isolated_config):
-    with patch.object(ollama_module, "list_ollama_models", return_value=["a:1b", "b:1b", "c:1b", "d:1b"]):
+    # include the config's existing default model ("qwen3-coder:30b") in the
+    # mock's available list since the merged/effective model is now
+    # re-validated on every call, not just when overridden.
+    with patch.object(ollama_module, "list_ollama_models", return_value=["qwen3-coder:30b", "a:1b", "b:1b", "c:1b", "d:1b"]):
         with pytest.raises(config_module.ConfigValidationError, match="max_fallback_models|limit"):
             config_module.configure_with_validation({
                 "fallback_models": ["ollama/a:1b", "ollama/b:1b", "ollama/c:1b", "ollama/d:1b"]
@@ -84,7 +87,10 @@ def test_configure_with_validation_rejects_fallback_list_over_cap(isolated_confi
 
 
 def test_configure_with_validation_accepts_fallback_list_at_cap(isolated_config):
-    with patch.object(ollama_module, "list_ollama_models", return_value=["a:1b", "b:1b", "c:1b"]):
+    # include the config's existing default model ("qwen3-coder:30b") in the
+    # mock's available list since the merged/effective model is now
+    # re-validated on every call, not just when overridden.
+    with patch.object(ollama_module, "list_ollama_models", return_value=["qwen3-coder:30b", "a:1b", "b:1b", "c:1b"]):
         result = config_module.configure_with_validation({
             "fallback_models": ["ollama/a:1b", "ollama/b:1b", "ollama/c:1b"]
         })
@@ -96,6 +102,20 @@ def test_configure_with_validation_rejects_gemini_with_ollama_model(isolated_con
         config_module.configure_with_validation({
             "backend": "gemini", "model": "ollama/qwen3-coder:30b"
         })
+
+
+def test_configure_with_validation_revalidates_existing_model_not_just_overrides(isolated_config):
+    # Set up: config already has an ollama/-prefixed model, validated at the
+    # time it was set.
+    with patch.object(ollama_module, "list_ollama_models", return_value=["qwen3-coder:30b"]):
+        config_module.configure_with_validation({"model": "ollama/qwen3-coder:30b"})
+
+    # Now the model is no longer pulled (e.g. `ollama rm`), and a later call
+    # changes an unrelated field without touching `model`. This should still
+    # re-validate the merged/effective model and reject it as stale.
+    with patch.object(ollama_module, "list_ollama_models", return_value=[]):
+        with pytest.raises(config_module.ConfigValidationError, match="not pulled|not found|unavailable"):
+            config_module.configure_with_validation({"max_fallback_models": 5})
 
 
 def test_list_available_models_with_prefix_prefixes_correctly(isolated_config):

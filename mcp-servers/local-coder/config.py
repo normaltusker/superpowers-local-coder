@@ -51,13 +51,13 @@ def configure_with_validation(overrides: dict) -> dict:
     fallback_models = overrides.get("fallback_models", current.get("fallback_models", []))
     max_fallback = overrides.get("max_fallback_models", current.get("max_fallback_models", 3))
 
-    # Only validate models that are being overridden
-    if "model" in overrides and overrides["model"]:
-        _validate_ollama_model(overrides["model"])
-
-    if "fallback_models" in overrides:
-        for fb in overrides["fallback_models"]:
-            _validate_ollama_model(fb)
+    # Validate the merged/effective values, not just what's being overridden.
+    # This ensures a config's already-persisted model gets re-checked even
+    # when a later configure() call doesn't touch the `model` field itself.
+    if model:
+        _validate_ollama_model(model)
+    for fb in fallback_models:
+        _validate_ollama_model(fb)
 
     # Check fallback list against cap (using the merged values)
     if len(fallback_models) > max_fallback:
