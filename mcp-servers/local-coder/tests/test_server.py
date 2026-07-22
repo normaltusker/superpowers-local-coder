@@ -26,34 +26,7 @@ def isolated_config(tmp_path, monkeypatch):
     return temp_config
 
 
-@pytest.fixture
-def git_repo_with_remote(tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
-    (repo / "README.md").write_text("hello\n")
-    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
-    remote = tmp_path / "remote.git"
-    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
-    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=repo, check=True)
-    subprocess.run(["git", "push", "-u", "origin", "main"], cwd=repo, check=True, capture_output=True)
-    return repo
-
-
-@pytest.fixture
-def git_repo_no_remote(tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
-    (repo / "README.md").write_text("hello\n")
-    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
-    return repo
+# git_repo_with_remote / git_repo_no_remote fixtures are shared via conftest.py
 
 
 async def test_delegate_implementation_missing_repo_path_returns_error(isolated_config):

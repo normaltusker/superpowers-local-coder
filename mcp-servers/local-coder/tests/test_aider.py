@@ -1,24 +1,10 @@
 import subprocess
 from unittest.mock import patch
 
-import pytest
-
 from backends.aider import AiderBackend
 from backends import common
 
-
-@pytest.fixture
-def git_repo(tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
-    (repo / "README.md").write_text("hello\n")
-    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=repo, check=True, capture_output=True)
-    return repo
-
+# git_repo fixture is shared via conftest.py
 
 BASE_CONFIG = {
     "idle_notify_interval_seconds": 20,
