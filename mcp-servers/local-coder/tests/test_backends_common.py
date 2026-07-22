@@ -193,6 +193,24 @@ def test_run_monitored_subprocess_calls_on_tick():
     assert len(ticks) >= 1
 
 
+def test_run_monitored_subprocess_bounds_output_to_tail():
+    # A subprocess that writes far more than _MAX_OUTPUT_CHARS must not have
+    # its full transcript accumulated in memory — only a bounded tail should
+    # be kept, and that tail must be the LATEST content (a truncated tail is
+    # only useful for downstream "what was the last thing that happened"
+    # error reporting if it's actually the end of the output, not the start).
+    over_cap_lines = common._MAX_OUTPUT_CHARS // 10 + 100  # each line ~10 chars, well over the cap
+    result = common.run_monitored_subprocess(
+        ["python3", "-c", f"import sys\nfor i in range({over_cap_lines}): print(f'line-{{i:06d}}')\nsys.stdout.flush()"],
+        cwd=".",
+        stall_timeout_seconds=5, idle_notify_interval_seconds=1,
+    )
+    assert len(result.stdout) <= common._MAX_OUTPUT_CHARS
+    # The tail must contain the LAST line written, not the first.
+    assert f"line-{over_cap_lines - 1:06d}" in result.stdout
+    assert "line-000000" not in result.stdout
+
+
 def test_run_monitored_subprocess_raises_stall_error_when_no_output():
     with pytest.raises(common.StallError):
         common.run_monitored_subprocess(

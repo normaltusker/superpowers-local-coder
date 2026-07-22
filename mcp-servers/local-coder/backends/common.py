@@ -133,6 +133,14 @@ def restore_working_tree(repo_path: str, pre_head: str, pre_porcelain: set[str])
 
 _READ_CHUNK_SIZE = 4096
 
+# Only the failure-tail of subprocess output is ever consumed downstream
+# (aider.py truncates to the last 2000 chars for an error message), so
+# accumulating the full transcript of a long-running, output-heavy backend
+# run in memory is unbounded growth for no benefit. Keep a bounded tail
+# instead — generous enough that no realistic downstream consumer's
+# truncation window is ever starved of content.
+_MAX_OUTPUT_CHARS = 20_000
+
 
 def run_monitored_subprocess(
     cmd: list[str],
@@ -152,7 +160,10 @@ def run_monitored_subprocess(
         cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
 
-    output_chunks: list[str] = []
+    # Bounded tail buffer: append new text, then trim from the front
+    # whenever it exceeds the cap, so memory stays flat regardless of how
+    # much a long-running subprocess writes.
+    output_tail = ""
     last_activity = time.monotonic()
     last_tick = time.monotonic()
 
@@ -180,7 +191,9 @@ def run_monitored_subprocess(
                 except OSError:
                     data = b""
                 if data:
-                    output_chunks.append(decoder.decode(data))
+                    output_tail += decoder.decode(data)
+                    if len(output_tail) > _MAX_OUTPUT_CHARS:
+                        output_tail = output_tail[-_MAX_OUTPUT_CHARS:]
                     last_activity = time.monotonic()
 
             if process.poll() is not None and not data:
@@ -192,9 +205,11 @@ def run_monitored_subprocess(
                         remaining = b""
                     if not remaining:
                         break
-                    output_chunks.append(decoder.decode(remaining))
+                    output_tail += decoder.decode(remaining)
+                    if len(output_tail) > _MAX_OUTPUT_CHARS:
+                        output_tail = output_tail[-_MAX_OUTPUT_CHARS:]
                 # Flush any trailing partial multi-byte sequence.
-                output_chunks.append(decoder.decode(b"", final=True))
+                output_tail += decoder.decode(b"", final=True)
                 break
 
             now = time.monotonic()
@@ -219,5 +234,5 @@ def run_monitored_subprocess(
 
     returncode = process.wait()
     return subprocess.CompletedProcess(
-        cmd, returncode, stdout="".join(output_chunks), stderr=""
+        cmd, returncode, stdout=output_tail, stderr=""
     )
