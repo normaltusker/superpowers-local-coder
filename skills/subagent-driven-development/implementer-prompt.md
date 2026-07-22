@@ -134,9 +134,22 @@ Subagent (local-coder-implementer):
     Write your full report to [REPORT_FILE]:
     - What you implemented (or what you attempted, if blocked)
     - What you tested and test results
-    - **TDD Evidence** (if TDD was required for this task):
-      - RED: command run, relevant failing output before implementation, and why the failure was expected
-      - GREEN: command run and relevant passing output after implementation
+    - **TDD Evidence** (if the task brief required TDD): you delegate the
+      entire implementation to `delegate_implementation` in one atomic
+      call, so you don't personally run a failing test before the
+      implementation exists — you have no independent RED step to show.
+      Report whatever evidence you *can* observe instead:
+      - Confirm the task brief's TDD requirement was included in what you
+        sent to `delegate_implementation` (quote the relevant instruction).
+      - After the call, run the test suite yourself via Bash and report
+        that GREEN output — this you can verify directly.
+      - Check `git log`/`git show` on the delegated commit for signs the
+        backend followed TDD (e.g. a test file added/modified alongside
+        the implementation), and note what you found either way.
+      - Don't fabricate or hand-wave a RED step you didn't witness — state
+        plainly that RED/GREEN discipline during implementation was the
+        delegated backend's responsibility and isn't independently
+        re-verifiable by this subagent.
     - Files changed
     - Self-review findings (if any)
     - Any issues or concerns
