@@ -162,15 +162,48 @@ worktree path as the marketplace source. No uninstall/reinstall was
 needed once the directory mismatch was understood — the original install
 was correct all along.
 
-**Next action, not yet done: run the actual Part 3 smoke test** (ask the
-now-connected session to brainstorm+plan+implement a trivial one-line
-change via `subagent-driven-development`, confirm `delegate_implementation`
-is what implements it rather than direct Edit/Write). **Do this from the
-main-repo-root session** (where `local-coder` is now connected), not the
-worktree-cd'd session used for Phase 2 doc/commit work — those remain two
-different sessions with two different jobs until this gets reconciled
-(see the open question in "Housekeeping for Phase 2" below about
-whether Phase 2 commits should also happen from the repo root).
+**Smoke test attempt #1 — correctly declined, not a bug.** Asked the
+connected repo-root session: "add a one-line comment to README.md, use
+subagent-driven-development." It loaded the `subagent-driven-development`
+skill successfully, then judged (correctly) that a one-line doc edit is
+too trivial to justify SDD's machinery (worktrees, plan files, per-task
+implementer/reviewer dispatch, ledgers) and offered to just make the
+edit directly instead of forcing the process. This is the skill working
+as intended, not a failure — but it means `delegate_implementation` was
+never actually called, so the smoke test still hasn't run.
+
+**Smoke test attempt #2 — task given, RESULT NOT YET SEEN.** Sent this
+task, asked for it to actually be run in the connected repo-root
+session — **this is the exact next action for whoever resumes**:
+```
+Let's add a "Local-Coder Quick Reference" section to
+mcp-servers/local-coder/README.md with 3-4 bullet points summarizing:
+what the MCP server does, the three tools it exposes
+(delegate_implementation, configure, list_available_models), and how to
+check which models are available. Use subagent-driven-development, and
+delegate the actual implementation to local-coder rather than writing it
+directly.
+```
+Rationale for this specific task: small and low-risk (pure
+documentation, no code semantics to get wrong), but has enough real
+shape (multiple bullet points, a specific file/section) that SDD
+engaging isn't artificial, and the explicit "delegate to local-coder"
+instruction removes ambiguity about which path it should take. **Also
+flagged to watch for:** that repo-root session sits on `dev` directly
+(not a feature branch) — SDD's normal flow should create/checkout a
+branch as part of its process, but this hasn't been confirmed; if it
+tries to commit straight to `dev`, that needs to be stopped.
+
+**If resuming and this result is now known:** update this section with
+what happened (did `delegate_implementation` actually fire? did aider
+run against Ollama? did a commit land, on what branch? did the reviewer
+approve? was a PR offered?) before doing anything else, then decide
+whether item 1 is COMPLETE or needs another attempt. **If resuming and
+this result is NOT yet known** (e.g. the prompt was sent but the
+response never arrived before running out of session), the task above
+is exactly what to re-send/check on in the repo-root session — don't
+regenerate a different task, use this one so the record stays
+consistent.
 
 ### Housekeeping for Phase 2
 
@@ -208,22 +241,52 @@ whether Phase 2 commits should also happen from the repo root).
 
 ### Resume prompt (paste this if a session ends mid-work / hits its limit)
 
+**Two different directories are in play right now — read this before
+picking which one to resume in:**
+- **Main repo root** (`/Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder`,
+  currently on `dev`) — this is where the `local-coder` plugin is
+  installed/connected. **Use this one to check on or re-run the smoke
+  test** (see "Smoke test attempt #2" above for the exact task to send).
+  Do NOT commit here without first checking `git branch --show-current`
+  — it's sitting on `dev` directly, not a feature branch.
+- **Worktree** (`.worktrees/local-coder-impl/`, branch `local-coder-impl`)
+  — this is where all git history/commits for this project have
+  actually happened, and where Phase 2 code/doc changes belong.
+  `local-coder` is NOT connected in a session started here (see the
+  "Housekeeping for Phase 2" open question above) — don't try to run the
+  smoke test from this one.
+
+If you don't know which one the smoke test's result landed in, start
+with the **main repo root** session (that's where attempt #2 was sent)
+and paste this:
+
 ```
 Read docs/superpowers/handoff/2026-07-21-local-coder-handoff.md in the
-superpowers-local-coder repo (worktree at .worktrees/local-coder-impl/,
-branch local-coder-impl) and resume Phase 2 work from exactly where it
-left off, per the "Where things stand NOW" section at the top. Don't
-re-derive context from git log or re-read the design spec/plan from
-scratch — the handoff doc is the current source of truth for what's
-done, what's in progress, and what's next. Keep the handoff doc updated
-as you go, the same way it's been maintained so far.
+superpowers-local-coder repo and resume Phase 2 work from exactly where
+it left off, per the "Where things stand NOW" section at the top —
+specifically "Smoke test attempt #2," which has a task already sent to
+a local-coder-connected session but whose result was never recorded.
+First check whether that task's outcome is visible in this session's
+own prior turns (scroll back / check for a delegate_implementation tool
+call and its result); if so, report what happened and update the
+handoff doc's "Smoke test attempt #2" section with the actual outcome.
+If not (this is a genuinely fresh session with no memory of sending
+that task), re-send the exact task text from that section to test
+subagent-driven-development + local-coder end-to-end. Don't re-derive
+context from git log or re-read the design spec/plan from scratch — the
+handoff doc is the current source of truth. Keep the handoff doc updated
+as you go, the same way it's been maintained so far. Note: this session
+is on `dev` directly at the repo root — do not commit anything here
+without switching to an appropriate branch first; actual code/doc
+commits belong in the worktree at .worktrees/local-coder-impl/ on branch
+local-coder-impl.
 ```
 
-If the blocker in "Item 1 attempt — findings and next step" above is
-still unresolved, that resume prompt alone is enough — the doc already
-contains the exact `claude plugin marketplace add` / `claude plugin
-install` commands and the fresh-session smoke-test steps needed to
-unblock it.
+If the plugin-connection blocker somehow regresses (e.g. `local-coder`
+shows disconnected again), the doc already contains the exact `claude
+plugin marketplace add` / `claude plugin install` commands and the
+directory-mismatch fix (start from repo root, not the worktree) under
+"Item 1 attempt — findings and next step" above.
 
 ---
 
