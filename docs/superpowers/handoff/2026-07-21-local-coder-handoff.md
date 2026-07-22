@@ -11,16 +11,12 @@ session end — a stale handoff is worse than none.
 implementation plan via `superpowers:subagent-driven-development`,
 task-by-task.** Check the progress ledger (see below) for exactly which
 tasks are done — trust it and `git log` over this prose if they conflict.
-As of this update: Tasks 1-6 complete and reviewed clean (Task 6 needed a
-binding plan correction first — see the FastMCP `**kwargs` entry below).
-**Task 7 (README/MCP registration) is IMPLEMENTED but NOT yet re-reviewed
-— its review is what surfaced Task 6.5** (see below), a real functional
-gap discovered mid-plan, not just a doc nit. Task 6.5 has been dispatched
-and its result is pending as of this handoff update. **Do not mark Task 7
-complete in the ledger until Task 6.5 lands and Task 7's README is
-re-checked against the final async-converted server.py** — the README's
-progress-notification claim was the thing that was actually FALSE before
-Task 6.5, so re-verify it reads true once Task 6.5 ships.
+As of this update: Tasks 1-7 AND Task 6.5 all complete and reviewed
+clean. The whole `mcp-servers/local-coder/` server is built, tested
+(43/43), and its README/MCP registration are verified accurate. Task 8
+(subagent definition + SDD skill rewiring) implemented and awaiting
+review. Only Task 9 (final verification checkpoint, no new code) remains
+after Task 8's review closes.
 
 **Plan file note:** `docs/superpowers/plans/2026-07-21-local-coder-phase1.md`
 now has a "Task 6.5" section inserted between Task 6 and Task 7 — this
