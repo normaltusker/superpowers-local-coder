@@ -16,8 +16,13 @@ Two independently shippable pieces, plus a phasing note on backends:
 2. A modification to `skills/subagent-driven-development/` so its per-task
    implementer subagent calls local-coder instead of editing files itself,
    with the subagent's tool access structurally restricted at the harness
-   level (a new `.claude/agents/local-coder-implementer.md` definition), not
-   just instructed via prompt.
+   level (a new `agents/local-coder-implementer.md` definition — this
+   plugin's existing convention, confirmed against other installed plugins
+   such as `feature-dev` and `code-simplifier`, is an `agents/` directory
+   at the plugin root, auto-discovered by frontmatter; **not**
+   `.claude/agents/`, which is a project-local, non-plugin convention and
+   would not travel with the plugin when installed elsewhere), not just
+   instructed via prompt.
 
 **Backend phasing:** Aider is implemented in this phase (Phase 1) — it's
 the only backend this design is initially built and smoke-tested against.
@@ -54,7 +59,39 @@ mcp-servers/local-coder/
                               # see "Codex and Gemini backends"; self_commits=False when built
     openrouter.py             # stub, NotImplementedError; not designed this round
   README.md
+  requirements.txt      # fastmcp, PyYAML, pytest — installed into a venv, no other packaging
 ```
+
+### MCP server registration
+
+New file at the repo/plugin root: `.mcp.json`. Confirmed against other
+installed plugins that ship an MCP server (e.g. `figma`) — this is the
+convention Claude Code plugins actually use for auto-loading a bundled MCP
+server; there is no `mcpServers` key inside `.claude-plugin/plugin.json`
+itself (an earlier draft of this spec assumed the latter without verifying
+it against a real installed plugin; corrected here).
+
+```json
+{
+  "mcpServers": {
+    "local-coder": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-servers/local-coder/server.py"]
+    }
+  }
+}
+```
+
+`${CLAUDE_PLUGIN_ROOT}` resolves to wherever the plugin is installed, so
+this works whether someone clones this fork directly or installs it as a
+plugin — matching the original requirement that no manual `claude mcp add`
+step is needed. The server is expected to run inside the venv created per
+"Prerequisites" in the README (the `python3` on `PATH` at the time Claude
+Code launches the server must be one with `requirements.txt` installed —
+the README documents activating the venv or using its absolute
+interpreter path in `command` if a bare `python3` doesn't resolve
+correctly in the user's environment).
 
 ### config.yaml
 
@@ -474,10 +511,15 @@ mitigation, not a guarantee.
 
 ## Part 2 — Rewiring `subagent-driven-development`
 
-### New file: `.claude/agents/local-coder-implementer.md`
+### New file: `agents/local-coder-implementer.md`
 
-A Claude Code subagent definition (this fork currently has no
-`.claude/agents/` directory — this is new) with YAML frontmatter:
+A Claude Code subagent definition at the plugin root (this fork currently
+has no `agents/` directory — this is new). Verified against other installed
+plugins (`feature-dev`, `code-simplifier`, `coderabbit`, `sonarqube`), all
+of which ship `agents/<name>.md` at plugin root with this same frontmatter
+shape, auto-discovered without any reference from `plugin.json`. This is
+**not** `.claude/agents/` — that path is a project-local convention for a
+single repo's own Claude Code config, not something a plugin ships:
 
 ```yaml
 ---
