@@ -120,11 +120,12 @@ end to end.
   a FastMCP dependency — verified in this venv before committing to this
   design, not assumed). Documented as a new **Task 6.5** addendum in the
   plan (inserted between Task 6 and Task 7, see commit `fe83fe7`) rather
-  than rewriting Tasks 3/4/6's already-reviewed history. Dispatched;
-  result pending as of this handoff update — **if resuming, check
-  `.superpowers/sdd/progress.md` for whether Task 6.5 completed, and if
-  Task 6.5 isn't done, Task 7 cannot be finalized either** (its README's
-  progress-notification claim depends on Task 6.5's fix actually landing).
+  than rewriting Tasks 3/4/6's already-reviewed history. **Task 6.5 is now
+  complete** — `_delegate_implementation_impl` is `async def`, the
+  synchronous backend call is bridged via `anyio.to_thread.run_sync`, and
+  `on_tick` bridges back to `Context.report_progress` via
+  `anyio.from_thread.run`. Task 7 was finalized after this landed, since
+  its README's progress-notification claim depended on it.
 - **A checked-in file (`config.yaml`) got silently mutated on disk**
   during Task 5's fix work — quoted YAML strings (`"aider"`) became
   unquoted (`aider`), same values, no functional change, but real
@@ -138,8 +139,7 @@ end to end.
   mutation wouldn't show up in a commit-range diff at all.
 
 **Workspace:** isolated git worktree at
-`.worktrees/local-coder-impl/` (relative to the main checkout at
-`/Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder`),
+`.worktrees/local-coder-impl/` (relative to the main repo checkout root),
 on branch `local-coder-impl`, pushed to `origin`, tracking `origin/dev`.
 **No PR opened yet for this branch** — that happens after all 9 tasks +
 final review are complete, per `finishing-a-development-branch`.

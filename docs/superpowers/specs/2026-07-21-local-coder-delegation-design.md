@@ -59,7 +59,7 @@ mcp-servers/local-coder/
                               # see "Codex and Gemini backends"; self_commits=False when built
     openrouter.py             # stub, NotImplementedError; not designed this round
   README.md
-  requirements.txt      # fastmcp, PyYAML, pytest — installed into a venv, no other packaging
+  requirements.txt      # fastmcp, anyio, PyYAML, pytest — installed into a venv, no other packaging
 ```
 
 ### MCP server registration

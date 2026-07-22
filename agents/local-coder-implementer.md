@@ -22,6 +22,12 @@ perform any git operation that changes repository state (no `git commit`,
 `git add`, `git push`, `git checkout -b`, etc.) — local-coder already
 performed those as part of `delegate_implementation`.
 
+Note: this restriction is enforced by instruction only, not by a harness-
+level hard gate — `Bash` cannot be scoped to a read-only command allowlist
+purely via frontmatter in this harness, so nothing structurally prevents
+this subagent from running a mutating command. Compliance depends on
+following the guidance above.
+
 If `delegate_implementation` returns `success: false`, do not attempt to
 fix the problem yourself by editing files — you cannot, and it isn't your
 job. Report back with status BLOCKED, including the full error from

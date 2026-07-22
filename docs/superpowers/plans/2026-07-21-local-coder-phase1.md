@@ -52,7 +52,7 @@ already reflects this; there is no ambiguity left to resolve mid-task.
   the plugin root (verified convention), not `.claude/agents/`.
 - **Python packaging:** `requirements.txt` + venv, no `pyproject.toml`, no
   package installation — flat imports as described above.
-  `requirements.txt` pins `fastmcp`, `PyYAML`, `pytest`.
+  `requirements.txt` pins `fastmcp`, `anyio`, `PyYAML`, `pytest`.
 - **`delegate_implementation` has no `model` parameter.** Model selection
   is `config.yaml`-only, set via `configure` before a plan starts. Do not
   add a per-call model override — this was explicitly decided against
@@ -615,6 +615,7 @@ class BackendAdapter(ABC):
 
 Create `mcp-servers/local-coder/backends/common.py`:
 ```python
+import selectors
 import subprocess
 import time
 from typing import Callable
@@ -673,34 +674,59 @@ def run_monitored_subprocess(
     last_activity = time.monotonic()
     last_tick = time.monotonic()
 
-    while True:
-        line = process.stdout.readline() if process.stdout else ""
-        if line:
-            output_lines.append(line)
-            last_activity = time.monotonic()
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
 
-        if process.poll() is not None and not line:
-            break
+    try:
+        while True:
+            # Poll for output without blocking indefinitely, so the loop
+            # keeps evaluating tick/stall timing even when the subprocess
+            # produces no output at all (e.g. `sleep`).
+            poll_timeout = min(idle_notify_interval_seconds, 0.5)
+            ready = selector.select(timeout=poll_timeout)
 
-        now = time.monotonic()
-        if now - last_tick >= idle_notify_interval_seconds:
-            if on_tick is not None:
-                on_tick()
-            last_tick = now
+            line = ""
+            if ready:
+                line = process.stdout.readline()
+                if line:
+                    output_lines.append(line)
+                    last_activity = time.monotonic()
 
-        if now - last_activity > stall_timeout_seconds:
-            process.kill()
-            process.wait()
-            raise StallError(stall_timeout_seconds)
+            if process.poll() is not None and not line:
+                # Drain any remaining buffered output before exiting.
+                remaining = process.stdout.read()
+                if remaining:
+                    output_lines.append(remaining)
+                break
 
-        if not line:
-            time.sleep(min(idle_notify_interval_seconds, 0.5))
+            now = time.monotonic()
+            if now - last_tick >= idle_notify_interval_seconds:
+                if on_tick is not None:
+                    on_tick()
+                last_tick = now
+
+            if now - last_activity > stall_timeout_seconds:
+                process.kill()
+                process.wait()
+                raise StallError(stall_timeout_seconds)
+    finally:
+        selector.close()
 
     returncode = process.wait()
     return subprocess.CompletedProcess(
         cmd, returncode, stdout="".join(output_lines), stderr=""
     )
 ```
+
+**Note (post-implementation):** the code above is the actual
+`selectors`-based implementation that shipped in
+`mcp-servers/local-coder/backends/common.py`. It replaced an earlier
+buggy draft in this plan that used a blocking `process.stdout.readline()`
+as the loop's first statement — that version blocked for the entire
+subprocess lifetime whenever the subprocess produced zero stdout output
+(e.g. `sleep 0.3`, which this task's own tests use), so the tick/stall
+checks below it never actually ran. Task 3's implementer found and fixed
+this; see the handoff doc's gotchas section for the full story.
 
 - [ ] **Step 5: Run test to verify it passes**
 
@@ -1653,8 +1679,10 @@ still-synchronous backend/monitoring call in a worker thread via
 `anyio.to_thread.run_sync` (from the async `_delegate_implementation_impl`),
 and have `on_tick` — invoked synchronously from within that worker thread
 — hand off to the async `Context.report_progress()` via
-`anyio.from_thread.run`. `anyio` is already a FastMCP dependency, no new
-requirement needed.
+`anyio.from_thread.run`. `anyio` was already pulled in transitively via
+FastMCP at the time this task was written; it is now also pinned directly
+in `requirements.txt` (`anyio>=4.0`) as an explicit runtime dependency,
+per the final-review fix in commit `b918a7d`.
 
 **Interfaces:**
 - `BackendAdapter.run_backend`'s abstract signature (base.py) gains an
