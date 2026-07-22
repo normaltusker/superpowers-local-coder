@@ -75,6 +75,22 @@ phase, not part of this Phase 2 pass):
    Report Format section. Revisit only if it causes a real problem in
    practice (e.g. during item 1's smoke test) — don't preemptively
    redesign it.
+6. **NEW, found during item 1's smoke test: `stall_timeout_seconds`'s
+   300s default may be too tight for a cold-loading large local model.**
+   The first real `delegate_implementation` call against
+   `ollama/qwen3-coder:30b` (18GB) stalled with zero output for the full
+   300s and gave up — `ollama ps` showed nothing loaded into memory right
+   before the call, so the likely cause is cold-load time alone (before
+   any token is generated) exceeding the stall window, not a hung/broken
+   model. The stall-detection mechanism itself worked correctly (clean
+   failure, no hang, no crash) — this is a config-default/guidance gap,
+   not a code bug. Consider for Phase 2: document the cold-load risk in
+   the README, recommend always setting `fallback_models` for large
+   primary models, and/or evaluate raising the default. Don't fix
+   speculatively — see how the fallback retry (in progress as of this
+   handoff) behaves first; if `qwen2.5-coder:7b` also stalls, that points
+   at a different problem entirely (e.g. Ollama itself under load) and
+   changes what fix actually makes sense.
 
 ### Item 1 attempt — findings and next step (2026-07-22)
 
@@ -224,38 +240,52 @@ means it failed silently and needs investigating fresh (check the
 session's own conversation for the tool result, don't just re-run
 blindly).
 
-**Smoke test attempt #2 — task given, RESULT NOT YET SEEN.** Sent this
-task, asked for it to actually be run in the connected repo-root
-session — **this is the exact next action for whoever resumes**:
-```
-Let's add a "Local-Coder Quick Reference" section to
-mcp-servers/local-coder/README.md with 3-4 bullet points summarizing:
-what the MCP server does, the three tools it exposes
-(delegate_implementation, configure, list_available_models), and how to
-check which models are available. Use subagent-driven-development, and
-delegate the actual implementation to local-coder rather than writing it
-directly.
-```
-Rationale for this specific task: small and low-risk (pure
-documentation, no code semantics to get wrong), but has enough real
-shape (multiple bullet points, a specific file/section) that SDD
-engaging isn't artificial, and the explicit "delegate to local-coder"
-instruction removes ambiguity about which path it should take. **Also
-flagged to watch for:** that repo-root session sits on `dev` directly
-(not a feature branch) — SDD's normal flow should create/checkout a
-branch as part of its process, but this hasn't been confirmed; if it
-tries to commit straight to `dev`, that needs to be stopped.
+**Smoke test attempt #2, first delegate_implementation call — FAILED,
+but usefully (stall, not a crash).** The MCP tool call
+(`kruub07t`) completed and returned `success: false`:
+`ollama/qwen3-coder:30b` stalled with **zero output for the full 300s
+`stall_timeout_seconds`**, no `fallback_models` were configured, so the
+call gave up cleanly with a clear error rather than hanging or crashing.
+This is a genuinely valuable result even though the task didn't
+complete: it's real evidence the stall-detection/no-fallback-configured
+path in `delegate_implementation` works exactly as designed. Checked
+`ollama ps` at the time — **nothing was loaded into memory** — so the
+most likely explanation is a cold-load of an 18GB/30B model exceeding
+300s before producing a single token (the stall detector watches for
+*output*, and cold-load time produces none). This is a real Phase 2
+finding worth its own line item: **`stall_timeout_seconds`'s 300s
+default may be too tight for a cold-loading large local model** — not
+raised as a bug in Phase 1's code (the mechanism did exactly what it was
+built to do), but as a possible config-default/README-guidance gap for
+Phase 2 to consider (e.g. documenting that first-use-after-idle can be
+slow, or raising the default, or recommending fallback_models always be
+set for large primary models).
 
-**If resuming and this result is now known:** update this section with
-what happened (did `delegate_implementation` actually fire? did aider
-run against Ollama? did a commit land, on what branch? did the reviewer
-approve? was a PR offered?) before doing anything else, then decide
-whether item 1 is COMPLETE or needs another attempt. **If resuming and
-this result is NOT yet known** (e.g. the prompt was sent but the
-response never arrived before running out of session), the task above
-is exactly what to re-send/check on in the repo-root session — don't
-regenerate a different task, use this one so the record stays
-consistent.
+**Attempt #2 retry — configure fallback, retry — IN PROGRESS AS OF THIS
+UPDATE.** Decision made: rather than a bare retry (doesn't test
+failover, risks same stall for an unrelated reason) or abandoning
+delegation (would leave item 1 still never having succeeded), configure
+`ollama/qwen2.5-coder:7b` (already pulled, small/fast) as
+`fallback_models`, keep `qwen3-coder:30b` as primary, then retry the
+same README task. Told to the repo-root session as:
+```
+Configure qwen2.5-coder:7b as a fallback model (call configure with
+fallback_models: ["ollama/qwen2.5-coder:7b"], keep qwen3-coder:30b as
+primary), then retry the delegation for the same README task.
+```
+**Result of this retry not yet seen as of this handoff update.**
+
+**If resuming and the retry's result is now known:** update this section
+with what happened (did the primary model succeed this time now that
+it's presumably warm/loaded from the first attempt? did it fail over to
+the 7b fallback? did EITHER complete — file written, commit landed, on
+what branch? did the reviewer approve? was a PR offered?) before doing
+anything else, then decide whether item 1 is COMPLETE. **If resuming and
+this result is NOT yet known**, re-send the exact retry instruction
+above in the repo-root session (`local-coder` connected there) — don't
+regenerate a different instruction, use this one so the record stays
+consistent. Also re-check `ps aux | grep -E "aider|ollama"` first in
+case it's still mid-run rather than actually stuck.
 
 ### Housekeeping for Phase 2
 
