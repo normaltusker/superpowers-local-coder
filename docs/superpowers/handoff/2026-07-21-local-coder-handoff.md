@@ -11,20 +11,34 @@ session end — a stale handoff is worse than none.
 implementation plan via `superpowers:subagent-driven-development`,
 task-by-task.** Check the progress ledger (see below) for exactly which
 tasks are done — trust it and `git log` over this prose if they conflict.
-**ALL 9 PLAN TASKS + THE TASK 6.5 ADDENDUM ARE COMPLETE AND MERGE-READY.**
-The final whole-branch review (most capable model) came back "Ready to
-merge: With fixes" — 1 Important (anyio not an explicit `requirements.txt`
-dependency, worked only transitively via fastmcp) + 2 Minor (missing
-`__pycache__` gitignore entry, spec/impl `.mcp.json` example drift). One
-fix dispatch (commit `b918a7d`) resolved all three; a second, independent
-confirmatory review empirically re-verified each fix (actually ran the
-suite, actually checked `git status`, didn't just trust the fix report)
-and returned **"Ready to merge: Yes."** 43/43 tests passing throughout.
-**Currently: about to invoke `superpowers:finishing-a-development-branch`**
-to decide how this branch gets proposed for merge (a new PR from
-`local-coder-impl` into `dev`, most likely — no PR exists for this branch
-yet). If resuming and this hasn't happened yet, that's the very next step
-— no more implementation or review work remains before it.
+**ALL 9 PLAN TASKS + THE TASK 6.5 ADDENDUM ARE COMPLETE.** The final
+whole-branch review + one fix round + a confirmatory re-review all
+returned "Ready to merge: Yes" (43/43 tests). **PR #2 was opened**
+(`local-coder-impl` → `dev`):
+https://github.com/normaltusker/superpowers-local-coder/pull/2
+
+**After the PR opened, CodeRabbit's automated review found 17 more
+findings** (real ones — branch-name argument injection into git/gh
+subprocess calls, a subprocess resource leak on unexpected exception, a
+generic exception crashing the whole `delegate_implementation` call
+instead of failing over, no timeout on `ollama list`, blocking git/gh
+calls left on the async event loop after Task 6.5's conversion, plus doc
+drift). **16 fixed** across 5 commits (`289c693`, `f18150b`, `c1dfb03`,
+`6b2635b`, `3ceac27`); **1 deliberately skipped** (unbounded
+`requirements.txt` version ranges / a transitive `idna` CVE — needs a
+proper lockfile tool, out of scope for a review-fix round, documented
+in the reply on that thread). All 17 threads replied-to and resolved on
+GitHub. A dedicated review of just this fix batch (most capable model,
+7 specific correctness checks with file:line evidence) came back clean.
+**55/55 tests passing now** (12 new TDD tests from this round).
+
+**Current state: PR #2 is open, all review rounds clean, nothing else
+pending.** If resuming: check `gh pr view 2 --repo
+normaltusker/superpowers-local-coder` for any NEW review activity since
+this handoff was written before assuming there's nothing left to do —
+CI/review bots may have posted more since. If truly nothing new, this
+work is done; merging the PR is the human's call, not something to do
+unprompted.
 
 **Plan file note:** `docs/superpowers/plans/2026-07-21-local-coder-phase1.md`
 now has a "Task 6.5" section inserted between Task 6 and Task 7 — this
