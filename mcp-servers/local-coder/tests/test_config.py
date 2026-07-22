@@ -28,6 +28,73 @@ def test_load_config_returns_defaults(isolated_config):
     assert cfg["open_pr"] is False
 
 
+def test_save_config_writes_atomically_via_temp_file_and_replace(isolated_config, monkeypatch):
+    # Confirm save_config never writes directly to CONFIG_PATH in place —
+    # it must go through a temp file in the same directory followed by
+    # os.replace(), so a crash mid-write can't leave config.yaml partially
+    # written/corrupted.
+    import os as os_module
+
+    replace_calls = []
+    real_replace = os_module.replace
+
+    def spying_replace(src, dst):
+        # At the moment of replace, the temp source file must already be
+        # fully written and exist as a sibling of CONFIG_PATH (same dir).
+        assert Path(src).parent == isolated_config.parent
+        assert Path(src).exists()
+        replace_calls.append((src, dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os_module, "replace", spying_replace)
+
+    cfg = config_module.load_config()
+    cfg["model"] = "ollama/atomic-write-test:1b"
+    config_module.save_config(cfg)
+
+    assert len(replace_calls) == 1
+    assert str(replace_calls[0][1]) == str(isolated_config)
+    # the temp file must be gone after a successful replace
+    leftover_temps = list(isolated_config.parent.glob(".config.yaml.*.tmp"))
+    assert leftover_temps == []
+
+    reloaded = config_module.load_config()
+    assert reloaded["model"] == "ollama/atomic-write-test:1b"
+
+
+def test_save_config_cleans_up_temp_file_on_write_failure(isolated_config, monkeypatch):
+    import yaml as yaml_module
+
+    def blowup_dump(*args, **kwargs):
+        raise RuntimeError("simulated write failure")
+
+    monkeypatch.setattr(yaml_module, "safe_dump", blowup_dump)
+
+    with pytest.raises(RuntimeError, match="simulated write failure"):
+        config_module.save_config({"model": "x"})
+
+    leftover_temps = list(isolated_config.parent.glob(".config.yaml.*.tmp"))
+    assert leftover_temps == []
+    # the original file must be untouched
+    reloaded = config_module.load_config()
+    assert reloaded["model"] == "ollama/qwen3-coder:30b"
+
+
+def test_configure_with_validation_uses_lock_around_compound_operation(isolated_config):
+    # Basic sanity check that the lock is actually acquired and released
+    # around the compound operation — not a true concurrency test (hard to
+    # do deterministically), just confirms the lockfile is created and
+    # usable, and that configure_with_validation completes normally under
+    # it (i.e. the lock doesn't deadlock or leak across calls).
+    result1 = config_module.configure_with_validation({"max_fallback_models": 5})
+    result2 = config_module.configure_with_validation({"max_fallback_models": 6})
+    assert result1["max_fallback_models"] == 5
+    assert result2["max_fallback_models"] == 6
+
+    lock_path = config_module._lock_path()
+    assert lock_path.exists()
+
+
 def test_save_config_persists_changes(isolated_config):
     cfg = config_module.load_config()
     cfg["model"] = "ollama/qwen2.5-coder:14b"

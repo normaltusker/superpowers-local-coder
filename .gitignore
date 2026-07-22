@@ -13,3 +13,4 @@ __pycache__/
 # plugin, so the whole directory is ignored here.
 evals/
 mcp-servers/local-coder/.venv/
+mcp-servers/local-coder/.config.yaml.lock

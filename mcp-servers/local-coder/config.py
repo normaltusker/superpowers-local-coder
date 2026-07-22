@@ -1,3 +1,7 @@
+import contextlib
+import fcntl
+import os
+import tempfile
 from pathlib import Path
 
 import yaml
@@ -14,6 +18,37 @@ CONFIG_PATH = Path(__file__).parent / "config.yaml"
 CLEAR_FIELD = "__clear__"
 
 
+def _lock_path() -> Path:
+    # Derived from CONFIG_PATH (rather than a fixed module-level constant)
+    # so tests that monkeypatch CONFIG_PATH to an isolated tmp_path also get
+    # an isolated lockfile, instead of every test run contending on one
+    # lockfile in the real package directory.
+    return CONFIG_PATH.parent / f".{CONFIG_PATH.name}.lock"
+
+
+@contextlib.contextmanager
+def _config_lock():
+    """Exclusive file lock guarding the load->merge->validate->save
+    sequence, so a concurrent configure() call (or a configure() racing a
+    delegate_implementation call reading config) can't interleave and lose
+    updates or persist a combination that was never validated together.
+
+    Uses fcntl.flock on a dedicated lockfile (not CONFIG_PATH itself, so
+    save_config's atomic replace of CONFIG_PATH is never affected by the
+    lock's own file lifecycle). POSIX-only (fcntl), consistent with this
+    project's documented macOS/Linux dev-environment scope — no
+    third-party dependency needed.
+    """
+    lock_path = _lock_path()
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
 def load_config() -> dict:
     with open(CONFIG_PATH) as f:
         return yaml.safe_load(f)
@@ -25,9 +60,6 @@ def save_config(config: dict) -> None:
     # config.yaml partially written/corrupted (os.replace is atomic on
     # POSIX when source and destination are on the same filesystem, which
     # a same-directory temp file guarantees).
-    import os
-    import tempfile
-
     fd, tmp_path = tempfile.mkstemp(
         dir=CONFIG_PATH.parent, prefix=".config.yaml.", suffix=".tmp"
     )
@@ -70,6 +102,11 @@ def _validate_ollama_model(model: str, available: list[str]) -> None:
 
 
 def configure_with_validation(overrides: dict) -> dict:
+    with _config_lock():
+        return _configure_with_validation_locked(overrides)
+
+
+def _configure_with_validation_locked(overrides: dict) -> dict:
     current = load_config()
 
     # Determine the final values for validation
