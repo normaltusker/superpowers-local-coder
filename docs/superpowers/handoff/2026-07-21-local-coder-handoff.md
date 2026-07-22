@@ -344,43 +344,90 @@ on_tick heartbeat. Manually verified end-to-end with a real subprocess
 (not just unit tests) that chunks stream through as they arrive, not
 buffered until exit.
 
-**OPEN QUESTION, not yet answered: how do you actually WATCH the
-local-coder MCP server's stderr live in this Claude Code setup?** The
-mechanism (chunks reaching stderr) is proven; where that stderr actually
-surfaces to a human watching — a log file, a Claude Code UI panel, a
-`tail -f` target — was NOT verified, to avoid documenting an unconfirmed
-guess. `~/Library/Logs/Claude/` exists but appeared to be the desktop
-app's own logs, not obviously the MCP subprocess's stderr; no MCP-
-specific log file was found via search. **Next real attempt at item 1
-should specifically check where this output lands** (try
-`claude mcp list`'s own surrounding UI, ask Claude Code directly "where
-can I see the local-coder MCP server's stderr", or check for a
-`--verbose`/`--debug` flag on the `claude` CLI that surfaces subprocess
-stderr) and record the answer here once confirmed — don't assume it
-works until someone has actually watched a real chunk arrive live.
+**"Where do you watch stderr" OPEN QUESTION — ANSWERED (the answer is:
+you can't, so a log file was added instead).** Investigated via `lsof`
+on the running server process: Claude Code pipes an MCP server's stdout/
+stderr over an internal unix socket it owns directly (the socket's other
+end is held by the `claude` binary's own PID) — there is no external tap
+point without root/sudo access, which this session doesn't have. Also
+tested `claude --debug-file <path>`: confirmed it captures Claude Code's
+own tool-dispatch lifecycle (`Calling MCP tool: delegate_implementation`,
+`still running (Ns elapsed)`, etc.) but NOT the actual subprocess output
+`on_output` prints — so it does not solve this. **Fix: `on_output` now
+ALSO writes to a fixed log file,
+`mcp-servers/local-coder/local-coder-output.log`** (gitignored, in the
+worktree next to `server.py`), truncated fresh at the start of every
+`delegate_implementation` call, alongside the existing stderr print.
+`tail -f .worktrees/local-coder-impl/mcp-servers/local-coder/local-coder-output.log`
+in a separate terminal is the confirmed, verified way to watch a
+delegated backend's real output live going forward. Committed as
+`b3835fb` (TDD, 3 new tests, all genuinely RED-before/GREEN-after).
 
-**`config.yaml` cleanup — DONE.** Confirmed via `ps aux` that no
-`aider`/subprocess was running before touching the file (the interrupted
-retry had already been killed/exited). Reverted BOTH
-`fallback_models` (back to `[]`) AND `target_repo_path` (back to
-`null`) — the earlier plan was to keep `fallback_models` as
-`qwen2.5-coder:7b`, but that got revisited: 6 tests hardcode the
-original empty-list default via the `isolated_config` fixture (which
-copies the LIVE `config.yaml`, not a fixed baseline — a real fragility
-in that fixture, not touched here since it's pre-existing and out of
-scope for this fix), and rather than update 6 tests for what was really
-just a local convenience, the decision was to keep the shipped default
-as-is. `git diff config.yaml` now shows zero changes — fully reverted to
-match `dev`.
+**MUCH more important: attempting to actually USE this watch-live setup
+surfaced a real, previously-undiscovered bug — a genuine hang, not a
+slow model.** While waiting to watch the retry (before the log-file fix
+had even been tried), the delegation call sat at "still running" for
+480+ seconds — well past the 300s `stall_timeout_seconds` — with no
+failover and no error. Investigated with `ps aux` (the aider process had
+consumed only ~5s of CPU across 4+ minutes of wall-clock time — a strong
+signal of "blocked," not "slow") and `sample` (macOS's built-in
+non-invasive stack sampler, no sudo needed): **the aider subprocess's
+main thread was parked in a `read()` syscall under
+`builtin_input_impl`/`PyFile_GetLine` — genuinely blocked trying to read
+from stdin.** Root cause: `run_monitored_subprocess`'s `Popen` call never
+set `stdin=`, so the backend subprocess inherited THIS SERVER'S OWN
+stdin — the MCP stdio JSON-RPC pipe from Claude Code, which is an open
+pipe that receives data but never sends EOF. Whatever caused aider to
+attempt a stdin read (despite `--yes`) then blocked forever, and — this
+is the important part — **the stall-timeout mechanism did not catch it**,
+because that mechanism only watches for OUTPUT activity; a process
+blocked reading stdin can still look "recently active" from earlier
+startup output, so the stall timer's clock never restarts and never
+fires. This was a real, unbounded hang with no automatic recovery path.
+
+**Fixed: `stdin=subprocess.DEVNULL`** added to the `Popen` call, severing
+the child from the parent's stdin entirely — any read attempt now gets
+immediate EOF instead of blocking. TDD note worth preserving: the
+straightforward version of this test passed even against the buggy code
+(pytest's own stdin is already non-blocking in this environment, so it
+didn't reproduce the bug) — had to construct the actual failure scenario
+directly (a real open pipe, held open with no EOF, dup2'd onto a forked
+child's stdin before calling the function under test) to get a genuine
+RED result (`STALLED`) before the fix and GREEN (immediate EOF) after.
+Committed as `620cfc0`. **110/110 tests passing.**
+
+**`config.yaml` cleanup — DONE, same procedure as before.** Confirmed via
+`ps aux` that nothing was running (the hung process had been killed —
+see below), then `git checkout -- config.yaml` to fully revert the
+drift (both `fallback_models` and `target_repo_path`) back to match
+`dev`. `git diff config.yaml` shows zero changes.
+
+**The hung aider process (PID 8099) was killed manually** (`kill 8099`)
+rather than left to hang indefinitely, since no automatic recovery
+existed before the stdin fix landed. **This means the
+`delegate_implementation` MCP tool call in whatever Claude Code session
+initiated it never received a normal return** — that call's parent
+process (the local-coder server, PID 4335) also appears to have exited
+around the same time (not confirmed why — possibly it noticed its child
+died and exited, or the MCP connection itself dropped). **If resuming in
+that same session: it likely needs to be restarted/reconnected** — check
+`claude mcp list` for `local-coder`'s connection status, and if it shows
+disconnected, that session needs a fresh reconnect (or a new session
+entirely) before delegating again.
 
 **If resuming: item 1 (the smoke test) has still never completed
-successfully.** The next attempt should (a) first resolve the "where do
-I watch stderr" open question above, (b) re-send the same Quick
-Reference task (text preserved above under "Smoke test attempt #2") to
-the repo-root session where `local-coder` is connected, (c) actually
-watch it run this time instead of waiting blind, (d) record the
-outcome. Don't re-litigate the visibility fix — it's done and tested;
-only the "where do I watch it" question remains.
+successfully — but this time for a well-understood, now-fixed reason,
+not an open question.** The next attempt should just work: (a) ensure
+`local-coder` is connected in a session that has today's commits loaded
+(a fresh session, or a reconnected one), (b) start
+`tail -f mcp-servers/local-coder/local-coder-output.log` (from the
+worktree) in a separate terminal BEFORE sending the task, (c) re-send
+the same Quick Reference task (text preserved above under "Smoke test
+attempt #2"), (d) watch the tail output live this time, (e) record
+whether it completes. Both real gaps found this round (no live
+visibility, the stdin hang) are now fixed and tested — there is no known
+reason left for this to fail, but "no known reason" is not the same as
+"verified working," which is exactly what item 1 still needs.
 
 ### Housekeeping for Phase 2
 
@@ -440,25 +487,33 @@ and paste this:
 ```
 Read docs/superpowers/handoff/2026-07-21-local-coder-handoff.md in the
 superpowers-local-coder repo and resume Phase 2 work from exactly where
-it left off, per the "Where things stand NOW" section at the top. The
-live-output visibility fix (on_output streaming to the local-coder MCP
-server's stderr) is DONE and tested (commit 870cb9a) — do not redo it.
-What's still open: (1) figure out exactly where/how to watch that
-server's stderr live in this Claude Code setup — the doc has a specific
-"OPEN QUESTION" note on this, answer it empirically (ask Claude Code
-directly, check for CLI flags, etc.) and record the answer in the doc;
-(2) once that's answered, re-send the Quick Reference smoke-test task
-(exact text preserved in the doc under "Smoke test attempt #2") to the
-repo-root session where local-coder is connected, and this time actually
-watch it run instead of waiting blind; (3) record whether item 1 (the
-Part 3 smoke test) finally completes. Don't re-derive context from git
-log or re-read the design spec/plan from scratch — the handoff doc is
-the current source of truth. Keep it updated as you go. Note: the
-repo-root session sits on `dev` directly — do not commit anything there
-without switching branches first; actual code/doc commits belong in the
-worktree at .worktrees/local-coder-impl/ on branch local-coder-impl,
-which is also where the LIVE config.yaml actually lives (see the doc's
-note on CLAUDE_PLUGIN_ROOT resolving to the worktree, not the repo root).
+it left off, per the "Where things stand NOW" section at the top. TWO
+real fixes landed this round, both DONE and tested — do not redo either:
+(1) on_output now also writes to a log file,
+mcp-servers/local-coder/local-coder-output.log (commit b3835fb), since
+Claude Code owns the MCP server's stderr internally with no external tap
+point; (2) a genuine hang bug is fixed — run_monitored_subprocess's
+Popen call now sets stdin=subprocess.DEVNULL, because the backend
+subprocess was inheriting the MCP server's own stdin (an open pipe that
+never sends EOF) and could block forever reading it, past the stall
+timeout, with no recovery (commit 620cfc0). What's still open: item 1,
+the Part 3 smoke test, has still never completed successfully. Re-send
+the Quick Reference smoke-test task (exact text preserved in the doc
+under "Smoke test attempt #2") to a session where local-coder is
+connected (check `claude mcp list` first — a prior session's hung
+delegate_implementation call may have left it disconnected), and START
+`tail -f mcp-servers/local-coder/local-coder-output.log` (from the
+worktree) in a separate terminal BEFORE sending the task this time, so
+you actually watch it run rather than waiting blind. Record whether it
+finally completes. Don't re-derive context from git log or re-read the
+design spec/plan from scratch — the handoff doc is the current source of
+truth. Keep it updated as you go. Note: a session at the main repo root
+sits on `dev` directly — do not commit anything there without switching
+branches first; actual code/doc commits belong in the worktree at
+.worktrees/local-coder-impl/ on branch local-coder-impl, which is also
+where the LIVE config.yaml and the new log file actually live (see the
+doc's note on CLAUDE_PLUGIN_ROOT resolving to the worktree, not the repo
+root).
 ```
 
 If the plugin-connection blocker somehow regresses (e.g. `local-coder`
