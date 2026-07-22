@@ -275,6 +275,41 @@ primary), then retry the delegation for the same README task.
 ```
 **Result of this retry not yet seen as of this handoff update.**
 
+**IMPORTANT discovery while checking on this: the running local-coder
+MCP server reads/writes the WORKTREE's `config.yaml`
+(`.worktrees/local-coder-impl/mcp-servers/local-coder/config.yaml`), NOT
+the repo-root checkout's copy — even though the Claude Code session
+issuing the `configure`/`delegate_implementation` calls has its shell
+`cd`'d into the repo root.** Confirmed by diffing the two files: the
+repo-root copy is still untouched (`fallback_models: []`,
+`target_repo_path: null`); the worktree copy now has
+`fallback_models: [ollama/qwen2.5-coder:7b]` and
+`target_repo_path: /Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder`
+(the repo root's own absolute path, written by the `configure` call
+presumably resolving its own cwd). This makes sense once you trace it:
+`${CLAUDE_PLUGIN_ROOT}` resolves to wherever the plugin's marketplace
+`source` points — which is the worktree
+(`.claude-plugin/marketplace.json`'s `source: "./"` combined with the
+marketplace being added FROM the worktree path) — so the server process
+itself, and everything it reads/writes including `config.yaml`, lives in
+the worktree regardless of which directory the chat session's own shell
+happens to be in. **Practical implication: from now on, always check
+`.worktrees/local-coder-impl/mcp-servers/local-coder/config.yaml` for
+the live config, not the repo-root copy — the repo-root copy is
+effectively dead/unused as long as the plugin is installed from the
+worktree.**
+
+**Do NOT hand-edit `config.yaml` while a `delegate_implementation`/
+`configure` call may still be in flight against it** — the running
+server process owns reads/writes to this file mid-call; editing it
+concurrently risks a race. **Once the retry has fully finished (check
+`ps aux | grep aider` is clear first): revert `target_repo_path` back
+to `null` before committing** (per explicit decision — a hardcoded
+personal absolute machine path doesn't belong in shared `dev` history),
+**but keep the `fallback_models: [ollama/qwen2.5-coder:7b]` change**
+(a real, useful default for this environment going forward). Then
+`git add`/commit/push from the worktree as usual.
+
 **If resuming and the retry's result is now known:** update this section
 with what happened (did the primary model succeed this time now that
 it's presumably warm/loaded from the first attempt? did it fail over to
