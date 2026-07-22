@@ -147,9 +147,9 @@ subpackage; `mcp-servers/local-coder/` itself never gets an `__init__.py`.
 Run:
 ```bash
 cd mcp-servers/local-coder
-python3 -m venv .venv
+python3.13 -m venv .venv
 ```
-Expected: `.venv/` directory created.
+Expected: `.venv/` directory created. Use a Python 3.10+ interpreter explicitly (e.g. `python3.13`) — a bare `python3` can resolve to an older system Python (observed: 3.9.6), which silently fails to install `fastmcp` (requires >=3.10).
 
 Check this repo's root `.gitignore` for an existing `.venv` entry:
 ```bash
@@ -1629,9 +1629,10 @@ instead of Claude Code's own Edit/Write tools.
 - This server's own dependencies installed into its venv:
   ```bash
   cd mcp-servers/local-coder
-  python3 -m venv .venv
+  python3.13 -m venv .venv
   .venv/bin/pip install -r requirements.txt
   ```
+  Use a Python 3.10+ interpreter explicitly (e.g. `python3.13`), not a bare `python3` — `fastmcp` requires >=3.10 and an older system `python3` will fail the install silently.
 
 ## Configuring backend/model
 
