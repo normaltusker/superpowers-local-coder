@@ -7,11 +7,47 @@ session end — a stale handoff is worse than none.
 
 ## Where things stand NOW (read this first)
 
-**Phase 1 is merged. Phase 2 is starting.** PR #2 (`local-coder-impl` →
-`dev`) merged at commit `70f8ba3` on 2026-07-22. `dev` now has the full
-Phase 1 build: the local-coder MCP server (Aider backend real,
-Codex/Gemini/OpenRouter stubbed), the SDD skill rewiring, and
-`agents/local-coder-implementer.md`.
+**Phase 1 is merged. Phase 2 in progress — currently on item 7.** PR #2
+(`local-coder-impl` → `dev`) merged at `70f8ba3`. `dev` has the full
+Phase 1 build.
+
+**LATEST (2026-07-22, item 7 = mid-flight communication):** Item 7 was
+selected as the Phase 2 focus (over the other backlog items). Ran
+`superpowers:brainstorming`. Built a throwaway `elicit-probe` MCP server
+and drove it from a live Claude Code session to answer the key design
+questions empirically, then removed it. **Confirmed findings:**
+- `ctx.report_progress()` renders live in Claude Code BUT is ephemeral
+  (each message replaces the last; nothing persists once superseded —
+  inherent to the MCP progress protocol, not fixable by calling it
+  differently).
+- `ctx.elicit()` works with Claude Code AND persists (question + the
+  user's answer both stay as permanent chat messages; verified full
+  round-trip — asked "favorite color?", got "Pink" back).
+- MCP resources are pull-based; no evidence Claude Code auto-refreshes on
+  `ResourceUpdatedNotification`. Ruled out as a live channel.
+
+**Design spec written and committed** (`ca18b09`):
+`docs/superpowers/specs/2026-07-22-mid-flight-communication-design.md`.
+Two-phase: **2a visibility (build now)** = upgrade `on_tick`'s
+`report_progress` to carry the latest real output line (throttled to the
+tick cadence, not per-chunk) + add an `output_tail` field
+(bounded to existing `_MAX_OUTPUT_CHARS`=20000) to
+`delegate_implementation`'s result dict on both success/failure, sourced
+from `CompletionResult` (new `output_tail` field on
+`backends/base.py`'s `CompletionResult`, populated by
+`AiderBackend.run_backend` from `result.stdout`). **2b interactive
+prompt-answering (design-only, gated)** = `elicit()`, but DO NOT build
+until real aider-prompt frequency is observed; the hard constraint is
+that `stdin=subprocess.DEVNULL` (commit `620cfc0`) must NOT be reverted.
+
+**NEXT STEP when resuming:** the design spec is written but NOT yet
+user-reviewed or turned into an implementation plan. Per the
+brainstorming flow, the next actions are: (1) ask the user to review the
+spec file; (2) once approved, invoke `superpowers:writing-plans` to
+create the Phase 2a implementation plan; (3) execute 2a via
+`superpowers:subagent-driven-development` or directly. Do NOT build 2b
+yet. Working tree is clean; the elicit-probe was removed and `.mcp.json`
+reverted.
 
 **Working branch:** `local-coder-impl` (same branch, same worktree at
 `.worktrees/local-coder-impl/`) — reused for Phase 2 rather than cutting a
@@ -547,40 +583,33 @@ picking which one to resume in:**
   "Housekeeping for Phase 2" open question above) — don't try to run the
   smoke test from this one.
 
-If you don't know which one the smoke test's result landed in, start
-with the **main repo root** session (that's where attempt #2 was sent)
-and paste this:
+Do code/doc work in the **worktree** session (`.worktrees/local-coder-impl/`,
+branch `local-coder-impl`). Only use a **main-repo-root** session (on
+`dev`, where the plugin is installed/connected) if you need to actually
+CALL `local-coder` MCP tools live — but item 7's next steps are
+spec/plan work, which do NOT need a live MCP connection. Paste this:
 
 ```
 Read docs/superpowers/handoff/2026-07-21-local-coder-handoff.md in the
 superpowers-local-coder repo and resume Phase 2 work from exactly where
-it left off, per the "Where things stand NOW" section at the top. TWO
-real fixes landed this round, both DONE and tested — do not redo either:
-(1) on_output now also writes to a log file,
-mcp-servers/local-coder/local-coder-output.log (commit b3835fb), since
-Claude Code owns the MCP server's stderr internally with no external tap
-point; (2) a genuine hang bug is fixed — run_monitored_subprocess's
-Popen call now sets stdin=subprocess.DEVNULL, because the backend
-subprocess was inheriting the MCP server's own stdin (an open pipe that
-never sends EOF) and could block forever reading it, past the stall
-timeout, with no recovery (commit 620cfc0). What's still open: item 1,
-the Part 3 smoke test, has still never completed successfully. Re-send
-the Quick Reference smoke-test task (exact text preserved in the doc
-under "Smoke test attempt #2") to a session where local-coder is
-connected (check `claude mcp list` first — a prior session's hung
-delegate_implementation call may have left it disconnected), and START
-`tail -f mcp-servers/local-coder/local-coder-output.log` (from the
-worktree) in a separate terminal BEFORE sending the task this time, so
-you actually watch it run rather than waiting blind. Record whether it
-finally completes. Don't re-derive context from git log or re-read the
-design spec/plan from scratch — the handoff doc is the current source of
-truth. Keep it updated as you go. Note: a session at the main repo root
-sits on `dev` directly — do not commit anything there without switching
-branches first; actual code/doc commits belong in the worktree at
-.worktrees/local-coder-impl/ on branch local-coder-impl, which is also
-where the LIVE config.yaml and the new log file actually live (see the
-doc's note on CLAUDE_PLUGIN_ROOT resolving to the worktree, not the repo
-root).
+it left off, per the "Where things stand NOW" section at the top. We are
+on Phase 2 item 7 (mid-flight communication for delegate_implementation).
+A design spec is ALREADY WRITTEN and committed at
+docs/superpowers/specs/2026-07-22-mid-flight-communication-design.md
+(commit ca18b09) — read it, do NOT rewrite it from scratch. The probe
+testing that informed it is DONE (elicit works+persists, report_progress
+renders but is ephemeral, resources are pull-based) and the throwaway
+elicit-probe has been removed — do NOT rebuild it. The immediate next
+step per the brainstorming flow: (1) ask the user to review the spec
+file if they haven't; (2) once approved, invoke superpowers:writing-plans
+to create the Phase 2a implementation plan (Phase 2a = visibility: live
+pulse via on_tick report_progress carrying real output + output_tail
+field in the result; 2b interactive prompt-answering is design-only and
+GATED — do NOT build 2b). Work in the worktree session on branch
+local-coder-impl. Don't re-derive context from git log — the handoff doc
+and the spec are the source of truth. Keep the handoff doc updated as you
+go. Respect session-usage limits: do not burn into paid credits; if
+approaching the limit, update the handoff doc and stop.
 ```
 
 If the plugin-connection blocker somehow regresses (e.g. `local-coder`
