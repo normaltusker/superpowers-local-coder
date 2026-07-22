@@ -2,137 +2,140 @@
 
 **Purpose of this file:** if this session ends mid-work, read this first —
 it should make resumption fast without re-deriving context from the whole
-conversation.
+conversation. **Update this file whenever a task completes**, not just at
+session end — a stale handoff is worse than none.
 
 ## Where things stand
 
-**Phase:** Design is done and approved. Currently starting implementation
-planning (`superpowers:writing-plans`) to turn the spec into an executable
-plan. **No implementation code has been written yet.**
+**Phase:** Design + plan are done and merged. **Currently executing the
+implementation plan via `superpowers:subagent-driven-development`,
+task-by-task.** Check the progress ledger (see below) for exactly which
+tasks are done — trust it and `git log` over this prose if they conflict.
 
-**Branch:** `local-coder-design`, pushed to `origin`. PR open:
-https://github.com/normaltusker/superpowers-local-coder/pull/1
-(base: `dev`, which was created fresh from `main` since this fork had no
-`dev` branch — see "Branches created this session" below).
+**Workspace:** isolated git worktree at
+`.worktrees/local-coder-impl/` (relative to the main checkout at
+`/Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder`),
+on branch `local-coder-impl`, pushed to `origin`, tracking `origin/dev`.
+**No PR opened yet for this branch** — that happens after all 9 tasks +
+final review are complete, per `finishing-a-development-branch`.
 
-**The spec:** `docs/superpowers/specs/2026-07-21-local-coder-delegation-design.md`
-— read this in full before doing anything else. It is the source of truth
-for every design decision below. This handoff summarizes it; it does not
-replace it.
+If resuming in a fresh session: `cd .worktrees/local-coder-impl` (or if
+that worktree doesn't exist in your checkout, `git worktree list` from the
+main repo root to find it, or `git checkout local-coder-impl` if working
+without worktrees).
 
-**Review status:** Gemini Code Assist reviewed PR #1 and found two real
-bugs, both fixed and pushed (commit `73a74a1`), replies posted on both
-review threads:
-1. `self_commits=False` change detection was using `git diff --name-only`
-   (misses newly created untracked files) — fixed to diff
-   `git status --porcelain` against the pre-run snapshot.
-2. `git push -u origin branch` was unconditional — fixed to check for an
-   `origin` remote first; no remote = success with `pr_url: null`, not a
-   failure.
+**Design spec:** `docs/superpowers/specs/2026-07-21-local-coder-delegation-design.md`
+(merged to `dev` via PR #1, reviewed by Gemini Code Assist, 2 findings
+fixed). Read this for full rationale — this handoff doesn't repeat it.
 
-No further review feedback pending as of this handoff.
+**Implementation plan being executed:**
+`docs/superpowers/plans/2026-07-21-local-coder-phase1.md` — 9 tasks,
+TDD throughout. Read this before dispatching or resuming any task; it is
+the single source of truth for what each task must do.
 
-## What the design actually says (condensed)
+**Progress ledger:** `.superpowers/sdd/progress.md` (git-ignored, local
+only — if it's missing/deleted, reconstruct from `git log --oneline` on
+this branch: each task's commits are self-describing, e.g. "local-coder:
+add config load/save/merge with tests" = Task 1).
 
-Full detail is in the spec; this is the "read this in 60 seconds" version.
+## Branch/PR state (as of this handoff)
 
-**Two parts:**
-1. `mcp-servers/local-coder/` — new FastMCP server, three tools:
-   `delegate_implementation`, `configure`, `list_available_models`.
-2. Rewire `skills/subagent-driven-development/` so its per-task implementer
-   subagent calls `delegate_implementation` instead of using Edit/Write,
-   via a new `.claude/agents/local-coder-implementer.md` subagent
-   definition that structurally excludes Edit/Write from that subagent's
-   toolset (a real harness restriction, not just a prompt instruction).
+- `main` — untouched, matches `origin/main`.
+- `dev` — has the merged design spec + plan + this handoff doc (via PR #1,
+  merged at commit `0aa1e39`). This is the base every implementation branch
+  tracks.
+- `local-coder-design` — the now-merged design-only branch. Its PR #1 is
+  closed/merged. Leave it alone; don't add implementation commits to it.
+- `local-coder-impl` — **the active implementation branch**, worktree at
+  `.worktrees/local-coder-impl/`, branched from `origin/dev` after PR #1
+  merged, then fast-forward-merged with 3 stray commits from
+  `local-coder-design` that hadn't made it into PR #1 (the plan file, the
+  handoff doc, and a path-correction fix) — those are now on `dev` via the
+  merge commit on this branch, so future rebases/merges from `dev` will be
+  clean.
 
-**Backend phasing — important, easy to get wrong:**
-- **Aider is the only backend implemented in Phase 1.** Shells out to
-  `aider --model {model} --yes --message "{task}"`, relies on aider's own
-  auto-commit (`self_commits=True`).
-- **Codex and Gemini are fully designed but NOT implemented yet** — stubs
-  raising `NotImplementedError` in Phase 1. Their concrete CLI invocation,
-  auth (`OPENAI_API_KEY` / `GEMINI_API_KEY`), and `self_commits=False`
-  change-detection contract are already specified in the spec's "Codex and
-  Gemini backends" section — a later phase implements them, it should NOT
-  need to redesign the interface.
-- **OpenRouter is an unresearched stub** — not designed at all yet.
-- Neither Codex CLI nor Gemini CLI auto-commits (unlike aider) — this is
-  why the `self_commits` flag exists on `BackendAdapter` at all. Gemini CLI
-  has no local/Ollama model support (Codex does).
+## What Phase 1 actually builds (condensed — full detail in the plan)
 
-**Key decisions locked in during brainstorming (each was contested/refined
-— don't re-litigate without re-reading why in the spec):**
-- Model/backend config happens ONLY via chat with Claude Code
-  (`list_available_models` → `configure(...)`), never manual YAML editing.
-  There is no checkbox UI — MCP tools can't render one.
-- `delegate_implementation` has **no `model` parameter** — SDD dispatch is
-  autonomous, so there's no point in the loop to inject a per-call
-  override. Model is a pre-run `config.yaml` setting only; changing it
-  mid-plan requires stopping and resuming.
-- `fallback_models`: explicit, human-curated, capped at `max_fallback_models`
-  (default 3, itself configurable). Stall detection via
-  `stall_timeout_seconds` (default 300s) — no subprocess output for that
-  long = killed, next model tried.
-- `configure` validates `ollama/`-prefixed models against `ollama list`
-  before writing; rejects `backend: gemini` + local-model combos.
-- `open_pr` defaults to `false` for the SDD integration — PR creation stays
-  solely with `finishing-a-development-branch` at the end of a plan, not
-  duplicated per task. `delegate_implementation` always pushes on success
-  (if a remote exists).
-- One branch for the whole plan, reused across every task's
-  `delegate_implementation` call (matches today's SDD behavior).
-- `target_repo_path` is never auto-detected — the controller (main Claude
-  Code session) resolves it via `using-git-worktrees` and passes it
-  explicitly on every call, same as the existing `Work from: [directory]`
-  placeholder pattern.
+- `mcp-servers/local-coder/` — Python FastMCP server, 3 tools
+  (`delegate_implementation`, `configure`, `list_available_models`), Aider
+  backend fully implemented, Codex/Gemini/OpenRouter as
+  `NotImplementedError` stubs (real implementation is a later phase, not
+  this plan).
+- `agents/local-coder-implementer.md` — new subagent definition,
+  `tools: Read, Grep, Glob, Bash, mcp__local-coder__delegate_implementation`
+  (Edit/Write structurally excluded).
+- `skills/subagent-driven-development/implementer-prompt.md` and
+  `SKILL.md` — rewired to dispatch that subagent and call
+  `delegate_implementation` instead of editing files directly. Both get a
+  `FORK DIVERGENCE` HTML-comment marker at the top.
 
-## Branches created this session (state of the repo)
+**Import convention decided while writing the plan** (a real gotcha,
+don't reintroduce it): `mcp-servers/local-coder/` is hyphenated, not a
+valid Python package name, so every internal import is **flat**
+(`import config`, `from backends.aider import AiderBackend`), not
+`from local_coder import ...`. A `conftest.py` at
+`mcp-servers/local-coder/` makes this resolve identically under pytest and
+under `server.py`'s direct script launch. If a future task's code doesn't
+match this, that's a bug — the plan's every code sample already does.
 
-- `main` — untouched, reset back to match `origin/main` after commits were
-  accidentally first made directly on it. Clean.
-- `dev` — **newly created** this session (didn't exist before), branched
-  from `origin/main`, pushed to `origin`. This fork's CLAUDE.md requires
-  all PRs to target `dev`, not `main`.
-- `local-coder-design` — **the working branch**, all 7 commits of design
-  work live here, pushed to `origin`, PR #1 open against `dev`.
+## Task list (see the plan file for full detail on each)
 
-If resuming: `git checkout local-coder-design` (or it may already be
-checked out — verify with `git branch --show-current`).
+1. Python scaffold + `config.py` (load/save/merge) + tests
+2. `ollama.py` (list wrapper) + tests
+3. `backends/base.py` (interface) + `backends/common.py` (shared branch/stall
+   logic) + tests
+4. `backends/aider.py` (real) + `backends/{codex,gemini,openrouter}.py`
+   (stubs) + tests
+5. `configure`/`list_available_models` validation logic in `config.py`
+   (ollama-list check, fallback cap, gemini+local-model guard) + tests
+6. `server.py` — FastMCP tool wrappers around plain `_*_impl` functions
+   (kept separate so tests call plain functions, not FastMCP-wrapped ones)
+   + tests
+7. `.mcp.json` registration + `README.md`
+8. `agents/local-coder-implementer.md` + rewire the two SDD skill files
+9. Full test suite run + verification checkpoint (no code changes)
 
-## Explored and explicitly ruled out
+## Key decisions from design (don't re-litigate — see spec for why)
 
-- **`markelz0r/superpowers-codex`** (a different fork) — investigated per
-  user request. It is NOT related to this design: it ports the whole
-  Superpowers skill framework to run natively inside the Codex CLI as its
-  own harness (Claude Code → Codex CLI harness swap), not "delegate coding
-  work from Claude Code out to a Codex backend" (which is what our
-  `CodexBackend` design does). Stale (last push 2026-01-26, 395 commits
-  behind upstream). User said to ignore it — no action needed, don't
-  revisit unless asked again.
+- `delegate_implementation` has **no `model` parameter** — model is a
+  pre-run `config.yaml` setting only, changed via `configure` before a
+  plan starts.
+- `open_pr` defaults `false` for the SDD flow — `delegate_implementation`
+  only pushes; `finishing-a-development-branch` owns the actual PR.
+- `self_commits=False` backends (Codex/Gemini, not built this phase) must
+  diff `git status --porcelain` against a pre-run snapshot, never
+  `git diff --name-only` alone (misses untracked files) — this was a real
+  bug caught by Gemini Code Assist's review of PR #1's design doc.
+- No `origin` remote on `target_repo_path` → success with `pr_url: null`,
+  not a failure (also a Gemini Code Assist finding on PR #1).
+- MCP servers register via root `.mcp.json`, subagents live in `agents/`
+  at plugin root — both verified against real installed plugins
+  (`figma`, `feature-dev`), NOT `.claude/agents/` or a `plugin.json`
+  `mcpServers` key (an earlier spec draft assumed the latter incorrectly).
 
-## Next step (in progress / not yet done)
+## Explored and ruled out (don't revisit unless asked)
 
-Was about to invoke `superpowers:writing-plans` to turn the approved spec
-into an executable implementation plan. **This had not been invoked yet as
-of this handoff being written** — if resuming and no plan file exists yet
-under `docs/superpowers/plans/`, start there:
+- `markelz0r/superpowers-codex` fork — unrelated (ports Superpowers to run
+  natively inside Codex CLI as its own harness; not delegation-from-Claude-
+  Code-to-Codex-backend, which is what our design does).
 
-1. Invoke `superpowers:writing-plans` skill.
-2. It will read the spec at
-   `docs/superpowers/specs/2026-07-21-local-coder-delegation-design.md`.
-3. Scope the plan to **Phase 1 only** (Aider backend + SDD rewiring) unless
-   the user says otherwise when asked — Codex/Gemini are designed but
-   explicitly deferred to a later phase per the spec's own scope section.
-4. After the plan is written and approved, the natural next skill is
-   `superpowers:subagent-driven-development` (same-session execution) or
-   `superpowers:executing-plans` (parallel session) — user has not yet
-   been asked which they want; ask when the plan is ready, don't assume.
-
-## Environment facts confirmed by the user (still true unless they say
-otherwise)
+## Environment facts confirmed by the user
 
 - `gh` CLI authenticated.
-- Ollama running locally with `qwen3-coder:30b` pulled.
-- `aider` already installed on PATH.
-- Target repo for local-coder to edit: comes from the session's cwd/worktree
-  at call time (not a fixed path) — see "Repo path resolution" in the spec.
+- Ollama running locally with `qwen3-coder:30b` pulled (plus several other
+  models — `ollama list` showed `qwen2.5-coder:7b`,
+  `qwen2.5-coder:1.5b-base`, etc., useful if a fallback-model test needs a
+  second real model name).
+- `aider` 0.86.2 installed on PATH.
+- Python 3.13.7, pytest 8.2.2 available system-wide (each task still
+  creates/uses `mcp-servers/local-coder/.venv/` per the plan, not the
+  system Python, once Task 1 creates it).
+- `fastmcp` is NOT installed system-wide — Task 1's venv setup step
+  installs it from `requirements.txt`.
+
+## Execution mode
+
+`superpowers:subagent-driven-development` — fresh implementer subagent per
+task, task-scoped reviewer after each, final whole-branch review after
+Task 9, then `superpowers:finishing-a-development-branch` (which will
+open the actual PR for this branch against `dev`).
