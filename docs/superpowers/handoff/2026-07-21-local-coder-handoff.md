@@ -40,14 +40,32 @@ prompt-answering (design-only, gated)** = `elicit()`, but DO NOT build
 until real aider-prompt frequency is observed; the hard constraint is
 that `stdin=subprocess.DEVNULL` (commit `620cfc0`) must NOT be reverted.
 
-**NEXT STEP when resuming:** the design spec is written but NOT yet
-user-reviewed or turned into an implementation plan. Per the
-brainstorming flow, the next actions are: (1) ask the user to review the
-spec file; (2) once approved, invoke `superpowers:writing-plans` to
-create the Phase 2a implementation plan; (3) execute 2a via
-`superpowers:subagent-driven-development` or directly. Do NOT build 2b
-yet. Working tree is clean; the elicit-probe was removed and `.mcp.json`
-reverted.
+**Design spec APPROVED by the user** (2026-07-22). **Implementation plan
+now WRITTEN and committed** (`b9a38e4`):
+`docs/superpowers/plans/2026-07-22-mid-flight-visibility-phase2a.md` —
+5 TDD tasks covering Phase 2a only (2b is gated/excluded):
+1. Add `output_tail: str = ""` field to `CompletionResult` (base.py).
+2. Populate it in `AiderBackend.run_backend` from `result.stdout` on the
+   3 result-bearing return paths (non-zero exit, no-commits, success);
+   the no-model and StallError paths keep `""` (no subprocess output).
+3. Surface `output_tail` in `delegate_implementation`'s result dict on
+   success + all-failed (all-failed uses the LAST attempt's tail).
+4. Live pulse: `make_on_tick`/`make_on_output` share a `latest_line`
+   holder so the per-tick `report_progress` carries the latest real
+   output line (`"{model}: {line}"`) instead of static "still running".
+   Throttled to tick cadence, NOT per-chunk. Flags one intended
+   behavior-change to an existing stderr test.
+5. Demote the log file to a debugging aside in the README.
+
+Suite is at 110 passing pre-plan; plan expects ~114 after (recount, the
+gate is zero failures).
+
+**NEXT STEP when resuming:** execute the plan. Per writing-plans, the
+handoff offered two options — **subagent-driven-development (recommended)**
+or inline **executing-plans**. The user has NOT yet chosen. Ask which,
+then execute. Do NOT build 2b. Working tree is clean; elicit-probe was
+removed, `.mcp.json` reverted. Respect session-usage limits — if
+approaching, update this doc and stop rather than burning paid credits.
 
 **Working branch:** `local-coder-impl` (same branch, same worktree at
 `.worktrees/local-coder-impl/`) — reused for Phase 2 rather than cutting a
@@ -594,22 +612,22 @@ Read docs/superpowers/handoff/2026-07-21-local-coder-handoff.md in the
 superpowers-local-coder repo and resume Phase 2 work from exactly where
 it left off, per the "Where things stand NOW" section at the top. We are
 on Phase 2 item 7 (mid-flight communication for delegate_implementation).
-A design spec is ALREADY WRITTEN and committed at
-docs/superpowers/specs/2026-07-22-mid-flight-communication-design.md
-(commit ca18b09) — read it, do NOT rewrite it from scratch. The probe
-testing that informed it is DONE (elicit works+persists, report_progress
-renders but is ephemeral, resources are pull-based) and the throwaway
-elicit-probe has been removed — do NOT rebuild it. The immediate next
-step per the brainstorming flow: (1) ask the user to review the spec
-file if they haven't; (2) once approved, invoke superpowers:writing-plans
-to create the Phase 2a implementation plan (Phase 2a = visibility: live
-pulse via on_tick report_progress carrying real output + output_tail
-field in the result; 2b interactive prompt-answering is design-only and
-GATED — do NOT build 2b). Work in the worktree session on branch
-local-coder-impl. Don't re-derive context from git log — the handoff doc
-and the spec are the source of truth. Keep the handoff doc updated as you
-go. Respect session-usage limits: do not burn into paid credits; if
-approaching the limit, update the handoff doc and stop.
+The design spec is written, committed, and USER-APPROVED
+(docs/superpowers/specs/2026-07-22-mid-flight-communication-design.md,
+ca18b09). The Phase 2a implementation plan is written and committed
+(docs/superpowers/plans/2026-07-22-mid-flight-visibility-phase2a.md,
+b9a38e4) — read it, do NOT rewrite it. The probe testing is DONE and the
+throwaway elicit-probe was removed — do NOT rebuild it. The immediate
+next step: ask the user whether to execute the plan via
+superpowers:subagent-driven-development (recommended) or inline
+executing-plans, then execute the 5 TDD tasks in order. Do NOT build 2b
+(interactive prompt-answering) — it's gated. Work in the worktree
+session on branch local-coder-impl. Suite is at 110 tests passing before
+execution; the gate throughout is zero failures. Don't re-derive context
+from git log — the handoff doc, spec, and plan are the source of truth.
+Keep the handoff doc updated after each task. Respect session-usage
+limits: do not burn into paid credits; if approaching the limit, update
+the handoff doc and stop.
 ```
 
 If the plugin-connection blocker somehow regresses (e.g. `local-coder`
