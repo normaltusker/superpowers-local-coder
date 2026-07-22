@@ -111,8 +111,16 @@ def _git_status_z(repo_path: str) -> str:
     # post-attempt snapshots report the identical single directory entry,
     # so the set-difference this function relies on never sees the new
     # file at all.
+    # --ignored surfaces "!!" entries too. Without it, a failed attempt's
+    # newly created ignored files (generated build output, .pyc, etc.) are
+    # invisible to both the pre- and post-attempt snapshot -- git omits
+    # ignored paths from status entirely by default -- so they silently
+    # survive cleanup and leak into whatever fallback model runs next.
     return subprocess.run(
-        ["git", "-C", repo_path, "status", "--porcelain", "-z", "--untracked-files=all"],
+        [
+            "git", "-C", repo_path, "status", "--porcelain", "-z",
+            "--untracked-files=all", "--ignored",
+        ],
         capture_output=True, text=True, check=True,
     ).stdout
 
@@ -131,6 +139,10 @@ _LITERAL_PATHSPECS_ENV = {"GIT_LITERAL_PATHSPECS": "1"}
 
 
 def snapshot_working_tree(repo_path: str) -> tuple[str, set[str]]:
+    # Normalized to absolute up front so a caller-supplied relative
+    # repo_path can't later collide with restore_working_tree's cwd=
+    # usage of the same string (see restore_working_tree's docstring).
+    repo_path = os.path.abspath(repo_path)
     pre_head = subprocess.run(
         ["git", "-C", repo_path, "rev-parse", "HEAD"],
         capture_output=True, text=True, check=True,
@@ -175,11 +187,28 @@ def restore_working_tree(repo_path: str, pre_head: str, pre_porcelain: set[str])
     other path's index state untouched.
 
     `pre_porcelain` is a set of bare paths (from `snapshot_working_tree`,
-    which parses `-z --untracked-files=all` output), not raw porcelain
-    lines — status codes are re-fetched fresh here rather than reused
-    from the snapshot, since a path's status can change between snapshot
-    time and restore time (e.g. a file that was untracked before the
-    attempt could have been staged by the attempt itself).
+    which parses `-z --untracked-files=all --ignored` output), not raw
+    porcelain lines — status codes are re-fetched fresh here rather than
+    reused from the snapshot, since a path's status can change between
+    snapshot time and restore time (e.g. a file that was untracked before
+    the attempt could have been staged by the attempt itself). `--ignored`
+    is required alongside `--untracked-files=all`: git omits "!!"
+    (gitignore-matched) paths from status entirely otherwise, so an
+    attempt's newly generated ignored files (build output, .pyc, etc.)
+    would be invisible to the pre/post diff and survive into the next
+    failover attempt. Ignored paths are cleaned via `git clean -fdx`
+    (the `-x` is what makes clean remove ignored, not just untracked,
+    paths) rather than `git restore`, since they were never tracked and
+    have no `pre_head` content to restore from.
+
+    `repo_path` is normalized to an absolute path at the top of both this
+    function and `snapshot_working_tree`. The calls below combine
+    `-C repo_path` (resolved against the process's cwd at call time) with
+    `cwd=repo_path` (which changes that cwd first) — a relative
+    `repo_path` would otherwise be resolved twice, collapsing to
+    `<repo_path>/<repo_path>`, which doesn't exist. Those calls don't set
+    `check=True`, so that failure was silent and cleanup became a total
+    no-op for any relative `target_repo_path`.
 
     If the attempt DID commit (e.g. aider's own auto-commit) before later
     failing, HEAD itself has moved and must be moved back — but with
@@ -192,6 +221,17 @@ def restore_working_tree(repo_path: str, pre_head: str, pre_porcelain: set[str])
     naturally discard them like anything else new, without a separate
     code path.
     """
+    # Normalized to absolute up front: the calls below combine "-C
+    # repo_path" (an argv flag resolved against the process's current
+    # cwd) with cwd=repo_path (which changes that cwd to repo_path
+    # first). A relative repo_path then gets resolved TWICE -- once by
+    # cwd=, then again by -C relative to the new cwd -- collapsing to
+    # "<repo_path>/<repo_path>", which doesn't exist. Those calls also
+    # don't set check=True, so the failure was previously silent and
+    # cleanup became a total no-op. Normalizing here keeps -C and cwd=
+    # pointing at the same real directory regardless of what the caller
+    # passed in.
+    repo_path = os.path.abspath(repo_path)
     current_head = subprocess.run(
         ["git", "-C", repo_path, "rev-parse", "HEAD"],
         capture_output=True, text=True, check=True,
@@ -209,14 +249,17 @@ def restore_working_tree(repo_path: str, pre_head: str, pre_porcelain: set[str])
         return
 
     # A tracked-in-HEAD path (anything git already knows about, i.e. not
-    # "??") is restored to its pre_head content in both the index and the
-    # worktree — this is what correctly discards staged-but-uncommitted
-    # corruption without touching any OTHER path's staged state.
-    # Untracked ("??") paths have no HEAD content to restore from — those
-    # go through `git clean` instead, which is the only tool that can
-    # remove a path git has no history for.
-    tracked_modified = [p for p, code in new_paths.items() if code != "??"]
-    untracked = [p for p, code in new_paths.items() if code == "??"]
+    # "??" or "!!") is restored to its pre_head content in both the index
+    # and the worktree — this is what correctly discards staged-but-
+    # uncommitted corruption without touching any OTHER path's staged
+    # state. Untracked ("??") and ignored ("!!") paths have no HEAD
+    # content to restore from — those go through `git clean` instead,
+    # which is the only tool that can remove a path git has no history
+    # for. `-x` is required alongside `-fd` for the ignored case: plain
+    # `git clean -fd` only removes untracked paths, silently skipping
+    # anything gitignore-matched.
+    tracked_modified = [p for p, code in new_paths.items() if code not in ("??", "!!")]
+    untracked_or_ignored = [p for p, code in new_paths.items() if code in ("??", "!!")]
 
     if tracked_modified:
         subprocess.run(
@@ -228,9 +271,9 @@ def restore_working_tree(repo_path: str, pre_head: str, pre_porcelain: set[str])
             cwd=repo_path, capture_output=True,
             env={**os.environ, **_LITERAL_PATHSPECS_ENV},
         )
-    if untracked:
+    if untracked_or_ignored:
         subprocess.run(
-            ["git", "-C", repo_path, "clean", "-fd", "--", *untracked],
+            ["git", "-C", repo_path, "clean", "-fdx", "--", *untracked_or_ignored],
             cwd=repo_path, capture_output=True,
             env={**os.environ, **_LITERAL_PATHSPECS_ENV},
         )

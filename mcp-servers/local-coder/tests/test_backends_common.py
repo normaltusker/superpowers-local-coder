@@ -297,6 +297,51 @@ def test_restore_working_tree_rejects_pathspec_magic_in_filenames(git_repo):
     assert victim_path.read_text() == "pre-existing untracked file that must survive\n"
 
 
+def test_restore_working_tree_cleans_new_ignored_file(git_repo):
+    # git status omits "!!" (ignored) entries by default, with or without
+    # --untracked-files=all -- only --ignored surfaces them. A failed
+    # attempt that generates an ignored build artifact (e.g. a .log or
+    # .pyc file matched by .gitignore) is invisible to the pre/post
+    # snapshot diff, so it survives cleanup and leaks into whatever
+    # fallback model runs next.
+    (git_repo / ".gitignore").write_text("*.log\n")
+    subprocess.run(["git", "add", ".gitignore"], cwd=git_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "add gitignore"], cwd=git_repo, check=True, capture_output=True)
+
+    pre_head, pre_porcelain = common.snapshot_working_tree(str(git_repo))
+
+    (git_repo / "generated.log").write_text("build output from failed attempt\n")
+
+    common.restore_working_tree(str(git_repo), pre_head, pre_porcelain)
+
+    assert not (git_repo / "generated.log").exists()
+
+
+def test_restore_working_tree_works_with_relative_repo_path(git_repo, tmp_path, monkeypatch):
+    # snapshot/restore combine "-C repo_path" (an argv flag) with
+    # cwd=repo_path (the subprocess's actual working directory) on the
+    # same relative path. If repo_path is relative, the process cwd
+    # changes to repo_path first, and THEN "-C repo_path" tries to cd into
+    # repo_path AGAIN relative to that new cwd (i.e. repo_path/repo_path),
+    # which doesn't exist -- git exits 128 and (with no check=True on
+    # those calls) the failure is silently swallowed, making cleanup a
+    # total no-op.
+    monkeypatch.chdir(tmp_path)
+    relative_repo_path = git_repo.relative_to(tmp_path).as_posix()
+
+    pre_head, pre_porcelain = common.snapshot_working_tree(relative_repo_path)
+
+    tracked_path = git_repo / "README.md"
+    original_content = tracked_path.read_text()
+    tracked_path.write_text("corrupted during failed attempt\n")
+    (git_repo / "new_from_attempt.py").write_text("# added during failed attempt\n")
+
+    common.restore_working_tree(relative_repo_path, pre_head, pre_porcelain)
+
+    assert tracked_path.read_text() == original_content
+    assert not (git_repo / "new_from_attempt.py").exists()
+
+
 def test_restore_working_tree_discards_staged_rename(git_repo):
     # A rename marks the OLD path as deleted in the index. Restoring only
     # the new path back to pre_head content leaves the old path missing
