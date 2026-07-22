@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "local-coder": {
+      "type": "stdio",
+      "command": "${CLAUDE_PLUGIN_ROOT}/mcp-servers/local-coder/.venv/bin/python",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-servers/local-coder/server.py"]
+    }
+  }
+}

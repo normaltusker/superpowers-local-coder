@@ -16,8 +16,13 @@ Two independently shippable pieces, plus a phasing note on backends:
 2. A modification to `skills/subagent-driven-development/` so its per-task
    implementer subagent calls local-coder instead of editing files itself,
    with the subagent's tool access structurally restricted at the harness
-   level (a new `.claude/agents/local-coder-implementer.md` definition), not
-   just instructed via prompt.
+   level (a new `agents/local-coder-implementer.md` definition — this
+   plugin's existing convention, confirmed against other installed plugins
+   such as `feature-dev` and `code-simplifier`, is an `agents/` directory
+   at the plugin root, auto-discovered by frontmatter; **not**
+   `.claude/agents/`, which is a project-local, non-plugin convention and
+   would not travel with the plugin when installed elsewhere), not just
+   instructed via prompt.
 
 **Backend phasing:** Aider is implemented in this phase (Phase 1) — it's
 the only backend this design is initially built and smoke-tested against.
@@ -54,7 +59,38 @@ mcp-servers/local-coder/
                               # see "Codex and Gemini backends"; self_commits=False when built
     openrouter.py             # stub, NotImplementedError; not designed this round
   README.md
+  requirements.txt      # fastmcp, anyio, PyYAML, pytest — installed into a venv, no other packaging
 ```
+
+### MCP server registration
+
+New file at the repo/plugin root: `.mcp.json`. Confirmed against other
+installed plugins that ship an MCP server (e.g. `figma`) — this is the
+convention Claude Code plugins actually use for auto-loading a bundled MCP
+server; there is no `mcpServers` key inside `.claude-plugin/plugin.json`
+itself (an earlier draft of this spec assumed the latter without verifying
+it against a real installed plugin; corrected here).
+
+```json
+{
+  "mcpServers": {
+    "local-coder": {
+      "type": "stdio",
+      "command": "${CLAUDE_PLUGIN_ROOT}/mcp-servers/local-coder/.venv/bin/python",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-servers/local-coder/server.py"]
+    }
+  }
+}
+```
+
+`${CLAUDE_PLUGIN_ROOT}` resolves to wherever the plugin is installed, so
+this works whether someone clones this fork directly or installs it as a
+plugin — matching the original requirement that no manual `claude mcp add`
+step is needed. `command` points directly at the venv's own interpreter
+(created per "Prerequisites" in the README) rather than a bare `python3`,
+so there is no dependency on `PATH` resolution at the time Claude Code
+launches the server — the venv with `requirements.txt` installed is used
+unambiguously.
 
 ### config.yaml
 
@@ -319,19 +355,32 @@ the list actually completed the task.
      was configured so nothing was pushed.
    - **`origin` exists:** `git push -u origin branch`. If the push itself
      fails (e.g. rejected, network error — a different failure mode from
-     "no remote configured"), return `{"success": false, "error": "..."}`;
-     the commit still exists locally (see "Error handling" below). If the
-     push succeeds and `config["open_pr"]` is true AND `gh pr view branch`
-     finds no existing open PR, run `gh pr create --fill --head branch
-     --base {pr_base_branch}` and capture its URL; otherwise `pr_url` is
-     `null`.
+     "no remote configured"), return `{"success": false, "error": "...",
+     "files_changed": [...], "commit_sha": "...", "model_used": "..."}` —
+     the commit still exists locally (see "Error handling" below), and the
+     extra fields let the caller confirm the implementation itself
+     succeeded without shelling out to `git log`. If the push succeeds and
+     `config["open_pr"]` is true AND `gh pr view branch` finds no existing
+     open PR, run `gh pr create --fill --head branch --base
+     {pr_base_branch}` and capture its URL; otherwise `pr_url` is `null`.
 5. Return `{"pr_url": ..., "branch": ..., "files_changed": [...], "model_used": ..., "summary": "..."}`
    on success (`pr_url` may be `null` per above). On total failure (every
-   model in the attempt order failed, or a configured push failed), return
-   `{"success": false, "error": "..."}` (error lists each model tried and
-   why, for the model-failure case) with no PR attempted.
+   model in the attempt order failed), return `{"success": false, "error":
+   "..."}` (error lists each model tried and why) with no PR attempted. On
+   a push failure specifically, the failure response additionally carries
+   `files_changed`, `commit_sha`, and `model_used` (see above).
 
-**`configure(backend=None, model=None, target_repo_path=None, open_pr=None, **overrides) -> dict`**
+**`configure(backend=None, model=None, fallback_models=None, max_fallback_models=None, stall_timeout_seconds=None, target_repo_path=None, branch_prefix=None, open_pr=None, pr_base_branch=None, idle_notify_interval_seconds=None, extra_backend_args=None) -> dict`**
+
+**Correction (discovered during Phase 1 implementation, see the plan's
+Task 6 section):** every `config.yaml` key is now an explicit named
+parameter — no `**overrides` catch-all. The installed FastMCP (3.4.4)
+rejects any `@mcp.tool()`-decorated function with a `**kwargs`-style
+parameter at decoration time; since the config-key set is fixed and
+known (11 keys), enumerating them explicitly loses nothing and gives MCP
+clients a properly typed schema per field instead of an opaque
+passthrough. Any other reference in this document implying a catch-all
+`**overrides` is superseded by this signature.
 
 Merges only the provided keys into `config.yaml` (untouched keys keep their
 current value), writes it back, returns the full resulting config so the
@@ -474,10 +523,15 @@ mitigation, not a guarantee.
 
 ## Part 2 — Rewiring `subagent-driven-development`
 
-### New file: `.claude/agents/local-coder-implementer.md`
+### New file: `agents/local-coder-implementer.md`
 
-A Claude Code subagent definition (this fork currently has no
-`.claude/agents/` directory — this is new) with YAML frontmatter:
+A Claude Code subagent definition at the plugin root (this fork currently
+has no `agents/` directory — this is new). Verified against other installed
+plugins (`feature-dev`, `code-simplifier`, `coderabbit`, `sonarqube`), all
+of which ship `agents/<name>.md` at plugin root with this same frontmatter
+shape, auto-discovered without any reference from `plugin.json`. This is
+**not** `.claude/agents/` — that path is a project-local convention for a
+single repo's own Claude Code config, not something a plugin ships:
 
 ```yaml
 ---
@@ -628,7 +682,11 @@ optional and left to you to run ad hoc if you want to see it live.
   network error) → returned as failure; the commit still exists locally, so
   the controller can inspect and retry manually rather than losing work.
   This is a distinct case from "no remote configured" above — the former
-  is expected/benign, this one is a real failure worth surfacing.
+  is expected/benign, this one is a real failure worth surfacing. The
+  failure response also includes `files_changed`, `commit_sha`, and
+  `model_used` alongside `error`, so the caller has direct evidence the
+  implementation itself succeeded locally even though `success: false`,
+  without having to shell out to `git log` to discover it.
 - Codex/Gemini/OpenRouter selected via `configure` before they're
   implemented → `delegate_implementation` surfaces the adapter's
   `NotImplementedError` message as a clean `error` field, not a stack trace.
