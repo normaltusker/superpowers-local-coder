@@ -34,3 +34,13 @@ job. Report back with status BLOCKED, including the full error from
 local-coder's response, so the controller can decide whether to retry with
 different context, a different model (via reconfiguring local-coder), or
 escalate.
+
+**You cannot write REPORT_FILE.** You have no `Write` tool, and per the
+Bash-usage restriction above you must not use Bash to write files either.
+When your prompt's report-format instructions say to "write your full
+report to [REPORT_FILE]," you cannot do that step literally — instead,
+include your full report content directly in your final response message
+to the controller. Treat your final message as the report; the controller
+(or whatever follows the report-format instructions you were given) is
+responsible for persisting that returned text to REPORT_FILE on your
+behalf.

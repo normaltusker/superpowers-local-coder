@@ -45,9 +45,8 @@ Subagent (local-coder-implementer):
          implementation instruction (not just pasted verbatim — synthesize the
          brief's acceptance criteria into a task description local-coder's
          backend can act on, including any TDD requirement from the brief)
-       - `branch`: [current working branch — filled in by the controller,
-         same as the directory below]
-       - `target_repo_path`: [directory]
+       - `branch`: [current working branch — filled in by the controller]
+       - `target_repo_path`: [directory — filled in by the controller]
     2. Wait for the result. If `success: false`, do not attempt to fix it
        yourself — report BLOCKED with the full error (see "When You're in
        Over Your Head" below).
