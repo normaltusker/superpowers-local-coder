@@ -128,14 +128,67 @@ one-line change (e.g. "add a one-line comment to README.md") via
 `subagent-driven-development`, and confirm `delegate_implementation` is
 what implements it, not direct Edit/Write.
 
-**This item is NOT complete.** It's blocked on being run in a fresh
-session with this fork installed as a plugin — the current/main
-Phase 2 session cannot do this to itself. See the resume prompt at the
-bottom of this file, or hand the two commands above plus the smoke-test
-ask to a fresh session directly.
+**UPDATE 2026-07-22, later same day — plugin install fix confirmed
+working, MCP connection UNBLOCKED.** The install genuinely worked, but
+one path detail bit us: `claude plugin marketplace add`/`install
+--scope project` write their enablement record to **the main repo
+root's** `.claude/settings.json`
+(`/Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder/.claude/settings.json`),
+not into the worktree — this is git-worktree-shared `--scope project`
+behavior in Claude Code, not a bug: all worktrees of one repo share one
+project-scope settings file at the git common dir. A session started
+`cd`'d into `.worktrees/local-coder-impl/` before running `claude`
+didn't pick up the enablement, so `local-coder` still failed
+(`CLAUDE_PLUGIN_ROOT` still missing) on the first retry. **Fix: start
+the session from the MAIN REPO ROOT
+(`/Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder`,
+currently on `dev`, which already has everything from the merged PR),
+not from the worktree.** Confirmed via `claude mcp list` in that
+session:
+```
+local-coder (worktree copy)              ✔ Connected
+local-coder (plugin, .mcp.json)          ✘ Failed to connect — CLAUDE_PLUGIN_ROOT env var missing
+```
+The second line is an expected, harmless duplicate — the client is
+showing two resolutions of the same server name (one via the installed
+plugin, which now works; one via any lingering plain `.mcp.json`
+reference, which still can't resolve `CLAUDE_PLUGIN_ROOT` on its own).
+**The plugin-sourced `local-coder` is what matters and it is live.**
+`installed_plugins.json` now correctly shows
+`superpowers@superpowers-dev` registered; `.claude/settings.json` at the
+main repo root has `enabledPlugins: {"superpowers@superpowers-dev":
+true}` and `extraKnownMarketplaces.superpowers-dev` pointing at the
+worktree path as the marketplace source. No uninstall/reinstall was
+needed once the directory mismatch was understood — the original install
+was correct all along.
+
+**Next action, not yet done: run the actual Part 3 smoke test** (ask the
+now-connected session to brainstorm+plan+implement a trivial one-line
+change via `subagent-driven-development`, confirm `delegate_implementation`
+is what implements it rather than direct Edit/Write). **Do this from the
+main-repo-root session** (where `local-coder` is now connected), not the
+worktree-cd'd session used for Phase 2 doc/commit work — those remain two
+different sessions with two different jobs until this gets reconciled
+(see the open question in "Housekeeping for Phase 2" below about
+whether Phase 2 commits should also happen from the repo root).
 
 ### Housekeeping for Phase 2
 
+- **Open question: which directory should Phase 2 sessions actually run
+  from?** The main repo root is on `dev` directly (not a worktree
+  checkout of `local-coder-impl`) but is where `local-coder` connects,
+  since that's where the plugin got enabled. The worktree at
+  `.worktrees/local-coder-impl/` is where all the git history/commits in
+  this handoff doc actually happened, and is the isolated branch Phase 2
+  commits are meant to land on — but a session started there doesn't see
+  `local-coder` as connected. **Until this is reconciled, treat them as
+  two different jobs**: use the main-repo-root session (on `dev`) for
+  anything that needs the actual `local-coder` MCP tools (the smoke test,
+  any future manual delegate_implementation testing); keep using the
+  worktree session for git/code/doc work on the `local-coder-impl`
+  branch. Don't commit from the repo-root session while it's sitting on
+  `dev` directly — check `git branch --show-current` before any commit
+  there to avoid accidentally committing straight to `dev`.
 - **Keep this handoff doc's "Where things stand NOW" section current.**
   Update it after every Phase 2 item completes or every time a session
   is about to end mid-work — the same discipline that governed Phase 1
