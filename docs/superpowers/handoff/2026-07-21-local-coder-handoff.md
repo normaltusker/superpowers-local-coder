@@ -91,50 +91,73 @@ phase, not part of this Phase 2 pass):
    handoff) behaves first; if `qwen2.5-coder:7b` also stalls, that points
    at a different problem entirely (e.g. Ollama itself under load) and
    changes what fix actually makes sense.
-7. **NEW, explicitly requested: design real interactive prompt-answering
-   for genuine aider judgment calls, not just fail-fast.** Context: a
-   real hang was found and fixed this session (`stdin=subprocess.DEVNULL`,
-   commit `620cfc0`) — aider was inheriting the MCP server's own stdin
-   (Claude Code's stdio JSON-RPC pipe, which never sends EOF) and blocked
-   forever on any read attempt, uncaught by the stall-timeout mechanism
-   (which only watches output, not "is this process actually stuck").
-   That fix converts a silent infinite hang into a fast, clean failure —
-   any stdin read now gets immediate EOF, `--yes` covers most routine
-   confirmations so this should be rare in practice, but if aider hits a
-   prompt `--yes` does NOT auto-answer (a genuine judgment call, not a
-   default yes/no), the run now fails fast with the prompt text captured
-   in `local-coder-output.log`/the error, rather than hanging — but
-   nothing lets a human actually ANSWER that prompt and let the run
-   continue. Explicitly flagged as worth designing properly, not left as
-   a permanent limitation. **Real constraints to design against, learned
-   the hard way this session:**
-   - `delegate_implementation` is currently a single synchronous
-     request/response MCP tool call — there is no existing mechanism for
-     it to pause mid-call, surface a question back to the calling Claude
-     Code session, wait for a human answer, and then resume the same
-     subprocess. This would need genuine two-way interaction, not just a
-     bigger response payload.
-   - The subprocess's stdin is intentionally severed
-     (`subprocess.DEVNULL`) specifically because leaving it attached to
-     the MCP server's own stdin causes real, silent hangs (see the bug
-     just fixed) — any redesign that reopens a stdin path for the
-     backend must NOT simply revert that fix; it needs a deliberately
-     managed pipe the server itself writes to only when a real answer is
-     ready, not the server's inherited stdin.
-   - FastMCP's `Context` already supports `report_progress` (used today
-     for the on_tick heartbeat) — investigate whether it or a similar
-     mechanism supports genuine bidirectional prompts/elicitation, or
-     whether this needs a custom protocol on top (e.g. pause, return a
-     "needs input" response with the prompt text, expose a new
-     `answer_prompt` MCP tool, resume).
-   - Consider scope carefully before building: how often does this
-     actually happen with `aider --yes` in practice? If genuinely rare,
-     a lighter-weight design (e.g. a documented manual recovery path —
-     "if delegate_implementation fails with a prompt-related error,
-     re-run aider manually against the same branch with the answer
-     baked into a modified task description") may be more proportionate
-     than a full interactive-pause protocol. Investigate real frequency
-     before committing to the heavier design.
+7. **NEW, explicitly requested and explicitly scope-merged: design a real
+   mid-flight communication channel for `delegate_implementation`,
+   covering BOTH live visibility and interactive prompt-answering as one
+   problem, not two.** This item started as two separate findings this
+   session and was deliberately merged, because both symptoms trace to
+   the same root gap: `delegate_implementation` is a single opaque,
+   synchronous call with no way to talk to the user WHILE it runs, only
+   before (the task description) and after (the final result).
+   - **Visibility symptom:** the `tail -f local-coder-output.log`
+     workaround built this session (commit `b3835fb`) works, but is
+     explicitly acknowledged as NOT a real feature — no realistic user
+     opens a second terminal and manually tails a file to check if a
+     delegation is progressing or stuck. Real visibility belongs INSIDE
+     the same Claude Code conversation that triggered the delegation,
+     surfaced natively as the call progresses (e.g. the existing
+     `on_tick`/`ctx.report_progress` heartbeat, currently just "still
+     running (model)...", could instead carry the actual latest output
+     chunk(s), so real progress shows up in-chat with no file, no second
+     terminal, no tailing).
+   - **Interactivity symptom:** a real hang was found and fixed this
+     session (`stdin=subprocess.DEVNULL`, commit `620cfc0`) — aider was
+     inheriting the MCP server's own stdin (Claude Code's stdio JSON-RPC
+     pipe, which never sends EOF) and blocked forever on any read
+     attempt, uncaught by the stall-timeout mechanism (which only
+     watches output, not "is this process actually stuck"). That fix
+     converts a silent infinite hang into a fast, clean failure — any
+     stdin read now gets immediate EOF — but if aider hits a prompt
+     `--yes` does NOT auto-answer (a genuine judgment call, not a
+     default yes/no), the run now fails fast with the prompt text
+     captured rather than hanging, but nothing lets a human actually
+     ANSWER that prompt and let the run continue.
+   - **Both need the same underlying capability**: some way for
+     `delegate_implementation` to communicate with the user WHILE
+     running, not just via a final return value. A real design should
+     solve both symptoms with one mechanism, not build a progress-only
+     fix and a separate prompt-answering fix that later need
+     reconciling.
+   - **Real constraints to design against, learned the hard way this
+     session** (still apply with the merged scope):
+     - `delegate_implementation` is currently single request/response —
+       no existing pause/resume mechanism mid-call.
+     - The subprocess's stdin is intentionally severed
+       (`subprocess.DEVNULL`) because leaving it attached to the MCP
+       server's own stdin causes real, silent hangs — any redesign that
+       reopens a stdin path for the backend must NOT simply revert that
+       fix; it needs a deliberately managed pipe the server itself
+       writes to only when a real answer is ready, not the server's
+       inherited stdin.
+     - FastMCP's `Context` already supports `report_progress` (used
+       today for the on_tick heartbeat) — investigate whether it or a
+       similar mechanism (elicitation, sampling, or another FastMCP
+       primitive) supports genuine bidirectional communication, or
+       whether this needs a custom protocol on top (e.g. pause, return a
+       "needs input" response with the prompt text, expose a new
+       `answer_prompt` MCP tool, resume).
+     - Consider scope carefully before building the interactive-answer
+       half specifically: how often does aider actually hit an
+       unanswerable prompt with `--yes` in practice? If genuinely rare,
+       a lighter-weight fallback (a documented manual recovery path —
+       "if delegate_implementation fails with a prompt-related error,
+       re-run aider manually against the same branch with the answer
+       baked into a modified task description") may be proportionate for
+       THAT half even if the visibility half still gets built properly.
+       Investigate real frequency before committing to the heavier
+       design for interactivity; visibility is worth building regardless
+       of frequency, since it's needed on every successful run too, not
+       just the rare stuck one.
 
 ### Item 1 attempt — findings and next step (2026-07-22)
 
