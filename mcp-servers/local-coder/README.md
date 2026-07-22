@@ -54,3 +54,16 @@ raise this environment variable (or set it to `0` to disable it) before
 starting Claude Code. `local-coder` sends periodic progress
 notifications and stderr log lines while a backend subprocess runs, but
 these are a best-effort mitigation, not a guarantee against this timeout.
+
+## Watching a delegation run
+
+While `delegate_implementation` runs, its progress appears live in the
+Claude Code conversation — the latest line of backend output surfaces
+as a progress update, and the full output transcript is included in the
+tool's final result (the `output_tail` field). No extra steps are needed
+to see what the backend is doing.
+
+For deep debugging, the raw backend output is also written to
+`mcp-servers/local-coder/local-coder-output.log` (truncated at the start
+of each call). Tailing that file is a power-user convenience, not the
+normal way to follow a run.
