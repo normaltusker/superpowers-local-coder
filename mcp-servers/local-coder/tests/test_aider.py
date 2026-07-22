@@ -254,3 +254,51 @@ def test_run_backend_creates_branch_if_missing(git_repo):
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert current_branch == "brand-new-branch"
+
+
+def test_run_backend_success_carries_output_tail(git_repo):
+    def fake_run(cmd, cwd, stall_timeout_seconds, idle_notify_interval_seconds, on_tick=None, on_output=None):
+        (git_repo / "new_file.py").write_text("# new\n")
+        subprocess.run(["git", "add", "new_file.py"], cwd=git_repo, check=True)
+        subprocess.run(["git", "commit", "-m", "aider commit"], cwd=git_repo, check=True, capture_output=True)
+        return subprocess.CompletedProcess(cmd, 0, stdout="aider did the thing", stderr="")
+
+    backend = AiderBackend()
+    with patch.object(common, "run_monitored_subprocess", side_effect=fake_run):
+        result = backend.run_backend(
+            task="add a file", repo_path=str(git_repo), branch="test-branch",
+            config=BASE_CONFIG, model="ollama/qwen3-coder:30b",
+        )
+
+    assert result.success is True
+    assert result.output_tail == "aider did the thing"
+
+
+def test_run_backend_nonzero_exit_carries_output_tail(git_repo):
+    def fake_run(cmd, cwd, stall_timeout_seconds, idle_notify_interval_seconds, on_tick=None, on_output=None):
+        return subprocess.CompletedProcess(cmd, 1, stdout="aider error trace here", stderr="")
+
+    backend = AiderBackend()
+    with patch.object(common, "run_monitored_subprocess", side_effect=fake_run):
+        result = backend.run_backend(
+            task="do something", repo_path=str(git_repo), branch="test-branch",
+            config=BASE_CONFIG, model="ollama/qwen3-coder:30b",
+        )
+
+    assert result.success is False
+    assert result.output_tail == "aider error trace here"
+
+
+def test_run_backend_no_commit_carries_output_tail(git_repo):
+    def fake_run(cmd, cwd, stall_timeout_seconds, idle_notify_interval_seconds, on_tick=None, on_output=None):
+        return subprocess.CompletedProcess(cmd, 0, stdout="aider ran but made no commit", stderr="")
+
+    backend = AiderBackend()
+    with patch.object(common, "run_monitored_subprocess", side_effect=fake_run):
+        result = backend.run_backend(
+            task="do nothing", repo_path=str(git_repo), branch="test-branch",
+            config=BASE_CONFIG, model="ollama/qwen3-coder:30b",
+        )
+
+    assert result.success is False
+    assert result.output_tail == "aider ran but made no commit"

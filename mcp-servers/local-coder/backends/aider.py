@@ -53,6 +53,7 @@ class AiderBackend(BackendAdapter):
             return CompletionResult(
                 success=False,
                 error=result.stdout.strip()[-2000:] or "aider exited non-zero",
+                output_tail=result.stdout,
             )
 
         post_head = subprocess.run(
@@ -66,7 +67,11 @@ class AiderBackend(BackendAdapter):
             # aider wrote files but a lint/commit step declined or failed
             # silently), so clean up here too.
             common.restore_working_tree(repo_path, pre_head, pre_porcelain)
-            return CompletionResult(success=False, error="aider made no commits")
+            return CompletionResult(
+                success=False,
+                error="aider made no commits",
+                output_tail=result.stdout,
+            )
 
         files_changed = subprocess.run(
             ["git", "-C", repo_path, "diff", "--name-only", pre_head, post_head],
@@ -77,4 +82,5 @@ class AiderBackend(BackendAdapter):
             success=True,
             files_changed=files_changed,
             commit_sha=post_head,
+            output_tail=result.stdout,
         )
