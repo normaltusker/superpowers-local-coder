@@ -57,18 +57,49 @@ def ensure_branch(repo_path: str, branch: str) -> None:
         )
 
 
+def _parse_porcelain_z(status_z: str) -> dict[str, str]:
+    """Parse `git status --porcelain -z` output into {path: status_code}.
+
+    `-z` mode reports paths unquoted and NUL-terminated instead of the
+    default mode's display-escaping (quoting paths with spaces, tabs,
+    non-ASCII, etc.) — parsing the default mode's quoted text as a literal
+    filesystem path silently fails to match such files at cleanup time.
+    A rename/copy record (status code starting with R or C) is two
+    NUL-terminated fields — new path, then old path — rather than one;
+    only the new path is tracked here, since that's the one that exists
+    on disk after the rename and is what cleanup needs to act on.
+    """
+    fields = status_z.split("\0")
+    result: dict[str, str] = {}
+    i = 0
+    while i < len(fields):
+        record = fields[i]
+        if not record:
+            i += 1
+            continue
+        code = record[:2]
+        path = record[3:]
+        result[path] = code
+        if code[0] in ("R", "C"):
+            # Rename/copy records carry the old path as a second field;
+            # consume it without tracking it as a "changed" path.
+            i += 1
+        i += 1
+    return result
+
+
 def snapshot_working_tree(repo_path: str) -> tuple[str, set[str]]:
     pre_head = subprocess.run(
         ["git", "-C", repo_path, "rev-parse", "HEAD"],
         capture_output=True, text=True, check=True,
     ).stdout.strip()
 
-    status = subprocess.run(
-        ["git", "-C", repo_path, "status", "--porcelain"],
+    status_z = subprocess.run(
+        ["git", "-C", repo_path, "status", "--porcelain", "-z"],
         capture_output=True, text=True, check=True,
     ).stdout
 
-    porcelain = {line for line in status.splitlines() if line.strip()}
+    porcelain = set(_parse_porcelain_z(status_z).keys())
     return pre_head, porcelain
 
 
@@ -85,6 +116,13 @@ def restore_working_tree(repo_path: str, pre_head: str, pre_porcelain: set[str])
     `pre_porcelain` are discarded — anything that was already
     modified/untracked before the attempt started is left alone rather than
     being blindly wiped by e.g. an unscoped `git reset --hard`.
+
+    `pre_porcelain` is a set of bare paths (from `snapshot_working_tree`,
+    which parses `-z` output), not raw porcelain lines — status codes are
+    re-fetched fresh here rather than reused from the snapshot, since a
+    path's status can change between snapshot time and restore time (e.g.
+    a file that was untracked before the attempt could have been staged
+    by the attempt itself).
     """
     current_head = subprocess.run(
         ["git", "-C", repo_path, "rev-parse", "HEAD"],
@@ -96,39 +134,35 @@ def restore_working_tree(repo_path: str, pre_head: str, pre_porcelain: set[str])
             check=True, capture_output=True,
         )
 
-    status = subprocess.run(
-        ["git", "-C", repo_path, "status", "--porcelain"],
+    status_z = subprocess.run(
+        ["git", "-C", repo_path, "status", "--porcelain", "-z"],
         capture_output=True, text=True, check=True,
     ).stdout
-    current_porcelain = {line for line in status.splitlines() if line.strip()}
+    current_entries = _parse_porcelain_z(status_z)
 
-    new_entries = current_porcelain - pre_porcelain
-    if not new_entries:
-        return
-
-    # Each porcelain line looks like "XY path" (or "XY orig -> new" for
-    # renames) — extract the path git status reports for the entry so we
-    # can restrict cleanup to exactly those paths.
-    new_paths = []
-    for line in new_entries:
-        path_part = line[3:]
-        if " -> " in path_part:
-            path_part = path_part.split(" -> ", 1)[1]
-        new_paths.append(path_part)
-
+    new_paths = {p: code for p, code in current_entries.items() if p not in pre_porcelain}
     if not new_paths:
         return
 
-    # Discard tracked-file modifications introduced by this attempt...
-    subprocess.run(
-        ["git", "-C", repo_path, "checkout", "--", *new_paths],
-        cwd=repo_path, capture_output=True,
-    )
-    # ...and remove any new untracked files/directories this attempt added.
-    subprocess.run(
-        ["git", "-C", repo_path, "clean", "-fd", "--", *new_paths],
-        cwd=repo_path, capture_output=True,
-    )
+    # Untracked paths ("??") can't be passed to `git checkout --` (it only
+    # accepts paths git already knows about) — mixing the two in one
+    # command makes the WHOLE command fail on the untracked entries,
+    # silently leaving tracked modifications uncleaned too. Split into two
+    # separate, independently-run commands instead, so one path class's
+    # cleanup can never mask the other's.
+    tracked_modified = [p for p, code in new_paths.items() if code != "??"]
+    untracked = [p for p, code in new_paths.items() if code == "??"]
+
+    if tracked_modified:
+        subprocess.run(
+            ["git", "-C", repo_path, "checkout", "--", *tracked_modified],
+            cwd=repo_path, capture_output=True,
+        )
+    if untracked:
+        subprocess.run(
+            ["git", "-C", repo_path, "clean", "-fd", "--", *untracked],
+            cwd=repo_path, capture_output=True,
+        )
 
 
 _READ_CHUNK_SIZE = 4096

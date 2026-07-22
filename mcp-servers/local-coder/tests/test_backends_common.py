@@ -175,6 +175,38 @@ def test_restore_working_tree_preserves_pre_existing_changes(git_repo):
     assert not (git_repo / "new_from_attempt.txt").exists()
 
 
+def test_restore_working_tree_discards_mixed_tracked_and_untracked_changes(git_repo):
+    # A real implementation attempt normally touches BOTH an existing
+    # (tracked) file and adds a new (untracked) one in the same run. `git
+    # checkout -- <tracked> <untracked>` fails entirely on the untracked
+    # path (not a valid checkout pathspec), which — if not handled
+    # separately — silently leaves the tracked modification uncleaned too.
+    tracked_path = git_repo / "README.md"
+    pre_head, pre_porcelain = common.snapshot_working_tree(str(git_repo))
+    original_tracked_content = tracked_path.read_text()
+
+    tracked_path.write_text("modified during failed attempt\n")
+    (git_repo / "new_from_attempt.py").write_text("# added during failed attempt\n")
+
+    common.restore_working_tree(str(git_repo), pre_head, pre_porcelain)
+
+    assert tracked_path.read_text() == original_tracked_content
+    assert not (git_repo / "new_from_attempt.py").exists()
+
+
+def test_restore_working_tree_handles_filenames_with_spaces(git_repo):
+    # git status's default output display-escapes (quotes) paths containing
+    # spaces/special characters — treating that quoted text as the literal
+    # filesystem path fails to match the real file at cleanup time.
+    pre_head, pre_porcelain = common.snapshot_working_tree(str(git_repo))
+
+    (git_repo / "file with space.py").write_text("# added during failed attempt\n")
+
+    common.restore_working_tree(str(git_repo), pre_head, pre_porcelain)
+
+    assert not (git_repo / "file with space.py").exists()
+
+
 def test_run_monitored_subprocess_returns_completed_process_on_success():
     result = common.run_monitored_subprocess(
         ["echo", "hello"], cwd=".",
