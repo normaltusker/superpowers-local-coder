@@ -305,8 +305,22 @@ def run_monitored_subprocess(
     # trailing newline) and then goes quiet without closing its pipe would
     # otherwise block readline() past the next poll interval, bypassing the
     # tick/stall checks for that period.
+    # stdin=DEVNULL severs the child from this process's own stdin. Without
+    # it, Popen defaults to inheriting the parent's stdin — for this MCP
+    # server, that's the stdio JSON-RPC pipe from Claude Code: an open
+    # pipe that receives data but never sends EOF. A backend subprocess
+    # that tries to read stdin for any reason (confirmed in practice: a
+    # real aider run hung with its main thread parked in a stdin read
+    # syscall, having consumed only ~5s of CPU across 4+ minutes of
+    # wall-clock time) then blocks forever waiting for a byte that can
+    # never arrive — and the stall-timeout mechanism below does NOT catch
+    # this, since it only watches for OUTPUT activity; a process blocked
+    # reading stdin can still look "recently active" from earlier startup
+    # output, so the stall timer never restarts and never fires. With
+    # stdin explicitly closed, any read attempt gets immediate EOF instead.
     process = subprocess.Popen(
-        cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        cmd, cwd=cwd, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
 
     # Bounded tail buffer: append new text, then trim from the front
