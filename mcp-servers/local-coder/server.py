@@ -117,31 +117,38 @@ async def _delegate_implementation_impl(
     attempt_errors = []
     last_output_tail = ""
 
+    # Shared holder: on_output writes the most recent non-empty output line
+    # here; on_tick reads it so the periodic progress pulse carries real
+    # backend output instead of a static heartbeat. A one-element list is a
+    # simple mutable cell both closures can see.
+    latest_line = [""]
+
     def make_on_tick(model_name: str):
         def on_tick():
-            print(f"[local-coder] still running ({model_name})...", file=sys.stderr, flush=True)
+            line = latest_line[0]
+            pulse = f"{model_name}: {line}" if line else f"Running {model_name}..."
+            print(f"[local-coder] {pulse}", file=sys.stderr, flush=True)
             if ctx is not None:
                 anyio.from_thread.run(
-                    ctx.report_progress, 0, None, f"Running {model_name}..."
+                    ctx.report_progress, 0, None, pulse
                 )
         return on_tick
 
     def make_on_output(model_name: str):
-        # Streams the backend subprocess's actual output (e.g. aider's own
-        # live progress/diff/commit messages) as it arrives, rather than
-        # only the bounded tail surfaced in an error message after the
-        # whole call finishes. Without this, a long-running delegated
-        # attempt is effectively headless — nothing about what the backend
-        # is actually doing is visible until it's already done (or already
-        # failed). Written to BOTH stderr (in case some setup does capture
-        # it) and OUTPUT_LOG_PATH (the guaranteed-visible path — see that
-        # constant's comment for why a log file, not just stderr, is
-        # needed).
+        # Streams the backend subprocess's actual output as it arrives, to
+        # BOTH stderr and OUTPUT_LOG_PATH (see that constant's comment), and
+        # records the latest non-empty line so the on_tick pulse above can
+        # surface it in-chat. Kept throttled to the tick cadence — the tick
+        # is what emits to report_progress; this callback only records.
         def on_output(chunk: str):
             line = f"[local-coder:{model_name}] {chunk}"
             print(line, end="", file=sys.stderr, flush=True)
             with open(OUTPUT_LOG_PATH, "a") as f:
                 f.write(chunk)
+            stripped = chunk.strip()
+            if stripped:
+                # Keep only the last line of a multi-line chunk.
+                latest_line[0] = stripped.splitlines()[-1]
         return on_output
 
     for model in attempt_models:

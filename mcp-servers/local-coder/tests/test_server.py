@@ -226,7 +226,42 @@ async def test_delegate_implementation_on_tick_logs_to_stderr_without_ctx(isolat
     on_tick()
 
     captured = capsys.readouterr()
-    assert "still running" in captured.err
+    assert "Running ollama/qwen3-coder:30b" in captured.err
+
+
+async def test_on_tick_pulse_reflects_latest_output_line(isolated_config, git_repo_no_remote):
+    captured = {}
+
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+        captured["on_tick"] = on_tick
+        captured["on_output"] = on_output
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    mock_ctx = MagicMock()
+    mock_ctx.report_progress = MagicMock()
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        with patch("anyio.from_thread.run") as mock_from_thread_run:
+            await server._delegate_implementation_impl(
+                task="add a.py", branch="feature-branch",
+                target_repo_path=str(git_repo_no_remote), ctx=mock_ctx,
+            )
+
+            on_tick = captured["on_tick"]
+            on_output = captured["on_output"]
+
+            # Simulate the backend emitting output, then a tick firing.
+            on_output("Applying edit...\n")
+            on_output("Running tests...\n")
+            on_tick()
+
+            # The progress message bridged to report_progress should carry
+            # the latest output line, not a static "still running".
+            assert mock_from_thread_run.called
+            progress_args = mock_from_thread_run.call_args.args
+            # args: (ctx.report_progress, progress, total, message)
+            message = progress_args[3]
+            assert "Running tests..." in message
 
 
 async def test_delegate_implementation_on_output_writes_to_log_file(
