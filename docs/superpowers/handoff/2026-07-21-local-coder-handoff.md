@@ -11,11 +11,23 @@ session end — a stale handoff is worse than none.
 implementation plan via `superpowers:subagent-driven-development`,
 task-by-task.** Check the progress ledger (see below) for exactly which
 tasks are done — trust it and `git log` over this prose if they conflict.
-As of this update: Tasks 1-5 complete, reviewed clean. Task 6 implemented
-(40/40 full suite passing) and awaiting review — but Task 6 required a
-**binding plan correction** before it could even be attempted the second
-time (see the FastMCP `**kwargs` entry below — this changes `configure`'s
-actual signature going forward, not just a workaround).
+As of this update: Tasks 1-6 complete and reviewed clean (Task 6 needed a
+binding plan correction first — see the FastMCP `**kwargs` entry below).
+**Task 7 (README/MCP registration) is IMPLEMENTED but NOT yet re-reviewed
+— its review is what surfaced Task 6.5** (see below), a real functional
+gap discovered mid-plan, not just a doc nit. Task 6.5 has been dispatched
+and its result is pending as of this handoff update. **Do not mark Task 7
+complete in the ledger until Task 6.5 lands and Task 7's README is
+re-checked against the final async-converted server.py** — the README's
+progress-notification claim was the thing that was actually FALSE before
+Task 6.5, so re-verify it reads true once Task 6.5 ships.
+
+**Plan file note:** `docs/superpowers/plans/2026-07-21-local-coder-phase1.md`
+now has a "Task 6.5" section inserted between Task 6 and Task 7 — this
+was NOT in the original plan, it's an addendum added mid-execution after
+Task 7's review caught the gap. If resuming, read Task 6.5's section in
+the plan file before assuming the original 9-task numbering still holds
+end to end.
 
 ## Gotchas hit during execution (read before dispatching later tasks)
 
@@ -86,6 +98,29 @@ actual signature going forward, not just a workaround).
   `config.py`'s internal `configure_with_validation(overrides: dict)`
   from Task 5 is UNAFFECTED — it's never `@mcp.tool()`-decorated and can
   keep taking a plain dict; only the two MCP-facing functions changed.
+- **Task 7's reviewer found that `on_tick` — the progress-notification
+  callback hook Task 3 built into `run_monitored_subprocess` — was never
+  actually wired up anywhere.** Task 4's `AiderBackend.run_backend` calls
+  `run_monitored_subprocess` without passing `on_tick` at all, and Task
+  6's `_delegate_implementation_impl` never received or threaded through
+  a FastMCP `Context`. This is a real gap in THE PLAN itself (my own
+  reference code for Task 4 never passed `on_tick` either), not an
+  implementer deviation — the design spec explicitly requires this
+  mechanism (stderr log + MCP progress ping every
+  `idle_notify_interval_seconds`) and it was silently dead code across
+  three already-approved tasks. Decision made (user chose the full option
+  over "defer, just fix the docs"): convert `_delegate_implementation_impl`
+  to `async def` (FastMCP's `Context.report_progress` is async),
+  bridging the still-synchronous `run_monitored_subprocess` call via
+  `anyio.to_thread.run_sync` / `anyio.from_thread.run` (anyio is already
+  a FastMCP dependency — verified in this venv before committing to this
+  design, not assumed). Documented as a new **Task 6.5** addendum in the
+  plan (inserted between Task 6 and Task 7, see commit `fe83fe7`) rather
+  than rewriting Tasks 3/4/6's already-reviewed history. Dispatched;
+  result pending as of this handoff update — **if resuming, check
+  `.superpowers/sdd/progress.md` for whether Task 6.5 completed, and if
+  Task 6.5 isn't done, Task 7 cannot be finalized either** (its README's
+  progress-notification claim depends on Task 6.5's fix actually landing).
 - **A checked-in file (`config.yaml`) got silently mutated on disk**
   during Task 5's fix work — quoted YAML strings (`"aider"`) became
   unquoted (`aider`), same values, no functional change, but real
