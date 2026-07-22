@@ -5,7 +5,105 @@ it should make resumption fast without re-deriving context from the whole
 conversation. **Update this file whenever a task completes**, not just at
 session end — a stale handoff is worse than none.
 
-## Where things stand
+## Where things stand NOW (read this first)
+
+**Phase 1 is merged. Phase 2 is starting.** PR #2 (`local-coder-impl` →
+`dev`) merged at commit `70f8ba3` on 2026-07-22. `dev` now has the full
+Phase 1 build: the local-coder MCP server (Aider backend real,
+Codex/Gemini/OpenRouter stubbed), the SDD skill rewiring, and
+`agents/local-coder-implementer.md`.
+
+**Working branch:** `local-coder-impl` (same branch, same worktree at
+`.worktrees/local-coder-impl/`) — reused for Phase 2 rather than cutting a
+new branch, per explicit direction. It was fast-forwarded to match `dev`
+right after the merge, so it currently has zero diff against `dev`; Phase
+2 commits land on top of it from here. **`main` is untouched — Phase 2
+work merges to `dev` only. Merging `dev` to `main` happens later, once
+Phase 2's basics are complete, and is explicitly the human's call, not
+something to do unprompted.**
+
+### Phase 2 backlog
+
+Everything below was identified as pending after a post-merge review of
+the original design spec against what Phase 1 actually shipped (Codex/
+Gemini/OpenRouter backends excluded — those remain their own later
+phase, not part of this Phase 2 pass):
+
+1. **Run the Part 3 manual smoke test for real.** Design spec's own
+   acceptance check — brainstorm → plan → SDD dispatches
+   `local-coder-implementer` → `delegate_implementation` actually invokes
+   aider against local Ollama → a commit lands on the shared branch → the
+   implementer verifies via Read and reports DONE → task reviewer
+   approves → `finishing-a-development-branch` opens the PR — has **never
+   been run end-to-end**. Every Phase 1 review cycle exercised
+   `restore_working_tree` and friends via unit tests and manual repros in
+   isolation, but nobody has watched the real `delegate_implementation` →
+   aider → Ollama path fire inside a live SDD run. This is the highest-
+   priority Phase 2 item: everything else so far is "verified by tests
+   and code reading," this is the one check that verifies the whole
+   chain actually works together.
+2. **Fresh-clone / plugin-install bootstrap provisioning.** `.mcp.json`
+   points at `mcp-servers/local-coder/.venv/bin/python`, but nothing
+   creates that venv automatically. A user installing this plugin fresh
+   (not the dev machine that already has the venv from Phase 1
+   implementation) gets a broken MCP server on first launch. Raised by
+   cubic-dev-ai on PR #2, closed there as won't-fix (scoped out of
+   Phase 1), now explicitly Phase 2 scope.
+3. **Windows support.** Currently impossible as-is: `config.py`'s file
+   locking uses `fcntl` (POSIX-only, no Windows equivalent), and
+   `.mcp.json`'s hardcoded `.venv/bin/python` path doesn't resolve on
+   Windows (`.venv/Scripts/python.exe` there). Also raised by cubic-dev-ai,
+   also won't-fixed on PR #2, now Phase 2 scope. Fixing #2 (a proper
+   launcher/bootstrap) and this one likely overlap — worth scoping
+   together rather than as two independent tasks.
+4. **Skill-eval evidence for the SKILL.md/implementer-prompt.md rewrite.**
+   This repo's own CLAUDE.md requires eval-harness evidence (via
+   `superpowers:writing-skills`, adversarial pressure testing across
+   multiple sessions) for changes to behavior-shaping skill content.
+   Phase 1's SDD rewiring shipped without this. Raised by cubic-dev-ai,
+   won't-fixed on PR #2 as a separate follow-up, now Phase 2 scope. Note:
+   this repo's own eval harness lives in `evals/` (see root `CLAUDE.md`'s
+   "Eval harness" section) — read that before starting this item.
+5. **TDD-under-delegation is structurally weaker than before the fork.**
+   Not a bug to fix outright, but worth deciding whether Phase 2 does
+   anything about it. The implementer subagent can no longer
+   independently verify RED-before-GREEN (no Edit/Write tools to run a
+   failing test itself), so `delegate_implementation`'s backend is
+   solely responsible for TDD discipline, and the subagent's report can
+   only state what evidence it observed after the fact. Currently
+   documented as an accepted trade-off in `implementer-prompt.md`'s
+   Report Format section. Revisit only if it causes a real problem in
+   practice (e.g. during item 1's smoke test) — don't preemptively
+   redesign it.
+
+None of items 1-5 have been started as of this handoff being written.
+Suggested order: **do item 1 first** — it's the cheapest to attempt and
+will likely surface whether items 2-5 (or something not yet identified)
+actually block real usage, rather than guessing at priority from the
+design doc alone.
+
+### Housekeeping for Phase 2
+
+- **Keep this handoff doc's "Where things stand NOW" section current.**
+  Update it after every Phase 2 item completes or every time a session
+  is about to end mid-work — the same discipline that governed Phase 1
+  below.
+- The `.superpowers/sdd/progress.md` ledger (git-ignored, local-only) was
+  Phase 1's task ledger. If Phase 2 work also goes through
+  `subagent-driven-development`, either reuse it (noting the phase
+  boundary) or start a fresh one — decide when Phase 2's first task
+  actually kicks off, don't decide preemptively here.
+- All of Phase 1's history (execution gotchas, the 5 rounds of
+  review-bot fix cycles, key design decisions, environment facts) is
+  preserved below under "Archive: Phase 1" — it's still useful context
+  (e.g. the `restore_working_tree` fix history matters if item 1's smoke
+  test surfaces a NEW bug in that function — see the explicit escalation
+  note in the archive about not auto-patching a 6th time), just no
+  longer the first thing a resuming session needs to read.
+
+---
+
+## Archive: Phase 1 (complete, merged to `dev` via PR #2)
 
 **Phase:** Design + plan are done and merged. **Currently executing the
 implementation plan via `superpowers:subagent-driven-development`,
@@ -187,18 +285,15 @@ real gap but belongs in its own dedicated eval-harness pass, not bundled
 into a review-fix cycle. All 5 resolved via `resolveReviewThread`.
 **62/62 review threads now resolved. Zero open threads on PR #2.**
 
-**Current state: PR #2 is open, all review threads resolved, 101/101
-tests passing.** `restore_working_tree` went through 5 review-driven fix
-rounds this session. **If any NEW finding shows up against that same
-function in a future session, stop and raise it with the repo owner
-before fixing** — don't keep patching indefinitely; either the function
-needs a more fundamental rethink, or review-bot findings on it should
-stop being auto-actioned without a cost/benefit check first. If resuming:
-check `gh pr view 2 --repo normaltusker/superpowers-local-coder` for any
-NEW review activity since this handoff was written before assuming
-there's nothing left to do — CI/review bots may post more later. If
-truly nothing new, this work is done; merging the PR is the human's
-call, not something to do unprompted.
+**PR #2 merged to `dev` at commit `70f8ba3` on 2026-07-22** (see
+"Where things stand NOW" at the top of this file for current state).
+`restore_working_tree` went through 5 review-driven fix rounds during
+Phase 1. **If any NEW finding shows up against that same function in a
+future session (e.g. during Phase 2 item 1's smoke test), stop and raise
+it with the repo owner before fixing** — don't keep patching
+indefinitely; either the function needs a more fundamental rethink, or
+review-bot findings on it should stop being auto-actioned without a
+cost/benefit check first.
 
 **Plan file note:** `docs/superpowers/plans/2026-07-21-local-coder-phase1.md`
 now has a "Task 6.5" section inserted between Task 6 and Task 7 — this
@@ -314,11 +409,11 @@ end to end.
 
 **Workspace:** isolated git worktree at
 `.worktrees/local-coder-impl/` (relative to the main repo checkout root),
-on branch `local-coder-impl`, pushed to `origin`, tracking `origin/dev`.
-**PR #2 is open** (`local-coder-impl` → `dev`) — see line 16 above for
-the link and current status. The worktree stays alive for iterating on
-review feedback; `finishing-a-development-branch`'s Option 2 ("push and
-create PR") is what opened it, and that step is already done.
+on branch `local-coder-impl`, pushed to `origin`. **PR #2 merged to `dev`
+on 2026-07-22** (commit `70f8ba3`) — see "Where things stand NOW" at the
+top of this file. The branch/worktree was reused (fast-forwarded to
+match `dev` post-merge) rather than torn down, since Phase 2 continues on
+it directly, per explicit direction.
 
 If resuming in a fresh session: `cd .worktrees/local-coder-impl` (or if
 that worktree doesn't exist in your checkout, `git worktree list` from the
