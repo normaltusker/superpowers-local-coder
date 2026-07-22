@@ -16,6 +16,7 @@ class AiderBackend(BackendAdapter):
         config: dict,
         model: str | None = None,
         on_tick: Callable[[], None] | None = None,
+        on_output: Callable[[str], None] | None = None,
     ) -> CompletionResult:
         model = model or config.get("model")
         if not model:
@@ -36,6 +37,7 @@ class AiderBackend(BackendAdapter):
                 stall_timeout_seconds=config["stall_timeout_seconds"],
                 idle_notify_interval_seconds=config["idle_notify_interval_seconds"],
                 on_tick=on_tick,
+                on_output=on_output,
             )
         except common.StallError as e:
             # aider writes edited files to disk before committing them (two

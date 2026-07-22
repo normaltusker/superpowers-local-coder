@@ -34,7 +34,7 @@ async def test_delegate_implementation_applies_configured_branch_prefix(isolated
     # passing a bare branch name should end up on the prefixed branch.
     captured = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
         captured["branch"] = branch
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
@@ -54,7 +54,7 @@ async def test_delegate_implementation_does_not_double_prefix_branch(isolated_co
     # applied twice.
     captured = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
         captured["branch"] = branch
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
@@ -72,7 +72,7 @@ async def test_delegate_implementation_skips_prefix_when_configured_empty(isolat
     config_module.merge_config({"branch_prefix": ""})
     captured = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
         captured["branch"] = branch
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
@@ -177,7 +177,7 @@ async def test_delegate_implementation_unimplemented_backend_returns_clean_error
 async def test_delegate_implementation_on_tick_reports_progress_via_ctx(isolated_config, git_repo_no_remote):
     captured_on_tick = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
         captured_on_tick["on_tick"] = on_tick
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
@@ -210,7 +210,7 @@ async def test_delegate_implementation_on_tick_reports_progress_via_ctx(isolated
 async def test_delegate_implementation_on_tick_logs_to_stderr_without_ctx(isolated_config, git_repo_no_remote, capsys):
     captured_on_tick = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
         captured_on_tick["on_tick"] = on_tick
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 

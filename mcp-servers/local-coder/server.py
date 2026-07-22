@@ -107,11 +107,24 @@ async def _delegate_implementation_impl(
                 )
         return on_tick
 
+    def make_on_output(model_name: str):
+        # Streams the backend subprocess's actual output (e.g. aider's own
+        # live progress/diff/commit messages) to this server's own stderr
+        # as it arrives, rather than only the bounded tail surfaced in an
+        # error message after the whole call finishes. Without this, a
+        # long-running delegated attempt is effectively headless — nothing
+        # about what the backend is actually doing is visible until it's
+        # already done (or already failed).
+        def on_output(chunk: str):
+            print(f"[local-coder:{model_name}] {chunk}", end="", file=sys.stderr, flush=True)
+        return on_output
+
     for model in attempt_models:
         try:
             result = await anyio.to_thread.run_sync(
                 lambda model=model: backend.run_backend(
-                    task, repo_path, branch, cfg, model=model, on_tick=make_on_tick(model)
+                    task, repo_path, branch, cfg, model=model,
+                    on_tick=make_on_tick(model), on_output=make_on_output(model),
                 )
             )
         except NotImplementedError as e:

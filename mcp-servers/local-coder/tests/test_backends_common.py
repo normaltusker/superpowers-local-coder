@@ -459,3 +459,67 @@ def test_run_monitored_subprocess_kills_process_when_on_tick_raises():
     proc = captured_pid["proc"]
     proc.wait(timeout=2)
     assert proc.poll() is not None  # process must have been killed, not leaked
+
+
+def test_run_monitored_subprocess_calls_on_output_with_each_chunk():
+    # A caller needs live visibility into a long-running backend's actual
+    # output (not just a generic "still running" heartbeat from on_tick),
+    # e.g. to stream aider's real progress to the server's own stderr as
+    # it happens, rather than only seeing a bounded tail after the whole
+    # call finishes.
+    chunks = []
+    result = common.run_monitored_subprocess(
+        ["python3", "-c", "import sys\nprint('hello')\nprint('world')\nsys.stdout.flush()"],
+        cwd=".",
+        stall_timeout_seconds=5, idle_notify_interval_seconds=1,
+        on_output=lambda chunk: chunks.append(chunk),
+    )
+    assert result.returncode == 0
+    assert "".join(chunks) == result.stdout
+
+
+def test_run_monitored_subprocess_on_output_receives_decoded_text_not_bytes():
+    chunks = []
+    common.run_monitored_subprocess(
+        ["echo", "hello"], cwd=".",
+        stall_timeout_seconds=5, idle_notify_interval_seconds=1,
+        on_output=lambda chunk: chunks.append(chunk),
+    )
+    assert all(isinstance(c, str) for c in chunks)
+
+
+def test_run_monitored_subprocess_on_output_is_optional():
+    # Existing callers that don't pass on_output must be unaffected —
+    # this is an additive, backward-compatible parameter.
+    result = common.run_monitored_subprocess(
+        ["echo", "hello"], cwd=".",
+        stall_timeout_seconds=5, idle_notify_interval_seconds=1,
+    )
+    assert result.returncode == 0
+
+
+def test_run_monitored_subprocess_kills_process_when_on_output_raises():
+    captured_pid = {}
+    real_popen = subprocess.Popen
+
+    def spying_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        captured_pid["pid"] = proc.pid
+        captured_pid["proc"] = proc
+        return proc
+
+    def blowup_on_output(chunk):
+        raise RuntimeError("on_output blew up")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(subprocess, "Popen", spying_popen)
+        with pytest.raises(RuntimeError, match="on_output blew up"):
+            common.run_monitored_subprocess(
+                ["echo", "hello"], cwd=".",
+                stall_timeout_seconds=5, idle_notify_interval_seconds=1,
+                on_output=blowup_on_output,
+            )
+
+    proc = captured_pid["proc"]
+    proc.wait(timeout=2)
+    assert proc.poll() is not None

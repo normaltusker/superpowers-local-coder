@@ -296,6 +296,7 @@ def run_monitored_subprocess(
     stall_timeout_seconds: float,
     idle_notify_interval_seconds: float,
     on_tick: Callable[[], None] | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> subprocess.CompletedProcess:
     # Run with an unbuffered binary pipe (not text=True) so we can read
     # whatever bytes are actually available via a non-blocking os.read()
@@ -339,10 +340,13 @@ def run_monitored_subprocess(
                 except OSError:
                     data = b""
                 if data:
-                    output_tail += decoder.decode(data)
+                    decoded = decoder.decode(data)
+                    output_tail += decoded
                     if len(output_tail) > _MAX_OUTPUT_CHARS:
                         output_tail = output_tail[-_MAX_OUTPUT_CHARS:]
                     last_activity = time.monotonic()
+                    if on_output is not None and decoded:
+                        on_output(decoded)
 
             if process.poll() is not None and not data:
                 # Drain any remaining buffered output before exiting.
@@ -353,11 +357,17 @@ def run_monitored_subprocess(
                         remaining = b""
                     if not remaining:
                         break
-                    output_tail += decoder.decode(remaining)
+                    decoded = decoder.decode(remaining)
+                    output_tail += decoded
                     if len(output_tail) > _MAX_OUTPUT_CHARS:
                         output_tail = output_tail[-_MAX_OUTPUT_CHARS:]
+                    if on_output is not None and decoded:
+                        on_output(decoded)
                 # Flush any trailing partial multi-byte sequence.
-                output_tail += decoder.decode(b"", final=True)
+                final_decoded = decoder.decode(b"", final=True)
+                output_tail += final_decoded
+                if on_output is not None and final_decoded:
+                    on_output(final_decoded)
                 break
 
             now = time.monotonic()
