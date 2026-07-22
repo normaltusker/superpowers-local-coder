@@ -1,9 +1,11 @@
 import shutil
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 import config as config_module
+import ollama as ollama_module
 
 
 @pytest.fixture
@@ -51,3 +53,58 @@ def test_merge_config_with_empty_overrides_is_a_noop(isolated_config):
     before = config_module.load_config()
     result = config_module.merge_config({})
     assert result == before
+
+
+def test_configure_with_validation_rejects_unpulled_ollama_model(isolated_config):
+    with patch.object(ollama_module, "list_ollama_models", return_value=["qwen3-coder:30b"]):
+        with pytest.raises(config_module.ConfigValidationError, match="not pulled|not found|unavailable"):
+            config_module.configure_with_validation({"model": "ollama/does-not-exist:1b"})
+
+
+def test_configure_with_validation_accepts_pulled_ollama_model(isolated_config):
+    with patch.object(ollama_module, "list_ollama_models", return_value=["qwen2.5-coder:14b"]):
+        result = config_module.configure_with_validation({"model": "ollama/qwen2.5-coder:14b"})
+    assert result["model"] == "ollama/qwen2.5-coder:14b"
+
+
+def test_configure_with_validation_skips_check_for_non_ollama_prefix(isolated_config):
+    # no mock needed — should never call list_ollama_models for a non-ollama/ model
+    with patch.object(ollama_module, "list_ollama_models") as mock_list:
+        result = config_module.configure_with_validation({"model": "openrouter/some-model"})
+        mock_list.assert_not_called()
+    assert result["model"] == "openrouter/some-model"
+
+
+def test_configure_with_validation_rejects_fallback_list_over_cap(isolated_config):
+    with patch.object(ollama_module, "list_ollama_models", return_value=["a:1b", "b:1b", "c:1b", "d:1b"]):
+        with pytest.raises(config_module.ConfigValidationError, match="max_fallback_models|limit"):
+            config_module.configure_with_validation({
+                "fallback_models": ["ollama/a:1b", "ollama/b:1b", "ollama/c:1b", "ollama/d:1b"]
+            })
+
+
+def test_configure_with_validation_accepts_fallback_list_at_cap(isolated_config):
+    with patch.object(ollama_module, "list_ollama_models", return_value=["a:1b", "b:1b", "c:1b"]):
+        result = config_module.configure_with_validation({
+            "fallback_models": ["ollama/a:1b", "ollama/b:1b", "ollama/c:1b"]
+        })
+    assert len(result["fallback_models"]) == 3
+
+
+def test_configure_with_validation_rejects_gemini_with_ollama_model(isolated_config):
+    with pytest.raises(config_module.ConfigValidationError, match="[Gg]emini"):
+        config_module.configure_with_validation({
+            "backend": "gemini", "model": "ollama/qwen3-coder:30b"
+        })
+
+
+def test_list_available_models_with_prefix_prefixes_correctly(isolated_config):
+    with patch.object(ollama_module, "list_ollama_models", return_value=["qwen3-coder:30b", "qwen2.5-coder:14b"]):
+        models = config_module.list_available_models_with_prefix()
+    assert models == ["ollama/qwen3-coder:30b", "ollama/qwen2.5-coder:14b"]
+
+
+def test_list_available_models_with_prefix_propagates_unavailable_error(isolated_config):
+    with patch.object(ollama_module, "list_ollama_models", side_effect=ollama_module.OllamaUnavailableError("no ollama")):
+        with pytest.raises(ollama_module.OllamaUnavailableError):
+            config_module.list_available_models_with_prefix()
