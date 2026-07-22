@@ -9,6 +9,7 @@ class CompletionResult:
     files_changed: list[str] = field(default_factory=list)
     commit_sha: str | None = None
     error: str | None = None
+    output_tail: str = ""
 
 
 class BackendAdapter(ABC):

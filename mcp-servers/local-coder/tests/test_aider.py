@@ -13,6 +13,14 @@ BASE_CONFIG = {
 }
 
 
+def test_completion_result_has_output_tail_field_defaulting_empty():
+    from backends.base import CompletionResult
+    r = CompletionResult(success=True)
+    assert r.output_tail == ""
+    r2 = CompletionResult(success=True, output_tail="some output")
+    assert r2.output_tail == "some output"
+
+
 def test_self_commits_is_true():
     assert AiderBackend.self_commits is True
 
