@@ -8,17 +8,20 @@ instead of Claude Code's own Edit/Write tools.
 ## Prerequisites
 
 - `aider` installed and on `PATH` (`pip install aider-chat` or `pipx install aider-chat`).
-- [Ollama](https://ollama.com) running locally, with the configured model
+- [Ollama](https://ollama.com), running locally with the configured model
   pulled (default: `qwen3-coder:30b` — `ollama pull qwen3-coder:30b`), and
-  every model listed in `fallback_models` (if any) also pulled.
-- `gh` CLI installed and authenticated (`gh auth status`).
+  every model listed in `fallback_models` (if any) also pulled — only
+  needed if `model` (or a `fallback_models` entry) uses the `ollama/`
+  prefix; not required if you're using a remote backend/model.
+- `gh` CLI installed and authenticated (`gh auth status`) — only needed if
+  `open_pr` is enabled.
 - This server's own dependencies installed into its venv:
   ```bash
   cd mcp-servers/local-coder
   python3.13 -m venv .venv
   .venv/bin/pip install -r requirements.txt
   ```
-  Use a Python 3.10+ interpreter explicitly (e.g. `python3.13`), not a bare `python3` — `fastmcp` requires >=3.10 and an older system `python3` will fail the install silently.
+  Use a Python 3.10+ interpreter explicitly (e.g. `python3.13`), not a bare `python3` — `fastmcp` requires >=3.10 and an older system `python3` will fail the install with an explicit Python-version-incompatibility error.
 
 ## Configuring backend/model
 

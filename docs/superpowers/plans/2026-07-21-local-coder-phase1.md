@@ -163,6 +163,7 @@ echo "mcp-servers/local-coder/.venv/" >> ../../.gitignore
 Create `mcp-servers/local-coder/requirements.txt`:
 ```
 fastmcp>=2.0.0
+anyio>=4.0
 PyYAML>=6.0
 pytest>=8.0.0
 ```
@@ -1508,7 +1509,13 @@ def _delegate_implementation_impl(
                     capture_output=True, text=True,
                 )
                 if push.returncode != 0:
-                    return {"success": False, "error": f"git push failed: {push.stderr.strip()}"}
+                    return {
+                        "success": False,
+                        "error": f"git push failed: {push.stderr.strip()}",
+                        "files_changed": result.files_changed,
+                        "commit_sha": result.commit_sha,
+                        "model_used": model,
+                    }
 
                 if cfg.get("open_pr") and not _has_open_pr(repo_path, branch):
                     pr = subprocess.run(
