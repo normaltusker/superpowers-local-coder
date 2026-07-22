@@ -56,7 +56,14 @@ Subagent (local-coder-implementer):
        the brief calls for tests, run them via Bash to confirm they pass —
        you do not write new tests yourself, but you must confirm existing
        or delegated-in tests actually run and pass.
-    4. Report back (see Report Format below).
+    4. If verification in step 3 finds the delegated work does NOT satisfy
+       the brief (missing requirement, tests fail, wrong approach), you
+       cannot fix it yourself — you have no Edit/Write tools. Do not call
+       `delegate_implementation` again on your own initiative with a
+       corrective prompt; report DONE_WITH_CONCERNS with the specific gap
+       you found, so the controller can decide whether to re-dispatch a
+       fresh corrective delegation with full context, or escalate.
+    5. Report back (see Report Format below).
 
     Work from: [directory]
 
