@@ -1617,6 +1617,183 @@ git commit -m "local-coder: add FastMCP server with delegate_implementation, con
 
 ---
 
+### Task 6.5: Wire on_tick to real progress notifications (async conversion)
+
+**Discovered during Task 7's review, not part of the original plan.** The
+design spec requires `delegate_implementation` to emit an MCP progress
+notification and a stderr log line roughly every
+`idle_notify_interval_seconds` while a backend subprocess runs. Task 3
+built `run_monitored_subprocess`'s `on_tick` callback hook correctly, but
+no task ever actually constructed and passed a real `on_tick` — Task 4's
+`AiderBackend.run_backend` calls `run_monitored_subprocess` without it,
+and Task 6's `_delegate_implementation_impl` never receives or threads
+through a FastMCP `Context`. The notification mechanism has been silently
+inert this whole time. This task fixes that end-to-end.
+
+**Files:**
+- Modify: `mcp-servers/local-coder/backends/base.py`
+- Modify: `mcp-servers/local-coder/backends/aider.py`
+- Modify: `mcp-servers/local-coder/backends/codex.py`,
+  `backends/gemini.py`, `backends/openrouter.py` (signature only, still stubs)
+- Modify: `mcp-servers/local-coder/server.py`
+- Modify: `mcp-servers/local-coder/tests/test_aider.py`,
+  `tests/test_server.py`
+
+**The design (confirmed against the actually-installed FastMCP 3.4.4 in
+this venv before writing this task — do not assume, verify
+`Context.report_progress` exists and is `async` via
+`inspect.iscoroutinefunction`):**
+
+`Context.report_progress(progress, total=None, message=None)` is `async`.
+`run_monitored_subprocess`'s polling loop is synchronous by design (a
+tight `selectors.select()` loop) — it must NOT become async itself, since
+awaiting it directly from an async caller would block the event loop for
+the entire subprocess duration. The correct pattern: run the
+still-synchronous backend/monitoring call in a worker thread via
+`anyio.to_thread.run_sync` (from the async `_delegate_implementation_impl`),
+and have `on_tick` — invoked synchronously from within that worker thread
+— hand off to the async `Context.report_progress()` via
+`anyio.from_thread.run`. `anyio` is already a FastMCP dependency, no new
+requirement needed.
+
+**Interfaces:**
+- `BackendAdapter.run_backend`'s abstract signature (base.py) gains an
+  `on_tick: Callable[[], None] | None = None` parameter, forwarded by
+  `AiderBackend` into its call to `common.run_monitored_subprocess`. The
+  three stub backends' signatures are updated for consistency (they still
+  just raise `NotImplementedError`, unaffected otherwise).
+- `_delegate_implementation_impl` becomes `async def`, gains an optional
+  `ctx: Context | None = None` parameter (FastMCP's `Context` type,
+  imported from `fastmcp`).
+- The `@mcp.tool()`-decorated `delegate_implementation` wrapper becomes
+  `async def` and gains a `ctx: Context` parameter — FastMCP
+  auto-injects a live `Context` into any tool function that declares this
+  parameter type-annotated; it is not something the caller passes
+  explicitly. Verify this injection behavior against the installed
+  FastMCP version's docs/source before relying on it — if FastMCP 3.4.4's
+  injection mechanism differs from what's assumed here, adapt accordingly
+  and document the actual mechanism used.
+
+- [ ] **Step 1: Write the failing tests**
+
+Extend `tests/test_aider.py`: add a test confirming `AiderBackend.run_backend`
+forwards an `on_tick` callable through to
+`common.run_monitored_subprocess` (mock `run_monitored_subprocess` and
+assert the `on_tick` kwarg it was called with is the same callable passed
+into `run_backend`).
+
+Extend `tests/test_server.py`: since `_delegate_implementation_impl` is
+now `async def`, every existing test calling it must become `async def`
+too and use `pytest.mark.asyncio` (add `pytest-asyncio` to
+`requirements.txt` if not already present — check
+`.venv/bin/pip show pytest-asyncio` first) or `anyio`'s pytest plugin
+(check whether `pytest-anyio`/`anyio.pytest_plugin` is already available
+via the existing `anyio` dependency before adding a new one — prefer
+reusing what's already installed over adding another test dependency).
+Add a new test confirming that when `_delegate_implementation_impl` is
+called with a mock `ctx` object, the underlying backend call receives an
+`on_tick` that, when invoked, calls `ctx.report_progress` (verify via the
+mock) — this test should NOT require FastMCP's actual thread-bridging
+machinery to work for real (mock `anyio.from_thread.run` or structure the
+test to isolate what's being verified), it should verify the wiring, not
+re-test anyio itself.
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `cd mcp-servers/local-coder && .venv/bin/python -m pytest tests/test_aider.py tests/test_server.py -v`
+Expected: FAIL — `on_tick` parameter doesn't exist yet on `run_backend`,
+`_delegate_implementation_impl` isn't async yet.
+
+- [ ] **Step 3: Implement the fix**
+
+In `backends/base.py`: add `on_tick: Callable[[], None] | None = None` to
+the abstract `run_backend` signature (import `Callable` from `typing` if
+not already imported).
+
+In `backends/aider.py`: accept `on_tick` in `run_backend`'s signature,
+forward it to the `common.run_monitored_subprocess(...)` call.
+
+In `backends/codex.py`, `backends/gemini.py`, `backends/openrouter.py`:
+update each stub's `run_backend` signature to match (still raises
+`NotImplementedError` immediately, signature consistency only).
+
+In `server.py`:
+1. Import `Context` from `fastmcp`.
+2. Convert `_delegate_implementation_impl` to `async def`, add
+   `ctx: Context | None = None` parameter.
+3. Inside the per-model attempt loop, before calling
+   `backend.run_backend(...)`, construct the tick callback:
+   ```python
+   def make_on_tick(model_name: str):
+       def on_tick():
+           print(f"[local-coder] still running ({model_name})...", file=sys.stderr, flush=True)
+           if ctx is not None:
+               anyio.from_thread.run(ctx.report_progress, 0, None, f"Running {model_name}...")
+       return on_tick
+   ```
+   (adjust the exact `report_progress` arguments to whatever's
+   semantically sensible — this is a long-running indeterminate task, so
+   `progress`/`total` may not have meaningful numeric values; a `message`-only
+   progress ping is reasonable, but confirm this against
+   `Context.report_progress`'s actual parameter meanings, don't guess
+   blindly).
+4. Wrap the call to `backend.run_backend(...)` (which is still a
+   synchronous method) in `anyio.to_thread.run_sync`, passing the
+   `on_tick` callback through: something like
+   `result = await anyio.to_thread.run_sync(lambda: backend.run_backend(task, repo_path, branch, cfg, model=model, on_tick=make_on_tick(model)))`.
+   Confirm `anyio.to_thread.run_sync` correctly propagates exceptions
+   raised inside the thread (it should, verify with a quick manual check
+   or by reading anyio's docs/source) — the existing `NotImplementedError`-catching
+   logic and the failover loop's error handling must keep working
+   identically to before this change.
+5. Convert the `@mcp.tool()`-decorated `delegate_implementation` wrapper
+   to `async def`, add the `ctx: Context` parameter, `await` the call to
+   `_delegate_implementation_impl`.
+6. `import sys` at the top of `server.py` if not already imported (needed
+   for the stderr print in `on_tick`).
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cd mcp-servers/local-coder && .venv/bin/python -m pytest tests/test_aider.py tests/test_server.py -v`
+Expected: all pass.
+
+- [ ] **Step 5: Run the full suite**
+
+Run: `cd mcp-servers/local-coder && .venv/bin/python -m pytest -v`
+Expected: every test across every file still passes — confirm the total
+count and that nothing in `test_backends_common.py`, `test_config.py`,
+`test_ollama.py` regressed (they shouldn't be touched by this change at
+all, since `run_monitored_subprocess` itself is unchanged — only its
+callers now pass a real `on_tick`).
+
+- [ ] **Step 6: Manually verify the server still starts cleanly**
+
+Run the same server-start smoke check Task 7 used (background + kill
+after a couple seconds, confirm the FastMCP startup banner appears with
+no traceback) — the `async def` conversion must not break FastMCP's
+ability to register/serve the tool.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add mcp-servers/local-coder/backends/base.py \
+        mcp-servers/local-coder/backends/aider.py \
+        mcp-servers/local-coder/backends/codex.py \
+        mcp-servers/local-coder/backends/gemini.py \
+        mcp-servers/local-coder/backends/openrouter.py \
+        mcp-servers/local-coder/server.py \
+        mcp-servers/local-coder/tests/test_aider.py \
+        mcp-servers/local-coder/tests/test_server.py \
+        mcp-servers/local-coder/requirements.txt
+git commit -m "local-coder: wire on_tick to real MCP progress notifications + stderr logging"
+```
+
+(Only include `requirements.txt` in the commit if a new test-only
+dependency was actually needed — omit it from the `git add` list
+otherwise.)
+
+---
+
 ### Task 7: MCP registration, README, plugin wiring
 
 **Files:**
