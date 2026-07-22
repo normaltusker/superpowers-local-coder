@@ -128,18 +128,59 @@ genuinely RED-before/GREEN-after; the rename-bug test only ever failed
 within an uncommitted intermediate edit, never against pushed history).
 All 3 threads from this round (comment IDs `3629411569` P0,
 `3629411575` P1, `3629411577` P2) replied to with fix explanations and
-are resolved on GitHub (this repo resolves threads automatically once
-the PR owner replies — no separate `resolveReviewThread` mutation was
-needed).
+came back already resolved — turned out to be a one-off (see next
+round's note below, `resolveReviewThread` was needed there), not a
+repo-wide auto-resolve behavior to rely on.
 
-**Current state: PR #2 is open. 54 of 59 total review threads resolved;
+**A 5th cubic-dev-ai pass then found 3 more findings in the same
+function, plus 2 unrelated ones.** At this point the repo owner flagged
+(rightly) that this was starting to feel endless, so this round was
+explicitly **triaged before any fix work**, verifying each claim with a
+manual repro against the real current code rather than trusting the
+finding text — same discipline as every prior round, but confirmed
+deliberately before writing code this time:
+- **Real, fixed:** `git status` omits `!!` (ignored) entries by default
+  even with `--untracked-files=all` — a failed attempt's newly generated
+  ignored files (build output, `.pyc`, etc.) were invisible to the
+  pre/post snapshot diff and survived cleanup, leaking into whatever
+  fallback model ran next. Fixed by adding `--ignored` to both status
+  calls and routing `!!` paths through `git clean -fdx` (`-x` is what
+  makes clean remove ignored, not just untracked, paths).
+- **Real, fixed, more serious than its P2 label:** `restore_working_tree`
+  combines `-C repo_path` (argv, resolved against the process's cwd) with
+  `cwd=repo_path` (which changes that cwd first) on the same string — a
+  relative `repo_path` got resolved twice, collapsing to
+  `<repo_path>/<repo_path>`, which doesn't exist. Those git calls don't
+  use `check=True`, so the failure was silent and **cleanup became a
+  total no-op for any relative `target_repo_path`** — same severity class
+  as the P0/P1 bugs from two rounds ago, just newly surfaced. Fixed by
+  normalizing `repo_path` to absolute at the top of both
+  `snapshot_working_tree` and `restore_working_tree`.
+- **Investigated, deliberately skipped:** a theoretical `E2BIG` if a
+  single attempt changes enough paths to exceed argv limits. Measured
+  this machine's `ARG_MAX` (~1MB) against realistic path lengths — needs
+  ~17,000+ changed paths in one attempt to threaten, which isn't a
+  realistic failure mode for this tool's actual usage (one plan task per
+  delegation call). Documented as a known limit, not fixed, replied with
+  the reasoning.
+Fixed the two real ones with TDD (both new tests verified genuinely
+RED-before/GREEN-after), committed as `ed67846`. **101/101 tests
+passing.** Replied to all 3 threads; this time they did NOT auto-resolve
+on reply, so `resolveReviewThread` was called explicitly on each
+(`comment_ids` `3629611562`, `3629611566`, `3629611587`) — don't assume
+either behavior going forward, always verify resolution state after
+replying rather than assuming it happened.
+
+**Current state: PR #2 is open. 57 of 62 total review threads resolved;
 5 left open intentionally** (the acknowledge-only scope findings from the
 first cubic round — do not resolve these without the repo owner's
-say-so, they represent open design questions, not defects). `restore_working_tree`
-has now been through 4 review-driven fix rounds and is believed stable —
-if a 5th finding shows up against this same function, treat that as a
-signal to step back and reconsider the approach more fundamentally rather
-than patching again. If resuming: check
+say-so, they represent open design questions, not defects).
+`restore_working_tree` has now been through 5 review-driven fix rounds.
+**If a 6th finding shows up against this same function, stop and raise
+it with the repo owner before fixing** — don't keep patching
+indefinitely; either the function needs a more fundamental rethink, or
+review-bot findings on it should stop being auto-actioned without a
+cost/benefit check first. If resuming: check
 `gh pr view 2 --repo normaltusker/superpowers-local-coder` for any NEW
 review activity since this handoff was written before assuming there's
 nothing left to do — CI/review bots may have posted more since. If truly
