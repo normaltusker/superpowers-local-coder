@@ -11,6 +11,30 @@ session end — a stale handoff is worse than none.
 implementation plan via `superpowers:subagent-driven-development`,
 task-by-task.** Check the progress ledger (see below) for exactly which
 tasks are done — trust it and `git log` over this prose if they conflict.
+As of this update: Tasks 1-2 complete and reviewed clean (Task 1 needed
+one fix round — see "Gotchas hit during execution" below); Task 3 dispatched.
+
+## Gotchas hit during execution (read before dispatching later tasks)
+
+- **Task 1's venv was initially built with the wrong Python.** The plan
+  said `python3 -m venv .venv`, and on this machine bare `python3` on PATH
+  resolves to 3.9.6 — too old for `fastmcp` (needs >=3.10). This silently
+  made `fastmcp` uninstallable without erroring loudly at venv-creation
+  time (pip just reported the package "not found," which the implementer
+  misread as a PyPI availability problem rather than a Python-version
+  problem). **Fixed**: venv recreated with `/usr/local/bin/python3.13`,
+  and the plan file itself was corrected at both `python3 -m venv`
+  occurrences to say `python3.13 -m venv` explicitly. If you're resuming
+  and a task's venv step seems to silently fail to install something,
+  check `.venv/bin/python --version` first — this exact failure mode can
+  recur if a task ever recreates the venv from scratch again.
+- **Task 1's implementer also created `tests/__init__.py`**, which the
+  plan explicitly forbids (see plan's File Structure section) because it
+  would risk breaking the flat-import resolution. Caught by task review,
+  fixed with `git rm`. Worth explicitly telling every later task's
+  implementer NOT to create this file, since it's an easy default
+  reflex ("tests dirs usually get an __init__.py") that contradicts this
+  specific plan's convention.
 
 **Workspace:** isolated git worktree at
 `.worktrees/local-coder-impl/` (relative to the main checkout at
