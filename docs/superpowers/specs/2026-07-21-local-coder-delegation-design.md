@@ -76,7 +76,7 @@ it against a real installed plugin; corrected here).
   "mcpServers": {
     "local-coder": {
       "type": "stdio",
-      "command": "python3",
+      "command": "${CLAUDE_PLUGIN_ROOT}/mcp-servers/local-coder/.venv/bin/python",
       "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-servers/local-coder/server.py"]
     }
   }
@@ -86,12 +86,11 @@ it against a real installed plugin; corrected here).
 `${CLAUDE_PLUGIN_ROOT}` resolves to wherever the plugin is installed, so
 this works whether someone clones this fork directly or installs it as a
 plugin — matching the original requirement that no manual `claude mcp add`
-step is needed. The server is expected to run inside the venv created per
-"Prerequisites" in the README (the `python3` on `PATH` at the time Claude
-Code launches the server must be one with `requirements.txt` installed —
-the README documents activating the venv or using its absolute
-interpreter path in `command` if a bare `python3` doesn't resolve
-correctly in the user's environment).
+step is needed. `command` points directly at the venv's own interpreter
+(created per "Prerequisites" in the README) rather than a bare `python3`,
+so there is no dependency on `PATH` resolution at the time Claude Code
+launches the server — the venv with `requirements.txt` installed is used
+unambiguously.
 
 ### config.yaml
 
