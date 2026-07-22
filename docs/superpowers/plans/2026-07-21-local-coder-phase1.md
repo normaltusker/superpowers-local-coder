@@ -1213,6 +1213,24 @@ git commit -m "local-coder: add configure validation (ollama check, fallback cap
   `.mcp.json`) and Task 8 (SDD rewiring) depend on this existing and
   working.
 
+**Correction, discovered during Task 6 dispatch (binding — the code below
+already reflects it):** the installed `fastmcp` (3.4.4) raises
+`ValueError: Functions with **kwargs are not supported as tools` at
+`@mcp.tool()` decoration time — i.e. at module import, before any test can
+run. An earlier draft of this plan gave `configure`/`_configure_impl` a
+`**overrides` catch-all parameter (mirroring the design spec's
+`configure(backend=None, model=None, ..., **overrides)` signature), which
+is incompatible with this FastMCP version's tool-schema validation.
+Fixed by enumerating every `config.yaml` key as an explicit named
+parameter instead of a catch-all — the set is fixed and known (11 keys),
+so nothing is actually lost by naming them; MCP clients get a properly
+typed schema for each field instead of an opaque passthrough. This only
+affects the two `@mcp.tool()`-facing functions (`configure` and
+`_configure_impl`, both shown with the corrected signature below) —
+`config.py`'s internal `configure_with_validation(overrides: dict)` from
+Task 5 is unaffected, since it's never decorated and can keep taking a
+plain dict.
+
 **Note on testing FastMCP tools:** FastMCP's `@mcp.tool()` decorator
 returns a `FunctionTool` wrapper, not the plain function — calling
 `server.delegate_implementation(...)` directly from a test would call the
@@ -1498,16 +1516,28 @@ def _delegate_implementation_impl(
 def _configure_impl(
     backend: str | None = None,
     model: str | None = None,
+    fallback_models: list[str] | None = None,
+    max_fallback_models: int | None = None,
+    stall_timeout_seconds: float | None = None,
     target_repo_path: str | None = None,
+    branch_prefix: str | None = None,
     open_pr: bool | None = None,
-    **overrides,
+    pr_base_branch: str | None = None,
+    idle_notify_interval_seconds: float | None = None,
+    extra_backend_args: list[str] | None = None,
 ) -> dict:
     all_overrides = {
         "backend": backend,
         "model": model,
+        "fallback_models": fallback_models,
+        "max_fallback_models": max_fallback_models,
+        "stall_timeout_seconds": stall_timeout_seconds,
         "target_repo_path": target_repo_path,
+        "branch_prefix": branch_prefix,
         "open_pr": open_pr,
-        **overrides,
+        "pr_base_branch": pr_base_branch,
+        "idle_notify_interval_seconds": idle_notify_interval_seconds,
+        "extra_backend_args": extra_backend_args,
     }
     all_overrides = {k: v for k, v in all_overrides.items() if v is not None}
 
@@ -1536,11 +1566,22 @@ def delegate_implementation(
 def configure(
     backend: str | None = None,
     model: str | None = None,
+    fallback_models: list[str] | None = None,
+    max_fallback_models: int | None = None,
+    stall_timeout_seconds: float | None = None,
     target_repo_path: str | None = None,
+    branch_prefix: str | None = None,
     open_pr: bool | None = None,
-    **overrides,
+    pr_base_branch: str | None = None,
+    idle_notify_interval_seconds: float | None = None,
+    extra_backend_args: list[str] | None = None,
 ) -> dict:
-    return _configure_impl(backend, model, target_repo_path, open_pr, **overrides)
+    return _configure_impl(
+        backend, model, fallback_models, max_fallback_models,
+        stall_timeout_seconds, target_repo_path, branch_prefix,
+        open_pr, pr_base_branch, idle_notify_interval_seconds,
+        extra_backend_args,
+    )
 
 
 @mcp.tool()
