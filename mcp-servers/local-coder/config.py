@@ -114,6 +114,27 @@ def _configure_with_validation_locked(overrides: dict) -> dict:
     model = overrides.get("model", current.get("model"))
     fallback_models = overrides.get("fallback_models", current.get("fallback_models", []))
     max_fallback = overrides.get("max_fallback_models", current.get("max_fallback_models", 3))
+    stall_timeout_seconds = overrides.get(
+        "stall_timeout_seconds", current.get("stall_timeout_seconds")
+    )
+    idle_notify_interval_seconds = overrides.get(
+        "idle_notify_interval_seconds", current.get("idle_notify_interval_seconds")
+    )
+
+    # A zero or negative stall_timeout_seconds would kill every backend
+    # attempt near-instantly; a zero or negative idle_notify_interval_seconds
+    # would busy-loop the tick/stall poll and flood progress notifications.
+    # Reject both at config-write time rather than letting them silently
+    # break every delegate_implementation call.
+    if stall_timeout_seconds is not None and stall_timeout_seconds <= 0:
+        raise ConfigValidationError(
+            f"stall_timeout_seconds must be strictly positive, got {stall_timeout_seconds!r}"
+        )
+    if idle_notify_interval_seconds is not None and idle_notify_interval_seconds <= 0:
+        raise ConfigValidationError(
+            "idle_notify_interval_seconds must be strictly positive, got "
+            f"{idle_notify_interval_seconds!r}"
+        )
 
     # Reject an unrecognized backend name immediately at config-write time
     # rather than letting it fail later, less helpfully, at

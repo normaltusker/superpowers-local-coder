@@ -142,6 +142,30 @@ def test_configure_with_validation_skips_check_for_non_ollama_prefix(isolated_co
     assert result["model"] == "openrouter/some-model"
 
 
+def test_configure_with_validation_rejects_non_positive_stall_timeout(isolated_config):
+    with pytest.raises(config_module.ConfigValidationError, match="stall_timeout_seconds"):
+        config_module.configure_with_validation({"stall_timeout_seconds": 0})
+    with pytest.raises(config_module.ConfigValidationError, match="stall_timeout_seconds"):
+        config_module.configure_with_validation({"stall_timeout_seconds": -5})
+
+
+def test_configure_with_validation_accepts_positive_stall_timeout(isolated_config):
+    result = config_module.configure_with_validation({"stall_timeout_seconds": 600})
+    assert result["stall_timeout_seconds"] == 600
+
+
+def test_configure_with_validation_rejects_non_positive_idle_notify_interval(isolated_config):
+    with pytest.raises(config_module.ConfigValidationError, match="idle_notify_interval_seconds"):
+        config_module.configure_with_validation({"idle_notify_interval_seconds": 0})
+    with pytest.raises(config_module.ConfigValidationError, match="idle_notify_interval_seconds"):
+        config_module.configure_with_validation({"idle_notify_interval_seconds": -1})
+
+
+def test_configure_with_validation_accepts_positive_idle_notify_interval(isolated_config):
+    result = config_module.configure_with_validation({"idle_notify_interval_seconds": 30})
+    assert result["idle_notify_interval_seconds"] == 30
+
+
 def test_configure_with_validation_rejects_fallback_list_over_cap(isolated_config):
     # include the config's existing default model ("qwen3-coder:30b") in the
     # mock's available list since the merged/effective model is now
