@@ -22,7 +22,7 @@ class AiderBackend(BackendAdapter):
             return CompletionResult(success=False, error="no model specified")
 
         common.ensure_branch(repo_path, branch)
-        pre_head, _ = common.snapshot_working_tree(repo_path)
+        pre_head, pre_porcelain = common.snapshot_working_tree(repo_path)
 
         cmd = [
             "aider", "--model", model, "--yes", "--message", task,
@@ -38,9 +38,16 @@ class AiderBackend(BackendAdapter):
                 on_tick=on_tick,
             )
         except common.StallError as e:
+            # aider writes edited files to disk before committing them (two
+            # separate, non-atomic steps) — a stall-kill can land between
+            # those steps and leave partial, uncommitted writes on disk.
+            # Clean those up now so the next failover attempt starts from
+            # the same state this attempt did.
+            common.restore_working_tree(repo_path, pre_head, pre_porcelain)
             return CompletionResult(success=False, error=str(e))
 
         if result.returncode != 0:
+            common.restore_working_tree(repo_path, pre_head, pre_porcelain)
             return CompletionResult(
                 success=False,
                 error=result.stdout.strip()[-2000:] or "aider exited non-zero",
@@ -52,6 +59,11 @@ class AiderBackend(BackendAdapter):
         ).stdout.strip()
 
         if post_head == pre_head:
+            # aider exited cleanly (returncode 0) without committing — this
+            # can still happen with dirty, uncommitted writes on disk (e.g.
+            # aider wrote files but a lint/commit step declined or failed
+            # silently), so clean up here too.
+            common.restore_working_tree(repo_path, pre_head, pre_porcelain)
             return CompletionResult(success=False, error="aider made no commits")
 
         files_changed = subprocess.run(

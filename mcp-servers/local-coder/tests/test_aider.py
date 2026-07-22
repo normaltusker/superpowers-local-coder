@@ -151,6 +151,75 @@ def test_run_backend_returns_clean_error_when_no_model_available(git_repo):
     mock_run.assert_not_called()
 
 
+def test_run_backend_cleans_up_partial_writes_after_stall(git_repo):
+    # Simulate aider writing a file to disk (as it does via apply_edits)
+    # before being killed by a stall timeout, i.e. before it ever reaches
+    # auto_commit. The failed attempt must not leave that partial write on
+    # disk for the next failover attempt to inherit.
+    def fake_run(cmd, cwd, stall_timeout_seconds, idle_notify_interval_seconds, on_tick=None):
+        (git_repo / "partial_write.py").write_text("# half-written by killed aider\n")
+        raise common.StallError(300)
+
+    backend = AiderBackend()
+    with patch.object(common, "run_monitored_subprocess", side_effect=fake_run):
+        result = backend.run_backend(
+            task="hang forever", repo_path=str(git_repo), branch="test-branch",
+            config=BASE_CONFIG, model="ollama/qwen3-coder:30b",
+        )
+
+    assert result.success is False
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=git_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert status.strip() == ""
+    assert not (git_repo / "partial_write.py").exists()
+
+
+def test_run_backend_cleans_up_partial_writes_after_nonzero_exit(git_repo):
+    # Same scenario but for a plain non-zero exit rather than a stall kill.
+    def fake_run(cmd, cwd, stall_timeout_seconds, idle_notify_interval_seconds, on_tick=None):
+        (git_repo / "partial_write.py").write_text("# half-written before crash\n")
+        return subprocess.CompletedProcess(cmd, 1, stdout="aider crashed", stderr="")
+
+    backend = AiderBackend()
+    with patch.object(common, "run_monitored_subprocess", side_effect=fake_run):
+        result = backend.run_backend(
+            task="do something", repo_path=str(git_repo), branch="test-branch",
+            config=BASE_CONFIG, model="ollama/qwen3-coder:30b",
+        )
+
+    assert result.success is False
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=git_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert status.strip() == ""
+    assert not (git_repo / "partial_write.py").exists()
+
+
+def test_run_backend_cleanup_preserves_pre_existing_dirty_state(git_repo):
+    # A file that was already modified/untracked BEFORE this attempt started
+    # must survive cleanup — only changes made during the failed attempt
+    # itself should be discarded.
+    (git_repo / "pre_existing_untracked.txt").write_text("already here before the attempt\n")
+
+    def fake_run(cmd, cwd, stall_timeout_seconds, idle_notify_interval_seconds, on_tick=None):
+        (git_repo / "partial_write.py").write_text("# half-written by killed aider\n")
+        raise common.StallError(300)
+
+    backend = AiderBackend()
+    with patch.object(common, "run_monitored_subprocess", side_effect=fake_run):
+        result = backend.run_backend(
+            task="hang forever", repo_path=str(git_repo), branch="test-branch",
+            config=BASE_CONFIG, model="ollama/qwen3-coder:30b",
+        )
+
+    assert result.success is False
+    assert (git_repo / "pre_existing_untracked.txt").exists()
+    assert not (git_repo / "partial_write.py").exists()
+
+
 def test_run_backend_creates_branch_if_missing(git_repo):
     def fake_run(cmd, cwd, stall_timeout_seconds, idle_notify_interval_seconds, on_tick=None):
         subprocess.run(["git", "commit", "--allow-empty", "-m", "aider commit"], cwd=git_repo, check=True, capture_output=True)

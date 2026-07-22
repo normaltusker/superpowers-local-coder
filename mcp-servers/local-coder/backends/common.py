@@ -67,6 +67,65 @@ def snapshot_working_tree(repo_path: str) -> tuple[str, set[str]]:
     return pre_head, porcelain
 
 
+def restore_working_tree(repo_path: str, pre_head: str, pre_porcelain: set[str]) -> None:
+    """Reset a working tree to its pre-attempt state after a FAILED backend
+    attempt, so the next failover attempt doesn't inherit partial,
+    uncommitted edits the failed attempt may have left on disk (e.g. a
+    backend that writes files before committing, killed mid-way by a stall
+    timeout).
+
+    Only undoes changes attributable to THIS attempt: HEAD is reset back to
+    `pre_head` (a no-op if the attempt never committed, which is the normal
+    case for a failure), and only paths NOT already present in
+    `pre_porcelain` are discarded — anything that was already
+    modified/untracked before the attempt started is left alone rather than
+    being blindly wiped by e.g. an unscoped `git reset --hard`.
+    """
+    current_head = subprocess.run(
+        ["git", "-C", repo_path, "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    if current_head != pre_head:
+        subprocess.run(
+            ["git", "-C", repo_path, "reset", "--mixed", pre_head],
+            check=True, capture_output=True,
+        )
+
+    status = subprocess.run(
+        ["git", "-C", repo_path, "status", "--porcelain"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    current_porcelain = {line for line in status.splitlines() if line.strip()}
+
+    new_entries = current_porcelain - pre_porcelain
+    if not new_entries:
+        return
+
+    # Each porcelain line looks like "XY path" (or "XY orig -> new" for
+    # renames) — extract the path git status reports for the entry so we
+    # can restrict cleanup to exactly those paths.
+    new_paths = []
+    for line in new_entries:
+        path_part = line[3:]
+        if " -> " in path_part:
+            path_part = path_part.split(" -> ", 1)[1]
+        new_paths.append(path_part)
+
+    if not new_paths:
+        return
+
+    # Discard tracked-file modifications introduced by this attempt...
+    subprocess.run(
+        ["git", "-C", repo_path, "checkout", "--", *new_paths],
+        cwd=repo_path, capture_output=True,
+    )
+    # ...and remove any new untracked files/directories this attempt added.
+    subprocess.run(
+        ["git", "-C", repo_path, "clean", "-fd", "--", *new_paths],
+        cwd=repo_path, capture_output=True,
+    )
+
+
 _READ_CHUNK_SIZE = 4096
 
 

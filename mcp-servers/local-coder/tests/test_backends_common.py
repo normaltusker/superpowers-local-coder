@@ -120,6 +120,42 @@ def test_snapshot_working_tree_detects_dirty_state(git_repo):
     assert any("untracked.txt" in line for line in porcelain)
 
 
+def test_restore_working_tree_resets_head_and_discards_new_changes(git_repo):
+    pre_head, pre_porcelain = common.snapshot_working_tree(str(git_repo))
+
+    (git_repo / "new_untracked.py").write_text("# added during attempt\n")
+    subprocess.run(["git", "add", "-A"], cwd=git_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "partial attempt commit"], cwd=git_repo, check=True, capture_output=True)
+
+    common.restore_working_tree(str(git_repo), pre_head, pre_porcelain)
+
+    head_after = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=git_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert head_after == pre_head
+    assert not (git_repo / "new_untracked.py").exists()
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=git_repo,
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert status.strip() == ""
+
+
+def test_restore_working_tree_preserves_pre_existing_changes(git_repo):
+    (git_repo / "already_dirty.txt").write_text("dirty before attempt\n")
+    pre_head, pre_porcelain = common.snapshot_working_tree(str(git_repo))
+    assert pre_porcelain  # sanity: fixture is dirty before the "attempt"
+
+    (git_repo / "new_from_attempt.txt").write_text("added during attempt\n")
+
+    common.restore_working_tree(str(git_repo), pre_head, pre_porcelain)
+
+    assert (git_repo / "already_dirty.txt").exists()
+    assert not (git_repo / "new_from_attempt.txt").exists()
+
+
 def test_run_monitored_subprocess_returns_completed_process_on_success():
     result = common.run_monitored_subprocess(
         ["echo", "hello"], cwd=".",
