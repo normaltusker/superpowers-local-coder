@@ -30,11 +30,10 @@ class ConfigValidationError(Exception):
     pass
 
 
-def _validate_ollama_model(model: str) -> None:
+def _validate_ollama_model(model: str, available: list[str]) -> None:
     if not model.startswith("ollama/"):
         return
     bare_name = model[len("ollama/"):]
-    available = ollama_module.list_ollama_models()
     if bare_name not in available:
         raise ConfigValidationError(
             f"Model '{model}' is not pulled. Available: "
@@ -54,10 +53,17 @@ def configure_with_validation(overrides: dict) -> dict:
     # Validate the merged/effective values, not just what's being overridden.
     # This ensures a config's already-persisted model gets re-checked even
     # when a later configure() call doesn't touch the `model` field itself.
+    # Fetch the ollama model list at most once per call — only if something
+    # actually needs it — rather than once per ollama/-prefixed model.
+    needs_ollama_check = (model and model.startswith("ollama/")) or any(
+        fb.startswith("ollama/") for fb in fallback_models
+    )
+    available = ollama_module.list_ollama_models() if needs_ollama_check else []
+
     if model:
-        _validate_ollama_model(model)
+        _validate_ollama_model(model, available)
     for fb in fallback_models:
-        _validate_ollama_model(fb)
+        _validate_ollama_model(fb, available)
 
     # Check fallback list against cap (using the merged values)
     if len(fallback_models) > max_fallback:
