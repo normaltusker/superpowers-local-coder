@@ -172,6 +172,58 @@ edit directly instead of forcing the process. This is the skill working
 as intended, not a failure — but it means `delegate_implementation` was
 never actually called, so the smoke test still hasn't run.
 
+**Smoke test attempt #2 — IN PROGRESS AS OF THIS UPDATE, looking
+genuinely healthy.** Sent the Quick Reference task from the "next
+action" note. The repo-root session again offered to skip SDD given its
+small size; user confirmed "delegate directly, skip SDD scaffolding" —
+a deliberate, reasonable simplification of the original ask (this is
+functionally still exercising the exact thing item 1 needs to verify:
+`delegate_implementation` really invoking aider against local Ollama —
+just without the full brainstorm→plan→implementer-subagent→reviewer
+ceremony around it, since that ceremony isn't what's in question here).
+The session then: read the current README, confirmed `local-coder` was
+reachable, called `mcp__local-coder__delegate_implementation` with
+`target_repo_path` explicit, and is now waiting on it in the background
+rather than polling.
+
+**Confirmed via `ps aux` from a separate terminal (not the Claude Code
+session itself) that this is REAL, not a stall or hallucinated tool
+call:**
+- `server.py` (the local-coder MCP server) is running as a real
+  background process, PID 79730.
+- It has actually spawned a real `aider` subprocess, PID 86750:
+  `aider --model ollama/qwen3-coder:30b --yes --message "..."`, with the
+  exact synthesized task text (add a "## Local-Coder Quick Reference"
+  section, given verbatim content, restricted to that one file/section).
+- Ollama (`ollama serve`) is running and available to serve the request.
+- As of this check, `mcp-servers/local-coder/README.md` has NOT yet been
+  modified (checked both the repo-root copy and the worktree copy) —
+  aider is still mid-run, not stuck; 30B local models take real wall-clock
+  time for a real inference pass, this is expected, not a hang.
+
+**A browser tab opened to `https://aider.chat/docs/llms/warnings.html`
+during this run — this is normal aider behavior, not an error.** Aider
+ships a `--show-model-warnings` flag (`True` by default, confirmed via
+`aider --help`) that opens this docs page when it wants to flag a
+model/provider quirk for an unfamiliar or unusual model — it is NOT a
+sign delegate_implementation is broken, and does NOT mean aider stopped
+running (the process was still alive and burning CPU when checked).
+
+**If resuming: check `ps aux | grep aider` first.** If the aider PID
+from this note is still running, wait for it — do not re-send the task
+or assume it's stuck. If it's gone, check whether
+`mcp-servers/local-coder/README.md` was modified (`git status` /
+`git diff` in the repo-root checkout, which is where this attempt is
+running, on `dev` directly) — a modified README with no corresponding
+commit likely means aider finished editing but
+`delegate_implementation`'s own auto-commit step hasn't run yet or
+failed; a modified+committed README means it fully succeeded and this
+item can be marked COMPLETE (record the commit SHA, branch, and whether
+a PR was offered); no modification at all with the process gone likely
+means it failed silently and needs investigating fresh (check the
+session's own conversation for the tool result, don't just re-run
+blindly).
+
 **Smoke test attempt #2 — task given, RESULT NOT YET SEEN.** Sent this
 task, asked for it to actually be run in the connected repo-root
 session — **this is the exact next action for whoever resumes**:
