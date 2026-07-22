@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Callable
 
 
 @dataclass
@@ -21,5 +22,6 @@ class BackendAdapter(ABC):
         branch: str,
         config: dict,
         model: str | None = None,
+        on_tick: Callable[[], None] | None = None,
     ) -> CompletionResult:
         ...

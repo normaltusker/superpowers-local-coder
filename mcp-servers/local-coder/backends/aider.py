@@ -1,4 +1,5 @@
 import subprocess
+from typing import Callable
 
 from backends.base import BackendAdapter, CompletionResult
 from backends import common
@@ -14,6 +15,7 @@ class AiderBackend(BackendAdapter):
         branch: str,
         config: dict,
         model: str | None = None,
+        on_tick: Callable[[], None] | None = None,
     ) -> CompletionResult:
         common.ensure_branch(repo_path, branch)
         pre_head, _ = common.snapshot_working_tree(repo_path)
@@ -29,6 +31,7 @@ class AiderBackend(BackendAdapter):
                 cwd=repo_path,
                 stall_timeout_seconds=config["stall_timeout_seconds"],
                 idle_notify_interval_seconds=config["idle_notify_interval_seconds"],
+                on_tick=on_tick,
             )
         except common.StallError as e:
             return CompletionResult(success=False, error=str(e))

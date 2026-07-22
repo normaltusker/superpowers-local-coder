@@ -1,13 +1,20 @@
 import subprocess
 import shutil
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import pytest
 
 import server
 import config as config_module
 from backends.base import CompletionResult
+
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
 
 
 @pytest.fixture
@@ -49,16 +56,16 @@ def git_repo_no_remote(tmp_path):
     return repo
 
 
-def test_delegate_implementation_missing_repo_path_returns_error(isolated_config):
-    result = server._delegate_implementation_impl(task="do something", branch="test-branch", target_repo_path=None)
+async def test_delegate_implementation_missing_repo_path_returns_error(isolated_config):
+    result = await server._delegate_implementation_impl(task="do something", branch="test-branch", target_repo_path=None)
     assert result["success"] is False
     assert "target_repo_path" in result["error"]
 
 
-def test_delegate_implementation_success_no_remote(isolated_config, git_repo_no_remote):
+async def test_delegate_implementation_success_no_remote(isolated_config, git_repo_no_remote):
     fake_result = CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
     with patch("backends.aider.AiderBackend.run_backend", return_value=fake_result):
-        result = server._delegate_implementation_impl(
+        result = await server._delegate_implementation_impl(
             task="add a.py", branch="feature-branch",
             target_repo_path=str(git_repo_no_remote),
         )
@@ -69,7 +76,7 @@ def test_delegate_implementation_success_no_remote(isolated_config, git_repo_no_
     assert result["model_used"] == "ollama/qwen3-coder:30b"
 
 
-def test_delegate_implementation_pushes_when_remote_exists(isolated_config, git_repo_with_remote):
+async def test_delegate_implementation_pushes_when_remote_exists(isolated_config, git_repo_with_remote):
     # AiderBackend.run_backend is mocked out below, so it never performs its
     # real side effect of creating/checking out the target branch (see
     # backends.common.ensure_branch). Create it here so the branch exists
@@ -81,7 +88,7 @@ def test_delegate_implementation_pushes_when_remote_exists(isolated_config, git_
     fake_result = CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
     with patch("backends.aider.AiderBackend.run_backend", return_value=fake_result):
         with patch("subprocess.run", wraps=subprocess.run) as spy:
-            result = server._delegate_implementation_impl(
+            result = await server._delegate_implementation_impl(
                 task="add a.py", branch="feature-branch",
                 target_repo_path=str(git_repo_with_remote),
             )
@@ -91,7 +98,7 @@ def test_delegate_implementation_pushes_when_remote_exists(isolated_config, git_
     assert len(push_calls) >= 1
 
 
-def test_delegate_implementation_failover_to_second_model(isolated_config, git_repo_no_remote):
+async def test_delegate_implementation_failover_to_second_model(isolated_config, git_repo_no_remote):
     config_module.merge_config({"fallback_models": ["ollama/qwen2.5-coder:14b"]})
     fail_result = CompletionResult(success=False, error="stalled: no output for 300s")
     success_result = CompletionResult(success=True, files_changed=["a.py"], commit_sha="def456")
@@ -100,7 +107,7 @@ def test_delegate_implementation_failover_to_second_model(isolated_config, git_r
         "backends.aider.AiderBackend.run_backend",
         side_effect=[fail_result, success_result],
     ):
-        result = server._delegate_implementation_impl(
+        result = await server._delegate_implementation_impl(
             task="add a.py", branch="feature-branch",
             target_repo_path=str(git_repo_no_remote),
         )
@@ -109,12 +116,12 @@ def test_delegate_implementation_failover_to_second_model(isolated_config, git_r
     assert result["model_used"] == "ollama/qwen2.5-coder:14b"
 
 
-def test_delegate_implementation_all_models_fail(isolated_config, git_repo_no_remote):
+async def test_delegate_implementation_all_models_fail(isolated_config, git_repo_no_remote):
     config_module.merge_config({"fallback_models": ["ollama/qwen2.5-coder:14b"]})
     fail_result = CompletionResult(success=False, error="aider made no commits")
 
     with patch("backends.aider.AiderBackend.run_backend", return_value=fail_result):
-        result = server._delegate_implementation_impl(
+        result = await server._delegate_implementation_impl(
             task="add a.py", branch="feature-branch",
             target_repo_path=str(git_repo_no_remote),
         )
@@ -124,14 +131,69 @@ def test_delegate_implementation_all_models_fail(isolated_config, git_repo_no_re
     assert "ollama/qwen2.5-coder:14b" in result["error"]
 
 
-def test_delegate_implementation_unimplemented_backend_returns_clean_error(isolated_config, git_repo_no_remote):
+async def test_delegate_implementation_unimplemented_backend_returns_clean_error(isolated_config, git_repo_no_remote):
     config_module.merge_config({"backend": "codex"})
-    result = server._delegate_implementation_impl(
+    result = await server._delegate_implementation_impl(
         task="add a.py", branch="feature-branch",
         target_repo_path=str(git_repo_no_remote),
     )
     assert result["success"] is False
     assert "not yet implemented" in result["error"]
+
+
+async def test_delegate_implementation_on_tick_reports_progress_via_ctx(isolated_config, git_repo_no_remote):
+    captured_on_tick = {}
+
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None):
+        captured_on_tick["on_tick"] = on_tick
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    mock_ctx = MagicMock()
+    mock_ctx.report_progress = MagicMock()
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        with patch("anyio.from_thread.run") as mock_from_thread_run:
+            result = await server._delegate_implementation_impl(
+                task="add a.py", branch="feature-branch",
+                target_repo_path=str(git_repo_no_remote),
+                ctx=mock_ctx,
+            )
+
+            assert result["success"] is True
+            on_tick = captured_on_tick["on_tick"]
+            assert on_tick is not None
+
+            # Invoke the captured on_tick as run_monitored_subprocess would,
+            # and confirm it bridges to ctx.report_progress via
+            # anyio.from_thread.run (mocked here so this test doesn't depend
+            # on real thread-bridging machinery — it verifies the wiring,
+            # not anyio itself).
+            on_tick()
+            assert mock_from_thread_run.called
+            args = mock_from_thread_run.call_args.args
+            assert args[0] == mock_ctx.report_progress
+
+
+async def test_delegate_implementation_on_tick_logs_to_stderr_without_ctx(isolated_config, git_repo_no_remote, capsys):
+    captured_on_tick = {}
+
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None):
+        captured_on_tick["on_tick"] = on_tick
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        result = await server._delegate_implementation_impl(
+            task="add a.py", branch="feature-branch",
+            target_repo_path=str(git_repo_no_remote),
+            ctx=None,
+        )
+
+    assert result["success"] is True
+    on_tick = captured_on_tick["on_tick"]
+    on_tick()
+
+    captured = capsys.readouterr()
+    assert "still running" in captured.err
 
 
 def test_configure_returns_full_config(isolated_config):

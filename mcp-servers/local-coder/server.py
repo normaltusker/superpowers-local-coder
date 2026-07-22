@@ -1,6 +1,8 @@
 import subprocess
+import sys
 
-from fastmcp import FastMCP
+import anyio
+from fastmcp import Context, FastMCP
 
 import config as config_module
 from backends.aider import AiderBackend
@@ -34,8 +36,9 @@ def _has_open_pr(repo_path: str, branch: str) -> bool:
     return result.returncode == 0
 
 
-def _delegate_implementation_impl(
-    task: str, branch: str, target_repo_path: str | None = None
+async def _delegate_implementation_impl(
+    task: str, branch: str, target_repo_path: str | None = None,
+    ctx: Context | None = None,
 ) -> dict:
     cfg = config_module.load_config()
     repo_path = target_repo_path or cfg.get("target_repo_path")
@@ -51,9 +54,22 @@ def _delegate_implementation_impl(
     attempt_models = [cfg["model"], *cfg.get("fallback_models", [])]
     attempt_errors = []
 
+    def make_on_tick(model_name: str):
+        def on_tick():
+            print(f"[local-coder] still running ({model_name})...", file=sys.stderr, flush=True)
+            if ctx is not None:
+                anyio.from_thread.run(
+                    ctx.report_progress, 0, None, f"Running {model_name}..."
+                )
+        return on_tick
+
     for model in attempt_models:
         try:
-            result = backend.run_backend(task, repo_path, branch, cfg, model=model)
+            result = await anyio.to_thread.run_sync(
+                lambda model=model: backend.run_backend(
+                    task, repo_path, branch, cfg, model=model, on_tick=make_on_tick(model)
+                )
+            )
         except NotImplementedError as e:
             return {"success": False, "error": str(e)}
 
@@ -140,10 +156,10 @@ def _list_available_models_impl() -> dict:
 
 
 @mcp.tool()
-def delegate_implementation(
-    task: str, branch: str, target_repo_path: str | None = None
+async def delegate_implementation(
+    task: str, branch: str, ctx: Context, target_repo_path: str | None = None,
 ) -> dict:
-    return _delegate_implementation_impl(task, branch, target_repo_path)
+    return await _delegate_implementation_impl(task, branch, target_repo_path, ctx=ctx)
 
 
 @mcp.tool()

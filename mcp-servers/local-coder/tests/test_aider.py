@@ -93,6 +93,29 @@ def test_run_backend_failure_on_stall(git_repo):
     assert "stalled" in result.error
 
 
+def test_run_backend_forwards_on_tick_to_run_monitored_subprocess(git_repo):
+    captured = {}
+
+    def fake_run(cmd, cwd, stall_timeout_seconds, idle_notify_interval_seconds, on_tick=None):
+        captured["on_tick"] = on_tick
+        (git_repo / "new_file.py").write_text("# new\n")
+        subprocess.run(["git", "add", "new_file.py"], cwd=git_repo, check=True)
+        subprocess.run(["git", "commit", "-m", "aider commit"], cwd=git_repo, check=True, capture_output=True)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    def my_on_tick():
+        pass
+
+    backend = AiderBackend()
+    with patch.object(common, "run_monitored_subprocess", side_effect=fake_run):
+        backend.run_backend(
+            task="add a file", repo_path=str(git_repo), branch="test-branch",
+            config=BASE_CONFIG, model="ollama/qwen3-coder:30b", on_tick=my_on_tick,
+        )
+
+    assert captured["on_tick"] is my_on_tick
+
+
 def test_run_backend_creates_branch_if_missing(git_repo):
     def fake_run(cmd, cwd, stall_timeout_seconds, idle_notify_interval_seconds, on_tick=None):
         subprocess.run(["git", "commit", "--allow-empty", "-m", "aider commit"], cwd=git_repo, check=True, capture_output=True)
