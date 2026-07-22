@@ -240,6 +240,34 @@ async def test_delegate_implementation_generic_exception_all_models_returns_clea
     assert "boom" in result["error"]
 
 
+async def test_delegate_implementation_push_timeout_returns_clean_error(isolated_config, git_repo_with_remote):
+    subprocess.run(
+        ["git", "-C", str(git_repo_with_remote), "checkout", "-b", "feature-branch"],
+        check=True, capture_output=True,
+    )
+    fake_result = CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    real_run = subprocess.run
+
+    def fake_subprocess_run(cmd, *args, **kwargs):
+        if "push" in cmd:
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 30))
+        return real_run(cmd, *args, **kwargs)
+
+    with patch("backends.aider.AiderBackend.run_backend", return_value=fake_result):
+        with patch("subprocess.run", side_effect=fake_subprocess_run):
+            result = await server._delegate_implementation_impl(
+                task="add a.py", branch="feature-branch",
+                target_repo_path=str(git_repo_with_remote),
+            )
+
+    assert result["success"] is False
+    assert "timed out" in result["error"].lower() or "timeout" in result["error"].lower()
+    # the commit still exists locally even though the push timed out
+    assert result["commit_sha"] == "abc123"
+    assert result["files_changed"] == ["a.py"]
+
+
 async def test_delegate_implementation_push_failure_includes_evidence(isolated_config, git_repo_with_remote):
     subprocess.run(
         ["git", "-C", str(git_repo_with_remote), "checkout", "-b", "feature-branch"],
@@ -268,6 +296,90 @@ async def test_delegate_implementation_push_failure_includes_evidence(isolated_c
     assert result["model_used"] == "ollama/qwen3-coder:30b"
 
 
+def test_has_open_pr_returns_false_for_clean_no_pr_case():
+    fake_result = MagicMock(returncode=1, stdout="", stderr='no pull requests found for branch "feature-x"\n')
+    with patch("subprocess.run", return_value=fake_result):
+        assert server._has_open_pr("/some/repo", "feature-x") is False
+
+
+def test_has_open_pr_returns_true_when_pr_exists():
+    fake_result = MagicMock(returncode=0, stdout="https://github.com/org/repo/pull/1\n", stderr="")
+    with patch("subprocess.run", return_value=fake_result):
+        assert server._has_open_pr("/some/repo", "feature-x") is True
+
+
+def test_has_open_pr_raises_on_ambiguous_gh_failure():
+    # A non-zero exit whose stderr does NOT indicate "no PR" (e.g. an auth
+    # failure or network error) must not be silently treated as "no PR" —
+    # that could trigger an unwanted `gh pr create` and either mask a real
+    # `gh` problem or create a duplicate PR.
+    fake_result = MagicMock(returncode=1, stdout="", stderr="error connecting to api.github.com\n")
+    with patch("subprocess.run", return_value=fake_result):
+        with pytest.raises(server.GhPrStatusUnknown):
+            server._has_open_pr("/some/repo", "feature-x")
+
+
+async def test_delegate_implementation_ambiguous_pr_status_skips_pr_create_with_note(isolated_config, git_repo_with_remote):
+    subprocess.run(
+        ["git", "-C", str(git_repo_with_remote), "checkout", "-b", "feature-branch"],
+        check=True, capture_output=True,
+    )
+    config_module.merge_config({"open_pr": True})
+    fake_result = CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    real_run = subprocess.run
+
+    def fake_subprocess_run(cmd, *args, **kwargs):
+        if "gh" in cmd and "view" in cmd:
+            return MagicMock(returncode=1, stdout="", stderr="error connecting to api.github.com\n")
+        if "gh" in cmd and "create" in cmd:
+            raise AssertionError("gh pr create should not be attempted when PR status is ambiguous")
+        return real_run(cmd, *args, **kwargs)
+
+    with patch("backends.aider.AiderBackend.run_backend", return_value=fake_result):
+        with patch("subprocess.run", side_effect=fake_subprocess_run):
+            result = await server._delegate_implementation_impl(
+                task="add a.py", branch="feature-branch",
+                target_repo_path=str(git_repo_with_remote),
+            )
+
+    assert result["success"] is True
+    assert result["pr_url"] is None
+    assert "note" in result
+    assert "PR status" in result["note"] or "pr status" in result["note"].lower()
+
+
+async def test_delegate_implementation_pr_create_failure_reported_as_note_not_silent(isolated_config, git_repo_with_remote):
+    subprocess.run(
+        ["git", "-C", str(git_repo_with_remote), "checkout", "-b", "feature-branch"],
+        check=True, capture_output=True,
+    )
+    config_module.merge_config({"open_pr": True})
+    fake_result = CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    real_run = subprocess.run
+
+    def fake_subprocess_run(cmd, *args, **kwargs):
+        if "gh" in cmd and "view" in cmd:
+            return MagicMock(returncode=1, stdout="", stderr='no pull requests found for branch "feature-branch"\n')
+        if "gh" in cmd and "create" in cmd:
+            return MagicMock(returncode=1, stdout="", stderr="pull request create failed: already exists")
+        return real_run(cmd, *args, **kwargs)
+
+    with patch("backends.aider.AiderBackend.run_backend", return_value=fake_result):
+        with patch("subprocess.run", side_effect=fake_subprocess_run):
+            result = await server._delegate_implementation_impl(
+                task="add a.py", branch="feature-branch",
+                target_repo_path=str(git_repo_with_remote),
+            )
+
+    assert result["success"] is True
+    assert result["pr_url"] is None
+    assert "note" in result
+    assert "PR creation" in result["note"]
+    assert "already exists" in result["note"]
+
+
 def test_configure_returns_full_config(isolated_config):
     with patch("ollama.list_ollama_models", return_value=["qwen2.5-coder:14b"]):
         result = server._configure_impl(model="ollama/qwen2.5-coder:14b")
@@ -280,6 +392,15 @@ def test_configure_rejects_invalid_model_with_clean_error(isolated_config):
         result = server._configure_impl(model="ollama/nonexistent:1b")
     assert result["success"] is False
     assert "error" in result
+
+
+def test_configure_returns_structured_error_when_ollama_unavailable(isolated_config):
+    from ollama import OllamaUnavailableError
+    with patch("ollama.list_ollama_models", side_effect=OllamaUnavailableError("ollama is not on PATH")):
+        result = server._configure_impl(model="ollama/some-model:1b")
+    assert result["success"] is False
+    assert "error" in result
+    assert "ollama" in result["error"].lower()
 
 
 def test_list_available_models_returns_prefixed_list(isolated_config):
