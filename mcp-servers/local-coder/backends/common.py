@@ -150,7 +150,20 @@ def restore_working_tree(repo_path: str, pre_head: str, pre_porcelain: set[str])
     Only undoes changes attributable to THIS attempt — anything already
     present in `pre_porcelain` (modified, staged, or untracked before the
     attempt started) is left completely alone, including its staged
-    state. This function does NOT run a blanket `git reset --mixed`: an
+    state. This is intentional and has a known, accepted edge: a path
+    that was ALREADY dirty before the attempt started, which the attempt
+    then modifies FURTHER, is not cleaned — the attempt's changes on top
+    of the user's pre-existing edit survive. Distinguishing "the user's
+    prior edit" from "the attempt's edit on the same path" would require
+    a per-path content snapshot (e.g. blob hashes), not just a path set;
+    this function only tracks which paths were dirty, not their content,
+    so it cannot make that distinction. This is a pre-existing limitation
+    of every version of this function, not something this design changed
+    — the earlier blanket-reset version had the same gap, plus it also
+    destroyed unrelated pre-existing staged work in the process (see
+    below), which this version no longer does.
+
+    This function does NOT run a blanket `git reset --mixed`: an
     earlier version did, to handle the case of a failed attempt leaving
     staged-but-uncommitted corruption, but a blanket reset unstages
     EVERY staged path in the index, not just the ones this attempt
