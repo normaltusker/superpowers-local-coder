@@ -1,5 +1,6 @@
 import subprocess
 import sys
+from pathlib import Path
 
 import anyio
 from fastmcp import Context, FastMCP
@@ -19,6 +20,17 @@ mcp = FastMCP("local-coder")
 # to not false-positive on a slow connection, bounded enough to actually
 # protect against a true hang.
 NETWORK_SUBPROCESS_TIMEOUT_SECONDS = 45
+
+# A delegated backend's live output is also written here, in addition to
+# this server's own stderr. Claude Code pipes an MCP server's stdout/
+# stderr over an internal socket it owns, with no reliable external tap
+# point (confirmed: neither `claude --debug-file` nor any
+# filesystem-visible fd surfaces it) — a plain file, written directly by
+# this process, is the only way to guarantee `tail -f` shows a delegated
+# attempt's real output live, regardless of how the parent process pipes
+# stderr. Fixed path (not per-run) so a human always knows where to look
+# without having to first ask the running call for a path.
+OUTPUT_LOG_PATH = Path(__file__).parent / "local-coder-output.log"
 
 BACKENDS = {
     "aider": AiderBackend,
@@ -66,6 +78,12 @@ async def _delegate_implementation_impl(
     task: str, branch: str, target_repo_path: str | None = None,
     ctx: Context | None = None,
 ) -> dict:
+    # Truncate at the start of every call, not just append forever — this
+    # is a fixed path reused across the server's whole lifetime, so
+    # without truncation a human tailing it during a new call would see
+    # stale output mixed in from a prior, unrelated attempt.
+    OUTPUT_LOG_PATH.write_text("")
+
     try:
         validate_branch_name(branch)
     except ValueError as e:
@@ -109,14 +127,20 @@ async def _delegate_implementation_impl(
 
     def make_on_output(model_name: str):
         # Streams the backend subprocess's actual output (e.g. aider's own
-        # live progress/diff/commit messages) to this server's own stderr
-        # as it arrives, rather than only the bounded tail surfaced in an
-        # error message after the whole call finishes. Without this, a
-        # long-running delegated attempt is effectively headless — nothing
-        # about what the backend is actually doing is visible until it's
-        # already done (or already failed).
+        # live progress/diff/commit messages) as it arrives, rather than
+        # only the bounded tail surfaced in an error message after the
+        # whole call finishes. Without this, a long-running delegated
+        # attempt is effectively headless — nothing about what the backend
+        # is actually doing is visible until it's already done (or already
+        # failed). Written to BOTH stderr (in case some setup does capture
+        # it) and OUTPUT_LOG_PATH (the guaranteed-visible path — see that
+        # constant's comment for why a log file, not just stderr, is
+        # needed).
         def on_output(chunk: str):
-            print(f"[local-coder:{model_name}] {chunk}", end="", file=sys.stderr, flush=True)
+            line = f"[local-coder:{model_name}] {chunk}"
+            print(line, end="", file=sys.stderr, flush=True)
+            with open(OUTPUT_LOG_PATH, "a") as f:
+                f.write(chunk)
         return on_output
 
     for model in attempt_models:

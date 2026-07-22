@@ -229,6 +229,95 @@ async def test_delegate_implementation_on_tick_logs_to_stderr_without_ctx(isolat
     assert "still running" in captured.err
 
 
+async def test_delegate_implementation_on_output_writes_to_log_file(
+    isolated_config, git_repo_no_remote, tmp_path, monkeypatch
+):
+    # Claude Code pipes an MCP server's stdout/stderr over an internal
+    # socket it owns — there is no reliable external tap point (confirmed:
+    # neither `--debug-file` nor any filesystem-visible fd shows this
+    # output). A plain log FILE, written directly by this server process,
+    # is the only way to guarantee a human can `tail -f` a delegated
+    # backend's real output regardless of how the parent process pipes
+    # stderr.
+    log_path = tmp_path / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", log_path)
+
+    captured_on_output = {}
+
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+        captured_on_output["on_output"] = on_output
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        result = await server._delegate_implementation_impl(
+            task="add a.py", branch="feature-branch",
+            target_repo_path=str(git_repo_no_remote),
+            ctx=None,
+        )
+
+    assert result["success"] is True
+    on_output = captured_on_output["on_output"]
+    on_output("hello from aider\n")
+    on_output("more output\n")
+
+    assert log_path.read_text() == "hello from aider\nmore output\n"
+
+
+async def test_delegate_implementation_on_output_still_writes_to_stderr(
+    isolated_config, git_repo_no_remote, tmp_path, monkeypatch, capsys
+):
+    # The stderr stream stays in place alongside the log file — some
+    # setups may capture it even if this one doesn't, and removing it
+    # would be a pure regression for no benefit.
+    log_path = tmp_path / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", log_path)
+
+    captured_on_output = {}
+
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+        captured_on_output["on_output"] = on_output
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        await server._delegate_implementation_impl(
+            task="add a.py", branch="feature-branch",
+            target_repo_path=str(git_repo_no_remote),
+            ctx=None,
+        )
+
+    on_output = captured_on_output["on_output"]
+    on_output("hello from aider\n")
+
+    captured = capsys.readouterr()
+    assert "hello from aider" in captured.err
+
+
+async def test_delegate_implementation_truncates_output_log_at_call_start(
+    isolated_config, git_repo_no_remote, tmp_path, monkeypatch
+):
+    # OUTPUT_LOG_PATH is a fixed path reused across every
+    # delegate_implementation call on this server's lifetime. Without
+    # truncation, `tail -f`-ing it during a new call would show stale
+    # output mixed in from a previous, unrelated attempt — confusing at
+    # best, actively misleading at worst (e.g. thinking the current
+    # attempt already produced output it hasn't yet).
+    log_path = tmp_path / "local-coder-output.log"
+    log_path.write_text("stale output from a previous call\n")
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", log_path)
+
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        await server._delegate_implementation_impl(
+            task="add a.py", branch="feature-branch",
+            target_repo_path=str(git_repo_no_remote),
+            ctx=None,
+        )
+
+    assert "stale output from a previous call" not in log_path.read_text()
+
+
 async def test_delegate_implementation_rejects_invalid_branch_name(isolated_config, git_repo_no_remote):
     with patch("subprocess.run") as mock_run:
         result = await server._delegate_implementation_impl(
