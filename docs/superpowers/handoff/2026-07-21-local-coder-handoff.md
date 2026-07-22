@@ -11,19 +11,20 @@ session end — a stale handoff is worse than none.
 implementation plan via `superpowers:subagent-driven-development`,
 task-by-task.** Check the progress ledger (see below) for exactly which
 tasks are done — trust it and `git log` over this prose if they conflict.
-**ALL 9 PLAN TASKS + THE TASK 6.5 ADDENDUM ARE COMPLETE AND REVIEWED
-CLEAN.** Task 9 (verification-only, no code) also done — 43/43 full
-suite passing, no stray `general-purpose` references, fork-divergence
-markers confirmed in both rewired skill files. **Currently: the final
-whole-branch code review is dispatched (on the most capable model), per
-`subagent-driven-development`'s process — this is the last gate before
-`finishing-a-development-branch`.** If resuming and this review hasn't
-completed yet, check for its result before doing anything else; if it
-already completed with findings, those need a fix round + re-review
-before merge. If it came back clean, the next and final step is inviting
-`superpowers:finishing-a-development-branch` to decide how this branch
-gets proposed for merge (a new PR from `local-coder-impl` into `dev`, most
-likely — no PR exists for this branch yet).
+**ALL 9 PLAN TASKS + THE TASK 6.5 ADDENDUM ARE COMPLETE AND MERGE-READY.**
+The final whole-branch review (most capable model) came back "Ready to
+merge: With fixes" — 1 Important (anyio not an explicit `requirements.txt`
+dependency, worked only transitively via fastmcp) + 2 Minor (missing
+`__pycache__` gitignore entry, spec/impl `.mcp.json` example drift). One
+fix dispatch (commit `b918a7d`) resolved all three; a second, independent
+confirmatory review empirically re-verified each fix (actually ran the
+suite, actually checked `git status`, didn't just trust the fix report)
+and returned **"Ready to merge: Yes."** 43/43 tests passing throughout.
+**Currently: about to invoke `superpowers:finishing-a-development-branch`**
+to decide how this branch gets proposed for merge (a new PR from
+`local-coder-impl` into `dev`, most likely — no PR exists for this branch
+yet). If resuming and this hasn't happened yet, that's the very next step
+— no more implementation or review work remains before it.
 
 **Plan file note:** `docs/superpowers/plans/2026-07-21-local-coder-phase1.md`
 now has a "Task 6.5" section inserted between Task 6 and Task 7 — this
