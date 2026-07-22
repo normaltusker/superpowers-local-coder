@@ -57,18 +57,41 @@ corrected in a follow-up round: `stall_timeout_seconds`/
 `idle_notify_interval_seconds` now validated as strictly positive,
 unbounded subprocess-output memory accumulation now bounded to a tail
 buffer, and the implementer-prompt.md's "what to do when verification
-finds a gap" instruction gap fixed. **92/92 tests passing** (up from 43 at
-merge-ready, 55 after CodeRabbit, 87 after the first cubic batch).
+finds a gap" instruction gap fixed. **92/92 tests passing** at that point
+(up from 43 at merge-ready, 55 after CodeRabbit, 87 after the first cubic
+batch).
 
-**Current state: PR #2 is open. 49 of 54 total review threads resolved;
-5 left open intentionally** (the acknowledge-only scope findings above —
-do not resolve these without the repo owner's say-so, they represent open
-design questions, not defects). If resuming: check `gh pr view 2 --repo
-normaltusker/superpowers-local-coder` for any NEW review activity since
-this handoff was written before assuming there's nothing left to do —
-CI/review bots may have posted more since. If truly nothing new beyond
-the 5 intentionally-open threads, this work is done; merging the PR is
-the human's call, not something to do unprompted.
+**A follow-up cubic-dev-ai pass then found 2 more real bugs in
+`restore_working_tree`** (the working-tree-cleanup function added during
+the first cubic round): (P1) `git checkout -- <tracked> <untracked>`
+fails ENTIRELY when any untracked path is included — the whole command
+aborts before touching tracked paths, so a failed attempt's tracked-file
+corruption silently survived cleanup whenever the attempt also created a
+new file (the normal case). (P2) default `git status --porcelain`
+quotes filenames with spaces/special chars, so cleanup silently failed
+to match such files. **Both verified via manual repro before fixing, not
+just trusted from the finding text.** Fixed by switching to
+`-z`-delimited status parsing and splitting checkout/clean into two
+independent commands. **While verifying this fix, a dedicated reviewer
+found a THIRD, pre-existing bug in the same function** (not from any
+review-bot finding): staged-but-uncommitted edits weren't reverted either
+(`checkout --` restores from the index, and the old `reset --mixed` was
+conditional on HEAD having moved) — this directly undermines the exact
+scenario the function's own docstring names (a stall-kill mid-attempt).
+Fixed with an unconditional `reset --mixed` before cleanup, verified with
+its own repro (reproduced the exact corruption pre-fix, confirmed closed
+post-fix). **95/95 tests passing now.**
+
+**Current state: PR #2 is open. 51 of 56 total review threads resolved;
+5 left open intentionally** (the acknowledge-only scope findings from the
+first cubic round — do not resolve these without the repo owner's
+say-so, they represent open design questions, not defects). If resuming:
+check `gh pr view 2 --repo normaltusker/superpowers-local-coder` for any
+NEW review activity since this handoff was written before assuming
+there's nothing left to do — CI/review bots may have posted more since.
+If truly nothing new beyond the 5 intentionally-open threads, this work
+is done; merging the PR is the human's call, not something to do
+unprompted.
 
 **Plan file note:** `docs/superpowers/plans/2026-07-21-local-coder-phase1.md`
 now has a "Task 6.5" section inserted between Task 6 and Task 7 — this
