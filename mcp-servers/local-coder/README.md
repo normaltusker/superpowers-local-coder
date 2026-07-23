@@ -65,7 +65,10 @@ is truncated to the last 20,000 characters, so for a long or chatty run
 it is the recent output, not the entire backend transcript. No extra
 steps are needed to see what the backend is doing.
 
-For deep debugging, the raw backend output is also written to
-`mcp-servers/local-coder/local-coder-output.log` (truncated at the start
-of each call). Tailing that file is a power-user convenience, not the
-normal way to follow a run.
+For deep debugging, the raw backend output is also written to a per-call
+log file next to the server
+(`mcp-servers/local-coder/local-coder-output-<pid>-<id>.log`). The exact
+path for a given call is returned in the tool result as `output_log`, so
+you can `tail -f` it if you want the raw stream. Each call gets its own
+file so concurrent delegations never clobber each other's log. Tailing it
+is a power-user convenience, not the normal way to follow a run.

@@ -14,4 +14,4 @@ __pycache__/
 evals/
 mcp-servers/local-coder/.venv/
 mcp-servers/local-coder/.config.yaml.lock
-mcp-servers/local-coder/local-coder-output.log
+mcp-servers/local-coder/local-coder-output*.log

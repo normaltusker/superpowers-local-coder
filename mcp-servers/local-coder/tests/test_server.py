@@ -368,11 +368,13 @@ async def test_delegate_implementation_on_output_writes_to_log_file(
         )
 
     assert result["success"] is True
+    # The concrete per-call log path is surfaced in the result dict.
+    per_call_log = Path(result["output_log"])
     on_output = captured_on_output["on_output"]
     on_output("hello from aider\n")
     on_output("more output\n")
 
-    assert log_path.read_text() == "hello from aider\nmore output\n"
+    assert per_call_log.read_text() == "hello from aider\nmore output\n"
 
 
 async def test_delegate_implementation_on_output_still_writes_to_stderr(
@@ -404,30 +406,37 @@ async def test_delegate_implementation_on_output_still_writes_to_stderr(
     assert "hello from aider" in captured.err
 
 
-async def test_delegate_implementation_truncates_output_log_at_call_start(
+async def test_each_call_uses_a_unique_output_log_path(
     isolated_config, git_repo_no_remote, tmp_path, monkeypatch
 ):
-    # OUTPUT_LOG_PATH is a fixed path reused across every
-    # delegate_implementation call on this server's lifetime. Without
-    # truncation, `tail -f`-ing it during a new call would show stale
-    # output mixed in from a previous, unrelated attempt — confusing at
-    # best, actively misleading at worst (e.g. thinking the current
-    # attempt already produced output it hasn't yet).
-    log_path = tmp_path / "local-coder-output.log"
-    log_path.write_text("stale output from a previous call\n")
-    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", log_path)
+    # Two overlapping delegate_implementation calls must NOT share one log
+    # file — otherwise the second call would clobber the first's active
+    # log and their output would interleave. Each call computes a unique
+    # per-call path (derived from OUTPUT_LOG_PATH) and returns it as
+    # `output_log`. Two calls must therefore report different paths, and
+    # each reported path must be a real sibling of the base path (so
+    # concurrent runs never collide).
+    base = tmp_path / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", base)
 
     def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
     with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
-        await server._delegate_implementation_impl(
+        r1 = await server._delegate_implementation_impl(
             task="add a.py", branch="feature-branch",
-            target_repo_path=str(git_repo_no_remote),
-            ctx=None,
+            target_repo_path=str(git_repo_no_remote), ctx=None,
+        )
+        r2 = await server._delegate_implementation_impl(
+            task="add b.py", branch="feature-branch",
+            target_repo_path=str(git_repo_no_remote), ctx=None,
         )
 
-    assert "stale output from a previous call" not in log_path.read_text()
+    assert r1["output_log"] != r2["output_log"]
+    # Each is a sibling of the base path (same directory), not the base itself.
+    assert Path(r1["output_log"]).parent == base.parent
+    assert Path(r1["output_log"]) != base
+    assert Path(r2["output_log"]) != base
 
 
 async def test_on_output_log_write_failure_does_not_abort_the_attempt(

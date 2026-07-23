@@ -1,5 +1,7 @@
+import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 import anyio
@@ -28,9 +30,24 @@ NETWORK_SUBPROCESS_TIMEOUT_SECONDS = 45
 # filesystem-visible fd surfaces it) — a plain file, written directly by
 # this process, is the only way to guarantee `tail -f` shows a delegated
 # attempt's real output live, regardless of how the parent process pipes
-# stderr. Fixed path (not per-run) so a human always knows where to look
-# without having to first ask the running call for a path.
+# stderr.
+#
+# This is the BASE path. Each delegate_implementation call computes a
+# UNIQUE per-call file next to it (see _make_output_log_path) — two
+# overlapping calls must not share one file, or the second call's
+# start-of-call truncation would wipe the first's active log and their
+# output would interleave. The concrete per-call path is returned in the
+# result dict (`output_log`) so a human knows which file to tail.
 OUTPUT_LOG_PATH = Path(__file__).parent / "local-coder-output.log"
+
+
+def _make_output_log_path() -> Path:
+    """A unique per-call log file next to OUTPUT_LOG_PATH, so concurrent
+    delegate_implementation calls never share (and corrupt) one file."""
+    unique = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    return OUTPUT_LOG_PATH.with_name(
+        f"{OUTPUT_LOG_PATH.stem}-{unique}{OUTPUT_LOG_PATH.suffix}"
+    )
 
 BACKENDS = {
     "aider": AiderBackend,
@@ -78,20 +95,12 @@ async def _delegate_implementation_impl(
     task: str, branch: str, target_repo_path: str | None = None,
     ctx: Context | None = None,
 ) -> dict:
-    # Truncate at the start of every call, not just append forever — this
-    # is a fixed path reused across the server's whole lifetime, so
-    # without truncation a human tailing it during a new call would see
-    # stale output mixed in from a prior, unrelated attempt. Best-effort:
-    # the log file is a debugging convenience, so a truncation failure
-    # (bad path, permission, disk full) must never abort the whole
-    # delegation before the backend even runs — warn and continue.
-    try:
-        OUTPUT_LOG_PATH.write_text("")
-    except OSError as e:
-        print(
-            f"[local-coder] warning: failed to truncate output log: {e}",
-            file=sys.stderr, flush=True,
-        )
+    # Unique per-call log file so two overlapping calls never share (and
+    # corrupt) one file. Because it's fresh per call, there is no stale
+    # prior-call content to truncate — the file simply gets created on
+    # first write. The path is surfaced in the result dict below so a
+    # human knows which file to tail.
+    output_log_path = _make_output_log_path()
 
     try:
         validate_branch_name(branch)
@@ -152,10 +161,10 @@ async def _delegate_implementation_impl(
 
     def make_on_output(model_name: str):
         # Streams the backend subprocess's actual output as it arrives, to
-        # BOTH stderr and OUTPUT_LOG_PATH (see that constant's comment), and
-        # records the latest non-empty line so the on_tick pulse above can
-        # surface it in-chat. Kept throttled to the tick cadence — the tick
-        # is what emits to report_progress; this callback only records.
+        # BOTH stderr and the per-call output_log_path, and records the
+        # latest complete line so the on_tick pulse above can surface it
+        # in-chat. Kept throttled to the tick cadence — the tick is what
+        # emits to report_progress; this callback only records.
         def on_output(chunk: str) -> None:
             line = f"[local-coder:{model_name}] {chunk}"
             print(line, end="", file=sys.stderr, flush=True)
@@ -169,7 +178,7 @@ async def _delegate_implementation_impl(
             # and leave partial backend writes to pollute the next fallback
             # attempt. Swallow it, warn, and keep the real attempt running.
             try:
-                with open(OUTPUT_LOG_PATH, "a") as f:
+                with open(output_log_path, "a") as f:
                     f.write(chunk)
             except OSError as e:
                 print(
@@ -241,6 +250,7 @@ async def _delegate_implementation_impl(
                         "commit_sha": result.commit_sha,
                         "model_used": model,
                         "output_tail": result.output_tail,
+                        "output_log": str(output_log_path),
                     }
                 if push.returncode != 0:
                     return {
@@ -250,6 +260,7 @@ async def _delegate_implementation_impl(
                         "commit_sha": result.commit_sha,
                         "model_used": model,
                         "output_tail": result.output_tail,
+                        "output_log": str(output_log_path),
                     }
 
                 if cfg.get("open_pr"):
@@ -305,6 +316,7 @@ async def _delegate_implementation_impl(
                 "model_used": model,
                 "summary": f"Implemented via {backend_name} ({model})",
                 "output_tail": result.output_tail,
+                "output_log": str(output_log_path),
                 **({"note": note} if note else {}),
             }
 
@@ -315,6 +327,7 @@ async def _delegate_implementation_impl(
         "success": False,
         "error": "all models failed — " + "; ".join(attempt_errors),
         "output_tail": last_output_tail,
+        "output_log": str(output_log_path),
     }
 
 
