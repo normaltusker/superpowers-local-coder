@@ -11,13 +11,20 @@ trap 'rm -rf "$TEST_ROOT"' EXIT
 pass() { echo "  [PASS] $1"; }
 fail() { echo "  [FAIL] $1"; FAILURES=$((FAILURES + 1)); }
 
+# The launch hook takes the plugin-data dir as its FIRST arg and server.py as
+# its SECOND. The data dir is passed explicitly (via ${CLAUDE_PLUGIN_DATA}
+# substitution in .mcp.json's args) rather than read from the environment,
+# because Claude Code reliably substitutes that placeholder into the MCP
+# server command's argv but does NOT reliably export it as an env var to the
+# server subprocess (verified in a real smoke test).
+
 # --- Test 1: missing venv → exit 1 with a clear message ---
 DATA1="$TEST_ROOT/data1"; mkdir -p "$DATA1"
-OUT="$(CLAUDE_PLUGIN_DATA="$DATA1" bash "$HOOK" /nonexistent/server.py 2>&1)"; RC=$?
+OUT="$(bash "$HOOK" "$DATA1" /nonexistent/server.py 2>&1)"; RC=$?
 if [ "$RC" -eq 1 ]; then pass "missing venv exits 1"; else fail "missing venv exits 1 (got $RC)"; fi
 if printf '%s' "$OUT" | grep -q "venv"; then pass "missing venv prints a clear reason"; else fail "missing venv prints a clear reason"; fi
 
-# --- Test 2: with a fake venv python, it execs that python on the arg ---
+# --- Test 2: with a fake venv python, it execs that python on the server arg ---
 DATA2="$TEST_ROOT/data2"
 mkdir -p "$DATA2/local-coder/.venv/bin"
 # Fake python that just echoes a marker + its arg, so we can prove exec.
@@ -26,12 +33,44 @@ cat > "$DATA2/local-coder/.venv/bin/python" <<'FAKE'
 echo "FAKE_PY_RAN arg=$1"
 FAKE
 chmod +x "$DATA2/local-coder/.venv/bin/python"
-OUT="$(CLAUDE_PLUGIN_DATA="$DATA2" bash "$HOOK" /some/server.py 2>&1)"; RC=$?
+OUT="$(bash "$HOOK" "$DATA2" /some/server.py 2>&1)"; RC=$?
 if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q "FAKE_PY_RAN arg=/some/server.py"; then
     pass "execs the venv python on the server.py arg"
 else
     fail "execs the venv python on the server.py arg (rc=$RC out=$OUT)"
 fi
+
+# --- Test 3: the data-dir arg must NOT come from the environment ---
+# Even if CLAUDE_PLUGIN_DATA points somewhere with NO venv, an explicit
+# data-dir arg pointing at the real venv must win. This is the exact bug the
+# smoke test caught: the subprocess env lacks CLAUDE_PLUGIN_DATA, so the hook
+# must rely on the arg, not the env.
+DATA3="$TEST_ROOT/data3"
+mkdir -p "$DATA3/local-coder/.venv/bin"
+cat > "$DATA3/local-coder/.venv/bin/python" <<'FAKE'
+#!/usr/bin/env bash
+echo "FAKE_PY_RAN arg=$1"
+FAKE
+chmod +x "$DATA3/local-coder/.venv/bin/python"
+# Point the ENV var at an empty dir (no venv); pass the REAL dir as the arg.
+OUT="$(CLAUDE_PLUGIN_DATA="$TEST_ROOT/wrong-empty" bash "$HOOK" "$DATA3" /some/server.py 2>&1)"; RC=$?
+if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q "FAKE_PY_RAN arg=/some/server.py"; then
+    pass "uses the data-dir ARG, not the CLAUDE_PLUGIN_DATA env var"
+else
+    fail "uses the data-dir ARG, not the CLAUDE_PLUGIN_DATA env var (rc=$RC out=$OUT)"
+fi
+
+# --- Test 4: missing data-dir arg → exit 1 with a clear message ---
+OUT="$(bash "$HOOK" "" /some/server.py 2>&1)"; RC=$?
+if [ "$RC" -eq 1 ] && printf '%s' "$OUT" | grep -q "data"; then
+    pass "empty data-dir arg exits 1 with a clear reason"
+else
+    fail "empty data-dir arg exits 1 with a clear reason (rc=$RC out=$OUT)"
+fi
+
+# --- Test 5: missing server.py arg → exit 1 ---
+OUT="$(bash "$HOOK" "$DATA2" "" 2>&1)"; RC=$?
+if [ "$RC" -eq 1 ]; then pass "empty server.py arg exits 1"; else fail "empty server.py arg exits 1 (got $RC)"; fi
 
 if [ "$FAILURES" -gt 0 ]; then echo "STATUS: FAILED ($FAILURES)"; exit 1; fi
 echo "STATUS: PASSED"

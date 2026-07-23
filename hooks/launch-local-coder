@@ -3,7 +3,17 @@
 # provisioned into the persistent plugin-data dir by hooks/provision-local-coder.
 #
 # Extensionless (see docs/windows/polyglot-hooks.md); dispatched by
-# hooks/run-hook.cmd. Arg $1 is the absolute path to server.py.
+# hooks/run-hook.cmd.
+#
+# Args:
+#   $1 = the plugin-data dir (${CLAUDE_PLUGIN_DATA}). Passed EXPLICITLY via
+#        .mcp.json's args (which Claude Code reliably substitutes) rather than
+#        read from the environment: Claude Code substitutes ${CLAUDE_PLUGIN_DATA}
+#        into the MCP server command's argv, but does NOT reliably export it as
+#        an env var to the server subprocess (confirmed in a real smoke test —
+#        the env-based approach failed to connect). If the arg is empty, fall
+#        back to the CLAUDE_PLUGIN_DATA env var (covers hook-test/dev callers).
+#   $2 = the absolute path to server.py.
 #
 # Unlike the provisioning hook, this does NOT silent-exit-0 on failure: an
 # MCP server that can't find its interpreter genuinely cannot run, so we
@@ -11,13 +21,23 @@
 # a connected-but-dead one.
 set -uo pipefail
 
-SERVER_PY="${1:-}"
-if [ -z "$SERVER_PY" ]; then
-    echo "[local-coder] launch failed: no server.py path argument" >&2
+DATA_DIR="${1:-}"
+if [ -z "$DATA_DIR" ]; then
+    DATA_DIR="${CLAUDE_PLUGIN_DATA:-}"
+fi
+if [ -z "$DATA_DIR" ]; then
+    echo "[local-coder] launch failed: no plugin-data dir (arg 1 was empty and" \
+         "CLAUDE_PLUGIN_DATA is unset)." >&2
     exit 1
 fi
 
-VENV="${CLAUDE_PLUGIN_DATA:-}/local-coder/.venv"
+SERVER_PY="${2:-}"
+if [ -z "$SERVER_PY" ]; then
+    echo "[local-coder] launch failed: no server.py path argument (arg 2)" >&2
+    exit 1
+fi
+
+VENV="$DATA_DIR/local-coder/.venv"
 if [ -x "$VENV/bin/python" ]; then
     exec "$VENV/bin/python" "$SERVER_PY"
 elif [ -x "$VENV/Scripts/python.exe" ]; then

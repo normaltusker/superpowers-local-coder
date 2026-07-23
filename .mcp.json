@@ -5,6 +5,7 @@
       "command": "${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd",
       "args": [
         "launch-local-coder",
+        "${CLAUDE_PLUGIN_DATA}",
         "${CLAUDE_PLUGIN_ROOT}/mcp-servers/local-coder/server.py"
       ]
     }
