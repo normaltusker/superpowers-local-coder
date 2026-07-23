@@ -15,13 +15,22 @@ instead of Claude Code's own Edit/Write tools.
   prefix; not required if you're using a remote backend/model.
 - `gh` CLI installed and authenticated (`gh auth status`) — only needed if
   `open_pr` is enabled.
-- This server's own dependencies installed into its venv:
+- The server's Python dependencies are provisioned **automatically**: when
+  the plugin is installed, a `SessionStart` hook creates a virtualenv under
+  the plugin's persistent data directory (`${CLAUDE_PLUGIN_DATA}/local-coder/.venv`)
+  and installs `requirements.txt` into it, re-installing only when
+  `requirements.txt` changes. You need a Python 3.10+ interpreter on `PATH`
+  (`python3`, `python`, or the `py` launcher on Windows) and network access
+  on first run; nothing else. On Windows, provisioning and launch run
+  through Git Bash (the same requirement as all Superpowers hooks — see
+  `docs/windows/polyglot-hooks.md`).
+
+  For local development outside a plugin install, create the venv manually:
   ```bash
   cd mcp-servers/local-coder
   python3.13 -m venv .venv
   .venv/bin/pip install -r requirements.txt
   ```
-  Use a Python 3.10+ interpreter explicitly (e.g. `python3.13`), not a bare `python3` — `fastmcp` requires >=3.10 and an older system `python3` will fail the install with an explicit Python-version-incompatibility error.
 
 ## Configuring backend/model
 
@@ -66,11 +75,11 @@ it is the recent output, not the entire backend transcript. No extra
 steps are needed to see what the backend is doing.
 
 For deep debugging, the raw backend output is also written to a per-call
-log file next to the server
-(`mcp-servers/local-coder/local-coder-output-<pid>-<id>.log`). Each call
-gets its own file so concurrent delegations never clobber each other's
-log. The exact path is announced early (as a progress update, before the
-backend starts) AND returned in the final tool result as `output_log`, so
+log file under the plugin's persistent data directory
+(`${CLAUDE_PLUGIN_DATA}/local-coder/local-coder-output-<pid>-<id>.log`).
+Each call gets its own file so concurrent delegations never clobber each
+other's log. The exact path is announced early (as a progress update, before
+the backend starts) AND returned in the final tool result as `output_log`, so
 you can start `tail -f`-ing it while the run is still in progress if you
 want the raw stream. Tailing it is a power-user convenience, not the
 normal way to follow a run.
