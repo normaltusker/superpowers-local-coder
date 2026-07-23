@@ -7,6 +7,7 @@ import yaml
 
 import ollama as ollama_module
 from backends.common import KNOWN_BACKENDS
+from paths import plugin_data_dir
 
 # Select the OS-appropriate file-locking primitive at import time. `fcntl`
 # does not exist on Windows (importing it unconditionally crashes the
@@ -18,7 +19,14 @@ if _IS_WINDOWS:
 else:
     import fcntl as _lock_module
 
-CONFIG_PATH = Path(__file__).parent / "config.yaml"
+# The bundled default config that ships with the plugin — used as a
+# read-only template to seed the real config on first use.
+_DEFAULT_CONFIG_PATH = Path(__file__).parent / "config.yaml"
+
+# The live, user-mutable config lives in the persistent plugin-data dir so
+# it survives plugin updates (the plugin root is wiped on update). Falls
+# back to the in-tree path outside a plugin (tests/dev) via plugin_data_dir.
+CONFIG_PATH = plugin_data_dir() / "config.yaml"
 
 # Sentinel accepted only for target_repo_path, to explicitly clear it back
 # to null. A bare `None` override means "don't change this field" (see
@@ -70,6 +78,13 @@ def _config_lock():
 
 
 def load_config() -> dict:
+    # First use in a fresh install: the persistent config doesn't exist yet.
+    # Seed it from the bundled default template. (Skip when the resolved
+    # path IS the template itself — the in-tree/dev fallback — to avoid a
+    # pointless self-copy.)
+    if not CONFIG_PATH.exists() and CONFIG_PATH != _DEFAULT_CONFIG_PATH:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(_DEFAULT_CONFIG_PATH.read_text())
     with open(CONFIG_PATH) as f:
         return yaml.safe_load(f)
 

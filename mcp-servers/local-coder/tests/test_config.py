@@ -298,3 +298,30 @@ def test_config_lock_still_guards_the_critical_section(isolated_config):
                                    "idle_notify_interval_seconds": 20,
                                    "extra_backend_args": []})
     assert config_module.load_config()["model"] == "ollama/x"
+
+
+def test_load_config_seeds_from_default_template_when_missing(tmp_path, monkeypatch):
+    # In a fresh install, the persistent config.yaml doesn't exist yet.
+    # load_config() must seed it from the bundled default template rather
+    # than crashing on a missing file.
+    import config as config_module
+    fresh = tmp_path / "config.yaml"
+    assert not fresh.exists()
+    monkeypatch.setattr(config_module, "CONFIG_PATH", fresh)
+
+    cfg = config_module.load_config()
+
+    assert fresh.exists()  # seeded
+    assert cfg["backend"] == "aider"  # matches the bundled default template
+    assert cfg["model"] == "ollama/qwen3-coder:30b"
+
+
+def test_load_config_uses_existing_file_when_present(tmp_path, monkeypatch):
+    import config as config_module
+    existing = tmp_path / "config.yaml"
+    existing.write_text("backend: aider\nmodel: ollama/custom\nfallback_models: []\n")
+    monkeypatch.setattr(config_module, "CONFIG_PATH", existing)
+
+    cfg = config_module.load_config()
+
+    assert cfg["model"] == "ollama/custom"  # existing file wins, not re-seeded
