@@ -84,6 +84,33 @@ non-blocking:
   dict IS correctly per-attempt. If ever revisited: reset
   `latest_line[0] = ""` at the top of each failover-loop iteration.
 
+**PR #3 REVIEW ROUND 1 — CodeRabbit DONE, cubic-dev-ai PENDING (2026-07-23).**
+CodeRabbit posted 5 findings (manually triggered — it auto-skips non-default
+base branches). All 5 verified real against the code, all fixed:
+- Code (commit `ee75028`, TDD, 119/119): guarded on_output's + the
+  call-start truncation's OUTPUT_LOG_PATH writes with try/except OSError
+  (a log-write failure was bypassing StallError-only working-tree cleanup
+  and could abort the whole call); added output_tail to the 2 push-failure
+  returns.
+- Docs (commit `4880293`): output_tail is the bounded 20K tail not a "full
+  transcript" (spec/plan/README); StallError path discards captured output
+  → output_tail="" (spec/plan/handoff); handoff branch-status "zero diff"
+  was stale. All 5 CodeRabbit threads replied + resolved.
+
+**cubic-dev-ai ALSO reviewed PR #3 — 7 findings, NOT yet triaged/fixed
+(comment ids 3636019855/58/63/72/86/88/92).** Several DUPLICATE what
+CodeRabbit already flagged + I already fixed (855/863 = 20K-tail-not-full;
+858 = stall empty tail; 892 = stale-pulse-across-failover, also the opus
+final-review Minor). Genuinely-new ones: 3636019872 (P2 — overlapping/
+concurrent delegate_implementation calls corrupt the shared log file:
+call B truncates call A's active log, callbacks interleave); 3636019886
+(P3 — plan's hard-coded baseline test count goes stale); 3636019888 (P3 —
+progress pulse can show an arbitrary chunk suffix, not a clean line, since
+on_output gets raw read chunks with partial lines). NEXT: triage these 7
+(verify each empirically), reply to the duplicates pointing at the commits
+that already fixed them + resolve, decide on the 3 new ones. Await user
+scope call before fixing the new ones — session-usage-limited.
+
 **PR #3 IS OPEN (2026-07-23):**
 https://github.com/normaltusker/superpowers-local-coder/pull/3 —
 "Phase 2 item 7: make delegate_implementation observable and
