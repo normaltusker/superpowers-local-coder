@@ -961,3 +961,20 @@ async def test_delegate_implementation_all_failed_includes_last_output_tail(isol
     assert result["success"] is False
     assert "output_tail" in result
     assert result["output_tail"].startswith("transcript from ")
+
+
+def test_output_log_path_lives_under_plugin_data_dir(tmp_path, monkeypatch):
+    # The per-call log base must live in the persistent plugin-data dir
+    # (survives plugin updates), not the ephemeral plugin root. server.py
+    # computes OUTPUT_LOG_PATH at import via plugin_data_dir(); verify the
+    # resolution honors CLAUDE_PLUGIN_DATA by re-importing the module fresh.
+    import importlib
+    monkeypatch.setenv("CLAUDE_PLUGIN_DATA", str(tmp_path))
+    import server as server_module
+    importlib.reload(server_module)
+    try:
+        assert server_module.OUTPUT_LOG_PATH.parent == tmp_path / "local-coder"
+        assert server_module.OUTPUT_LOG_PATH.name == "local-coder-output.log"
+    finally:
+        monkeypatch.delenv("CLAUDE_PLUGIN_DATA", raising=False)
+        importlib.reload(server_module)  # restore in-tree default for other tests

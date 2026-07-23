@@ -13,6 +13,7 @@ from backends.codex import CodexBackend
 from backends.gemini import GeminiBackend
 from backends.openrouter import OpenRouterBackend
 from backends.common import KNOWN_BACKENDS, validate_branch_name
+from paths import plugin_data_dir
 
 mcp = FastMCP("local-coder")
 
@@ -38,7 +39,9 @@ NETWORK_SUBPROCESS_TIMEOUT_SECONDS = 45
 # start-of-call truncation would wipe the first's active log and their
 # output would interleave. The concrete per-call path is returned in the
 # result dict (`output_log`) so a human knows which file to tail.
-OUTPUT_LOG_PATH = Path(__file__).parent / "local-coder-output.log"
+# The log lives in the persistent plugin-data dir (survives plugin updates),
+# not next to this server.py file.
+OUTPUT_LOG_PATH = plugin_data_dir() / "local-coder-output.log"
 
 
 def _make_output_log_path() -> Path:
