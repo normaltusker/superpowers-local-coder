@@ -14,5 +14,6 @@ class OpenRouterBackend(BackendAdapter):
         config: dict,
         model: str | None = None,
         on_tick: Callable[[], None] | None = None,
+        on_output: Callable[[str], None] | None = None,
     ) -> CompletionResult:
         raise NotImplementedError("OpenRouter backend not yet implemented")

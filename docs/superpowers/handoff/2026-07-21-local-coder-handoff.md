@@ -5,7 +5,768 @@ it should make resumption fast without re-deriving context from the whole
 conversation. **Update this file whenever a task completes**, not just at
 session end — a stale handoff is worse than none.
 
-## Where things stand
+## Where things stand NOW (read this first)
+
+**Phase 1 is merged. Phase 2 in progress — currently on item 7.** PR #2
+(`local-coder-impl` → `dev`) merged at `70f8ba3`. `dev` has the full
+Phase 1 build.
+
+**LATEST (2026-07-22, item 7 = mid-flight communication):** Item 7 was
+selected as the Phase 2 focus (over the other backlog items). Ran
+`superpowers:brainstorming`. Built a throwaway `elicit-probe` MCP server
+and drove it from a live Claude Code session to answer the key design
+questions empirically, then removed it. **Confirmed findings:**
+- `ctx.report_progress()` renders live in Claude Code BUT is ephemeral
+  (each message replaces the last; nothing persists once superseded —
+  inherent to the MCP progress protocol, not fixable by calling it
+  differently).
+- `ctx.elicit()` works with Claude Code AND persists (question + the
+  user's answer both stay as permanent chat messages; verified full
+  round-trip — asked "favorite color?", got "Pink" back).
+- MCP resources are pull-based; no evidence Claude Code auto-refreshes on
+  `ResourceUpdatedNotification`. Ruled out as a live channel.
+
+**Design spec written and committed** (`ca18b09`):
+`docs/superpowers/specs/2026-07-22-mid-flight-communication-design.md`.
+Two-phase: **2a visibility (build now)** = upgrade `on_tick`'s
+`report_progress` to carry the latest real output line (throttled to the
+tick cadence, not per-chunk) + add an `output_tail` field
+(bounded to existing `_MAX_OUTPUT_CHARS`=20000) to
+`delegate_implementation`'s result dict on both success/failure, sourced
+from `CompletionResult` (new `output_tail` field on
+`backends/base.py`'s `CompletionResult`, populated by
+`AiderBackend.run_backend` from `result.stdout`). **2b interactive
+prompt-answering (design-only, gated)** = `elicit()`, but DO NOT build
+until real aider-prompt frequency is observed; the hard constraint is
+that `stdin=subprocess.DEVNULL` (commit `620cfc0`) must NOT be reverted.
+
+**Design spec APPROVED by the user** (2026-07-22). **Implementation plan
+now WRITTEN and committed** (`b9a38e4`):
+`docs/superpowers/plans/2026-07-22-mid-flight-visibility-phase2a.md` —
+5 TDD tasks covering Phase 2a only (2b is gated/excluded):
+1. Add `output_tail: str = ""` field to `CompletionResult` (base.py).
+2. Populate it in `AiderBackend.run_backend` from `result.stdout` on the
+   3 result-bearing return paths (non-zero exit, no-commits, success);
+   the no-model path has no result, and the StallError path keeps `""`
+   — NOT because there's no output (a stall does capture output up to the
+   kill) but because that path currently discards it; retaining it is a
+   possible future improvement, out of scope for the visibility pass.
+3. Surface `output_tail` in `delegate_implementation`'s result dict on
+   success + all-failed (all-failed uses the LAST attempt's tail).
+4. Live pulse: `make_on_tick`/`make_on_output` share a `latest_line`
+   holder so the per-tick `report_progress` carries the latest real
+   output line (`"{model}: {line}"`) instead of static "still running".
+   Throttled to tick cadence, NOT per-chunk. Flags one intended
+   behavior-change to an existing stderr test.
+5. Demote the log file to a debugging aside in the README.
+
+Suite is at 110 passing pre-plan; plan expects ~114 after (recount, the
+gate is zero failures).
+
+**PHASE 2a IS BUILT AND REVIEWED — DONE (2026-07-23).** Executed all 5
+plan tasks via `superpowers:subagent-driven-development` (fresh
+implementer + task reviewer per task). Commits `eee5c4a`→`7d257e4`
+(pushed to `origin/local-coder-impl`). **117/117 tests passing** (was
+110). Final whole-branch review (opus) verdict: **"Ready to merge: Yes"**
+— all three 2a spec requirements implemented and verified in final code,
+all global constraints hold (`stdin=DEVNULL` intact, `_MAX_OUTPUT_CHARS`
+bound reused, pulse throttled to tick cadence, flat imports, NO 2b/
+`elicit()` code present). Three Minor findings, all adjudicated
+non-blocking:
+- `NotImplementedError` early-return lacks `output_tail` key — fine, no
+  subprocess ran so `""` conveys the same; `output_tail` was scoped to
+  the success + all-failed paths only, by design.
+- Task 4's multi-line-chunk `splitlines()[-1]` branch is trace-verified
+  only (tests feed single-line chunks) — trivially correct.
+- Stale-pulse across failover: `latest_line` is one shared cell, so a
+  tick during model B before B emits could show model A's last line for
+  one interval — cosmetic only; the durable `output_tail` in the result
+  dict IS correctly per-attempt. If ever revisited: reset
+  `latest_line[0] = ""` at the top of each failover-loop iteration.
+
+**PR #3 REVIEW ROUND 1 — CodeRabbit DONE, cubic-dev-ai PENDING (2026-07-23).**
+CodeRabbit posted 5 findings (manually triggered — it auto-skips non-default
+base branches). All 5 verified real against the code, all fixed:
+- Code (commit `ee75028`, TDD, 119/119): guarded on_output's + the
+  call-start truncation's OUTPUT_LOG_PATH writes with try/except OSError
+  (a log-write failure was bypassing StallError-only working-tree cleanup
+  and could abort the whole call); added output_tail to the 2 push-failure
+  returns.
+- Docs (commit `4880293`): output_tail is the bounded 20K tail not a "full
+  transcript" (spec/plan/README); StallError path discards captured output
+  → output_tail="" (spec/plan/handoff); handoff branch-status "zero diff"
+  was stale. All 5 CodeRabbit threads replied + resolved.
+
+**cubic-dev-ai review of PR #3 — ROUND 1 (run `d761dbc2`) DONE
+(2026-07-23).** 7 findings. Categorized precisely (an earlier version of
+this note double-counted the reset-per-attempt finding — corrected here):
+- 2 were CodeRabbit DUPLICATES already fixed (855/863 = bounded-tail
+  wording → doc fix `4880293`). Replied pointing at the commits +
+  resolved.
+- 4 were cubic-specific, fixed with TDD across TWO commits. Three landed
+  in `76e7147`: 3636019888 (partial-line pulse — buffer incomplete lines,
+  promote only complete ones); 3636019892 (reset latest_line/partial_line
+  per failover attempt so a fallback's pulse can't relabel the prior
+  model's line — this one ALSO matched the opus final-review Minor, but
+  it's counted once, here, as a cubic fix); 3636019886 (plan's hard-coded
+  test count → count-agnostic). The fourth, 3636019872 (P2, concurrent-log
+  corruption), landed SEPARATELY in `c694d9d` as a bigger change: per-call
+  unique log path returned as `output_log`, eliminating the shared-file
+  clobber and removing start-of-call truncation. (2 + 4 = 6
+  fixed/resolved.)
+- **STILL OPEN (deliberate): 3636019858** — a stalled attempt returns
+  output_tail="". Retaining the captured tail through StallError is a
+  real feature change, scoped out of this visibility PR; replied + left
+  open as tracked future work. Do NOT resolve without doing the work.
+
+**cubic-dev-ai ROUND 2 (run `8352b075`) — DONE (2026-07-23).** cubic
+re-reviewed the round-1 fix commits and found 7 real SECOND-ORDER issues
+those fixes introduced (the "each fix surfaces the next edge" pattern).
+Per user decision: fixed 4 code + 2 doc, deferred 1.
+- Code, all TDD (commit `6c14cef`): UnicodeEncodeError on the log
+  write (now `encoding="utf-8", errors="replace"` + catch broadly, since
+  UnicodeEncodeError is not an OSError); partial_line unbounded + no CR
+  handling (now treats `\r` as a delimiter so progress bars update the
+  pulse, and caps the buffer at `_PARTIAL_LINE_MAX_CHARS`=8000); stderr
+  flood on persistent log failure (now warns ONCE via `log_write_ok`
+  flag, reset per attempt); log path not discoverable for live tailing
+  (now announced early via `ctx.report_progress` + stderr, before
+  run_backend, in addition to the result dict).
+- Docs: README updated (early-announce for live tailing); these two
+  handoff self-consistency nits (the double-count above, and this
+  round-2 block replacing the stale "waiting for review" text below).
+- **DEFERRED (replied, left open): 3636207385** (P2) — per-call log
+  files accumulate indefinitely, no retention policy. Real, but it's a
+  genuine design question (size/age/count policy), not a one-line fix;
+  scoped as future work, not bolted onto this PR.
+
+**PR #3 CURRENT STATE (supersedes any older status text below):**
+**127/127 tests passing.** Both bots fully triaged. Review rounds:
+CodeRabbit ×1, cubic ×4 (cubic kept re-reviewing each round's fix
+commits). 22/26 threads resolved; 4 open, all intentional:
+- 3636019858 (stall-tail retention) and 3636207385 (log-retention
+  policy) — real future work, replied + tracked, do NOT resolve without
+  doing the work.
+- 3636380675 and 3636380686 — P3 handoff-doc consistency nits, replied
+  as valid-but-not-actioned under the round cap (internal-doc polish, no
+  code impact). Left open as acknowledged-but-declined.
+Every finding was verified empirically before acting. **Note:** the
+"PR #3 IS OPEN" / "NEXT STEP" block far below is HISTORICAL (117/117 /
+"await review") — trust THIS block.
+
+**REVIEW-ROUND CAP (user directive, 2026-07-23): the automated
+review-response budget for PR #3 is SPENT.** The cap was 3 rounds; the
+one exception since was round 4's single P2 — a genuine correctness bug
+this PR's own earlier fix introduced (unguarded `await
+ctx.report_progress` in the early log-announce could abort a delegation;
+fixed in `1a6abc3`, guarded best-effort, TDD). That was fixed because it
+protected shipped-code quality, not doc churn. **Going forward: do NOT
+open further automated fix rounds.** If bots post again, read the
+comments; fix ONLY a genuine, shipped-code correctness/security bug (and
+surface it to the human first); ignore doc-consistency / style / nit
+churn. PR #3 is ready for the human's merge call.
+
+**PR #3 IS OPEN (2026-07-23):**
+https://github.com/normaltusker/superpowers-local-coder/pull/3 —
+"Phase 2 item 7: make delegate_implementation observable and
+non-hanging" (`local-coder-impl` → `dev`, +1914/−41, 15 files).
+Scoped as the WHOLE item-7 arc (one coherent theme: "make delegation
+observable and non-hanging"), not just the 5-task 2a plan — because the
+branch also carries the earlier item-7 code fixes that were committed
+directly during smoke-test debugging and never PR'd (the stdin-hang fix
+`620cfc0`, log-file visibility `b3835fb`, stderr streaming `870cb9a`).
+The user chose this single-theme framing over splitting into a separate
+hang-fix PR. PR body (full template completed, honest fork-specific
+framing, model/harness/plugin disclosure) lives at the scratchpad path
+`pr-body-2a.md` if it needs editing. 117/117 tests passing; final
+whole-branch review was "Ready to merge: Yes."
+
+**NEXT STEP when resuming:** monitor PR #3 for CI / review-bot activity
+(cubic-dev-ai, CodeRabbit — both reviewed PR #2 heavily, expect the
+same here). Follow the established pattern from PR #2: for each finding,
+**verify empirically before fixing** (don't trust the bot's claim), fix
+real issues with TDD, reply on the thread + resolve, skip genuinely
+out-of-scope items with a documented reason, and keep THIS handoff doc
+current after each round. Do NOT touch pre-existing upstream defects —
+only findings in code THIS PR changed. Do NOT build 2b (interactive
+prompt-answering) — gated. Merging PR #3 is the human's call, not
+something to do unprompted. Working tree is clean. Respect session-usage
+limits — if approaching, update this doc and stop rather than burning
+paid credits.
+
+**Working branch:** `local-coder-impl` (same branch, same worktree at
+`.worktrees/local-coder-impl/`) — reused for Phase 2 rather than cutting a
+new branch, per explicit direction. It was fast-forwarded to match `dev`
+right after PR #2 merged, and now carries the Phase 2 item-7 commits on
+top — so it is **ahead of `dev` and is the source branch for PR #3**.
+Further Phase 2 commits land on top of it from here. **`main` is
+untouched — Phase 2 work merges to `dev` only. Merging `dev` to `main`
+happens later, once Phase 2's basics are complete, and is explicitly the
+human's call, not something to do unprompted.**
+
+### Phase 2 backlog
+
+Everything below was identified as pending after a post-merge review of
+the original design spec against what Phase 1 actually shipped (Codex/
+Gemini/OpenRouter backends excluded — those remain their own later
+phase, not part of this Phase 2 pass):
+
+1. **Run the Part 3 manual smoke test for real — STARTED, BLOCKED, see
+   below.** Design spec's own acceptance check — brainstorm → plan → SDD
+   dispatches `local-coder-implementer` → `delegate_implementation`
+   actually invokes aider against local Ollama → a commit lands on the
+   shared branch → the implementer verifies via Read and reports DONE →
+   task reviewer approves → `finishing-a-development-branch` opens the
+   PR — has **still never been run end-to-end**. Attempting it on
+   2026-07-22 surfaced a real, more-fundamental-than-expected blocker —
+   see "Item 1 attempt — findings and next step" immediately below.
+2. **Fresh-clone / plugin-install bootstrap provisioning — TURNS OUT TO
+   BLOCK ITEM 1, NOT JUST FRESH INSTALLS.** `.mcp.json` uses
+   `${CLAUDE_PLUGIN_ROOT}`, a variable Claude Code only sets when the
+   repo is loaded as an **installed plugin** — not when it's a plain
+   project checkout (which is how this session and this worktree are
+   normally used). This isn't only a "fresh clone" problem as originally
+   scoped from the cubic-dev-ai finding; it means the local-coder MCP
+   tools are **unreachable in the very session doing Phase 2
+   development**, unless that session specifically has this fork
+   installed as a plugin. See the item 1 findings below for the concrete
+   repro and the exact install steps to unblock it.
+3. **Windows support.** Currently impossible as-is: `config.py`'s file
+   locking uses `fcntl` (POSIX-only, no Windows equivalent), and
+   `.mcp.json`'s hardcoded `.venv/bin/python` path doesn't resolve on
+   Windows (`.venv/Scripts/python.exe` there). Also raised by cubic-dev-ai,
+   also won't-fixed on PR #2, now Phase 2 scope. Fixing #2 (a proper
+   launcher/bootstrap) and this one likely overlap — worth scoping
+   together rather than as two independent tasks.
+4. **Skill-eval evidence for the SKILL.md/implementer-prompt.md rewrite.**
+   This repo's own CLAUDE.md requires eval-harness evidence (via
+   `superpowers:writing-skills`, adversarial pressure testing across
+   multiple sessions) for changes to behavior-shaping skill content.
+   Phase 1's SDD rewiring shipped without this. Raised by cubic-dev-ai,
+   won't-fixed on PR #2 as a separate follow-up, now Phase 2 scope. Note:
+   this repo's own eval harness lives in `evals/` (see root `CLAUDE.md`'s
+   "Eval harness" section) — read that before starting this item.
+5. **TDD-under-delegation is structurally weaker than before the fork.**
+   Not a bug to fix outright, but worth deciding whether Phase 2 does
+   anything about it. The implementer subagent can no longer
+   independently verify RED-before-GREEN (no Edit/Write tools to run a
+   failing test itself), so `delegate_implementation`'s backend is
+   solely responsible for TDD discipline, and the subagent's report can
+   only state what evidence it observed after the fact. Currently
+   documented as an accepted trade-off in `implementer-prompt.md`'s
+   Report Format section. Revisit only if it causes a real problem in
+   practice (e.g. during item 1's smoke test) — don't preemptively
+   redesign it.
+6. **NEW, found during item 1's smoke test: `stall_timeout_seconds`'s
+   300s default may be too tight for a cold-loading large local model.**
+   The first real `delegate_implementation` call against
+   `ollama/qwen3-coder:30b` (18GB) stalled with zero output for the full
+   300s and gave up — `ollama ps` showed nothing loaded into memory right
+   before the call, so the likely cause is cold-load time alone (before
+   any token is generated) exceeding the stall window, not a hung/broken
+   model. The stall-detection mechanism itself worked correctly (clean
+   failure, no hang, no crash) — this is a config-default/guidance gap,
+   not a code bug. Consider for Phase 2: document the cold-load risk in
+   the README, recommend always setting `fallback_models` for large
+   primary models, and/or evaluate raising the default. Don't fix
+   speculatively — see how the fallback retry (in progress as of this
+   handoff) behaves first; if `qwen2.5-coder:7b` also stalls, that points
+   at a different problem entirely (e.g. Ollama itself under load) and
+   changes what fix actually makes sense.
+7. **NEW, explicitly requested and explicitly scope-merged: design a real
+   mid-flight communication channel for `delegate_implementation`,
+   covering BOTH live visibility and interactive prompt-answering as one
+   problem, not two.** This item started as two separate findings this
+   session and was deliberately merged, because both symptoms trace to
+   the same root gap: `delegate_implementation` is a single opaque,
+   synchronous call with no way to talk to the user WHILE it runs, only
+   before (the task description) and after (the final result).
+   - **Visibility symptom:** the `tail -f local-coder-output.log`
+     workaround built this session (commit `b3835fb`) works, but is
+     explicitly acknowledged as NOT a real feature — no realistic user
+     opens a second terminal and manually tails a file to check if a
+     delegation is progressing or stuck. Real visibility belongs INSIDE
+     the same Claude Code conversation that triggered the delegation,
+     surfaced natively as the call progresses (e.g. the existing
+     `on_tick`/`ctx.report_progress` heartbeat, currently just "still
+     running (model)...", could instead carry the actual latest output
+     chunk(s), so real progress shows up in-chat with no file, no second
+     terminal, no tailing).
+   - **Interactivity symptom:** a real hang was found and fixed this
+     session (`stdin=subprocess.DEVNULL`, commit `620cfc0`) — aider was
+     inheriting the MCP server's own stdin (Claude Code's stdio JSON-RPC
+     pipe, which never sends EOF) and blocked forever on any read
+     attempt, uncaught by the stall-timeout mechanism (which only
+     watches output, not "is this process actually stuck"). That fix
+     converts a silent infinite hang into a fast, clean failure — any
+     stdin read now gets immediate EOF — but if aider hits a prompt
+     `--yes` does NOT auto-answer (a genuine judgment call, not a
+     default yes/no), the run now fails fast with the prompt text
+     captured rather than hanging, but nothing lets a human actually
+     ANSWER that prompt and let the run continue.
+   - **Both need the same underlying capability**: some way for
+     `delegate_implementation` to communicate with the user WHILE
+     running, not just via a final return value. A real design should
+     solve both symptoms with one mechanism, not build a progress-only
+     fix and a separate prompt-answering fix that later need
+     reconciling.
+   - **Real constraints to design against, learned the hard way this
+     session** (still apply with the merged scope):
+     - `delegate_implementation` is currently single request/response —
+       no existing pause/resume mechanism mid-call.
+     - The subprocess's stdin is intentionally severed
+       (`subprocess.DEVNULL`) because leaving it attached to the MCP
+       server's own stdin causes real, silent hangs — any redesign that
+       reopens a stdin path for the backend must NOT simply revert that
+       fix; it needs a deliberately managed pipe the server itself
+       writes to only when a real answer is ready, not the server's
+       inherited stdin.
+     - FastMCP's `Context` already supports `report_progress` (used
+       today for the on_tick heartbeat) — investigate whether it or a
+       similar mechanism (elicitation, sampling, or another FastMCP
+       primitive) supports genuine bidirectional communication, or
+       whether this needs a custom protocol on top (e.g. pause, return a
+       "needs input" response with the prompt text, expose a new
+       `answer_prompt` MCP tool, resume).
+     - Consider scope carefully before building the interactive-answer
+       half specifically: how often does aider actually hit an
+       unanswerable prompt with `--yes` in practice? If genuinely rare,
+       a lighter-weight fallback (a documented manual recovery path —
+       "if delegate_implementation fails with a prompt-related error,
+       re-run aider manually against the same branch with the answer
+       baked into a modified task description") may be proportionate for
+       THAT half even if the visibility half still gets built properly.
+       Investigate real frequency before committing to the heavier
+       design for interactivity; visibility is worth building regardless
+       of frequency, since it's needed on every successful run too, not
+       just the rare stuck one.
+
+### Item 1 attempt — findings and next step (2026-07-22)
+
+Verified environment was ready first: `ollama list` has `qwen3-coder:30b`
+pulled (the config default), `aider` 0.86.2 on PATH, `gh` authenticated,
+the server's venv (`mcp-servers/local-coder/.venv/`) has fastmcp 3.4.4
+installed and `server.py` imports cleanly. None of that was the problem.
+
+**The actual blocker:** `claude mcp list` in this session shows:
+```
+local-coder: ${CLAUDE_PLUGIN_ROOT}/mcp-servers/local-coder/.venv/bin/python ... - ⏸ Pending approval
+```
+and the diagnostics report `Missing environment variables:
+CLAUDE_PLUGIN_ROOT` for `.mcp.json`. Confirmed with `env | grep
+CLAUDE_PLUGIN_ROOT` (empty). This session has the **official**
+`superpowers@claude-plugins-official` plugin installed (see
+`~/.claude/settings.json`'s `enabledPlugins`), not this fork — so
+`CLAUDE_PLUGIN_ROOT` never points at this checkout, and the
+`mcp__local-coder__*` tools are not available to call (confirmed via
+`ToolSearch`, no match).
+
+This can't be fixed by exporting the env var in a shell — Claude Code
+resolves `.mcp.json` once, before/outside the running session, so a
+`export CLAUDE_PLUGIN_ROOT=...` in Bash has no effect on the
+already-resolved MCP client config. Manually running
+`server.py`'s `_delegate_implementation_impl` directly via a Python
+script was considered and explicitly rejected: it would prove the
+backend logic works (already covered by the 101-test suite), but would
+**not** test the actual thing Part 3 verifies — Claude Code's real
+subagent-dispatch → tool-restricted implementer → MCP call chain. Faking
+that with a script would produce a false "smoke test passed" result.
+
+**Confirmed fix path — this repo IS structured to self-install:**
+`.claude-plugin/marketplace.json` at repo root defines a `superpowers-dev`
+marketplace with one plugin (`superpowers`, `source: "./"`) — this fork
+ships everything needed to install itself locally. **This requires a
+FRESH Claude Code session** (a plugin install needs a session restart to
+take effect, and the smoke test itself needs to be the acceptance test
+described in root `CLAUDE.md` — a clean session). Exact steps for that
+fresh session:
+
+```bash
+claude plugin marketplace add /Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder/.worktrees/local-coder-impl --scope project
+claude plugin install superpowers@superpowers-dev --scope project
+```
+Then restart/start a new `claude` session from
+`.worktrees/local-coder-impl/`, confirm `claude mcp list` shows
+`local-coder` connected (not "Pending approval" / missing env var), then
+run the actual Part 3 smoke test: ask it to brainstorm+plan+implement a
+one-line change (e.g. "add a one-line comment to README.md") via
+`subagent-driven-development`, and confirm `delegate_implementation` is
+what implements it, not direct Edit/Write.
+
+**UPDATE 2026-07-22, later same day — plugin install fix confirmed
+working, MCP connection UNBLOCKED.** The install genuinely worked, but
+one path detail bit us: `claude plugin marketplace add`/`install
+--scope project` write their enablement record to **the main repo
+root's** `.claude/settings.json`
+(`/Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder/.claude/settings.json`),
+not into the worktree — this is git-worktree-shared `--scope project`
+behavior in Claude Code, not a bug: all worktrees of one repo share one
+project-scope settings file at the git common dir. A session started
+`cd`'d into `.worktrees/local-coder-impl/` before running `claude`
+didn't pick up the enablement, so `local-coder` still failed
+(`CLAUDE_PLUGIN_ROOT` still missing) on the first retry. **Fix: start
+the session from the MAIN REPO ROOT
+(`/Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder`,
+currently on `dev`, which already has everything from the merged PR),
+not from the worktree.** Confirmed via `claude mcp list` in that
+session:
+```
+local-coder (worktree copy)              ✔ Connected
+local-coder (plugin, .mcp.json)          ✘ Failed to connect — CLAUDE_PLUGIN_ROOT env var missing
+```
+The second line is an expected, harmless duplicate — the client is
+showing two resolutions of the same server name (one via the installed
+plugin, which now works; one via any lingering plain `.mcp.json`
+reference, which still can't resolve `CLAUDE_PLUGIN_ROOT` on its own).
+**The plugin-sourced `local-coder` is what matters and it is live.**
+`installed_plugins.json` now correctly shows
+`superpowers@superpowers-dev` registered; `.claude/settings.json` at the
+main repo root has `enabledPlugins: {"superpowers@superpowers-dev":
+true}` and `extraKnownMarketplaces.superpowers-dev` pointing at the
+worktree path as the marketplace source. No uninstall/reinstall was
+needed once the directory mismatch was understood — the original install
+was correct all along.
+
+**Smoke test attempt #1 — correctly declined, not a bug.** Asked the
+connected repo-root session: "add a one-line comment to README.md, use
+subagent-driven-development." It loaded the `subagent-driven-development`
+skill successfully, then judged (correctly) that a one-line doc edit is
+too trivial to justify SDD's machinery (worktrees, plan files, per-task
+implementer/reviewer dispatch, ledgers) and offered to just make the
+edit directly instead of forcing the process. This is the skill working
+as intended, not a failure — but it means `delegate_implementation` was
+never actually called, so the smoke test still hasn't run.
+
+**Smoke test attempt #2 — IN PROGRESS AS OF THIS UPDATE, looking
+genuinely healthy.** Sent the Quick Reference task from the "next
+action" note. The repo-root session again offered to skip SDD given its
+small size; user confirmed "delegate directly, skip SDD scaffolding" —
+a deliberate, reasonable simplification of the original ask (this is
+functionally still exercising the exact thing item 1 needs to verify:
+`delegate_implementation` really invoking aider against local Ollama —
+just without the full brainstorm→plan→implementer-subagent→reviewer
+ceremony around it, since that ceremony isn't what's in question here).
+The session then: read the current README, confirmed `local-coder` was
+reachable, called `mcp__local-coder__delegate_implementation` with
+`target_repo_path` explicit, and is now waiting on it in the background
+rather than polling.
+
+**Confirmed via `ps aux` from a separate terminal (not the Claude Code
+session itself) that this is REAL, not a stall or hallucinated tool
+call:**
+- `server.py` (the local-coder MCP server) is running as a real
+  background process, PID 79730.
+- It has actually spawned a real `aider` subprocess, PID 86750:
+  `aider --model ollama/qwen3-coder:30b --yes --message "..."`, with the
+  exact synthesized task text (add a "## Local-Coder Quick Reference"
+  section, given verbatim content, restricted to that one file/section).
+- Ollama (`ollama serve`) is running and available to serve the request.
+- As of this check, `mcp-servers/local-coder/README.md` has NOT yet been
+  modified (checked both the repo-root copy and the worktree copy) —
+  aider is still mid-run, not stuck; 30B local models take real wall-clock
+  time for a real inference pass, this is expected, not a hang.
+
+**A browser tab opened to `https://aider.chat/docs/llms/warnings.html`
+during this run — this is normal aider behavior, not an error.** Aider
+ships a `--show-model-warnings` flag (`True` by default, confirmed via
+`aider --help`) that opens this docs page when it wants to flag a
+model/provider quirk for an unfamiliar or unusual model — it is NOT a
+sign delegate_implementation is broken, and does NOT mean aider stopped
+running (the process was still alive and burning CPU when checked).
+
+**If resuming: check `ps aux | grep aider` first.** If the aider PID
+from this note is still running, wait for it — do not re-send the task
+or assume it's stuck. If it's gone, check whether
+`mcp-servers/local-coder/README.md` was modified (`git status` /
+`git diff` in the repo-root checkout, which is where this attempt is
+running, on `dev` directly) — a modified README with no corresponding
+commit likely means aider finished editing but
+`delegate_implementation`'s own auto-commit step hasn't run yet or
+failed; a modified+committed README means it fully succeeded and this
+item can be marked COMPLETE (record the commit SHA, branch, and whether
+a PR was offered); no modification at all with the process gone likely
+means it failed silently and needs investigating fresh (check the
+session's own conversation for the tool result, don't just re-run
+blindly).
+
+**Smoke test attempt #2, first delegate_implementation call — FAILED,
+but usefully (stall, not a crash).** The MCP tool call
+(`kruub07t`) completed and returned `success: false`:
+`ollama/qwen3-coder:30b` stalled with **zero output for the full 300s
+`stall_timeout_seconds`**, no `fallback_models` were configured, so the
+call gave up cleanly with a clear error rather than hanging or crashing.
+This is a genuinely valuable result even though the task didn't
+complete: it's real evidence the stall-detection/no-fallback-configured
+path in `delegate_implementation` works exactly as designed. Checked
+`ollama ps` at the time — **nothing was loaded into memory** — so the
+most likely explanation is a cold-load of an 18GB/30B model exceeding
+300s before producing a single token (the stall detector watches for
+*output*, and cold-load time produces none). This is a real Phase 2
+finding worth its own line item: **`stall_timeout_seconds`'s 300s
+default may be too tight for a cold-loading large local model** — not
+raised as a bug in Phase 1's code (the mechanism did exactly what it was
+built to do), but as a possible config-default/README-guidance gap for
+Phase 2 to consider (e.g. documenting that first-use-after-idle can be
+slow, or raising the default, or recommending fallback_models always be
+set for large primary models).
+
+**Attempt #2 retry — configure fallback, retry — IN PROGRESS AS OF THIS
+UPDATE.** Decision made: rather than a bare retry (doesn't test
+failover, risks same stall for an unrelated reason) or abandoning
+delegation (would leave item 1 still never having succeeded), configure
+`ollama/qwen2.5-coder:7b` (already pulled, small/fast) as
+`fallback_models`, keep `qwen3-coder:30b` as primary, then retry the
+same README task. Told to the repo-root session as:
+```
+Configure qwen2.5-coder:7b as a fallback model (call configure with
+fallback_models: ["ollama/qwen2.5-coder:7b"], keep qwen3-coder:30b as
+primary), then retry the delegation for the same README task.
+```
+**Result of this retry not yet seen as of this handoff update.**
+
+**IMPORTANT discovery while checking on this: the running local-coder
+MCP server reads/writes the WORKTREE's `config.yaml`
+(`.worktrees/local-coder-impl/mcp-servers/local-coder/config.yaml`), NOT
+the repo-root checkout's copy — even though the Claude Code session
+issuing the `configure`/`delegate_implementation` calls has its shell
+`cd`'d into the repo root.** Confirmed by diffing the two files: the
+repo-root copy is still untouched (`fallback_models: []`,
+`target_repo_path: null`); the worktree copy now has
+`fallback_models: [ollama/qwen2.5-coder:7b]` and
+`target_repo_path: /Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder`
+(the repo root's own absolute path, written by the `configure` call
+presumably resolving its own cwd). This makes sense once you trace it:
+`${CLAUDE_PLUGIN_ROOT}` resolves to wherever the plugin's marketplace
+`source` points — which is the worktree
+(`.claude-plugin/marketplace.json`'s `source: "./"` combined with the
+marketplace being added FROM the worktree path) — so the server process
+itself, and everything it reads/writes including `config.yaml`, lives in
+the worktree regardless of which directory the chat session's own shell
+happens to be in. **Practical implication: from now on, always check
+`.worktrees/local-coder-impl/mcp-servers/local-coder/config.yaml` for
+the live config, not the repo-root copy — the repo-root copy is
+effectively dead/unused as long as the plugin is installed from the
+worktree.**
+
+**Do NOT hand-edit `config.yaml` while a `delegate_implementation`/
+`configure` call may still be in flight against it** — the running
+server process owns reads/writes to this file mid-call; editing it
+concurrently risks a race. (This was respected: the config cleanup
+below only happened after confirming via `ps aux` that nothing was
+still running against it — see "`config.yaml` cleanup — DONE" further
+down for the final outcome, which ended up reverting BOTH fields, not
+just `target_repo_path` as originally planned here.)
+
+**Retry outcome: INCONCLUSIVE — interrupted deliberately, not a failure
+or a stall.** The retry (primary `qwen3-coder:30b`, fallback
+`qwen2.5-coder:7b`) was mid-run — confirmed via `ps aux` it had actually
+failed over to `qwen2.5-coder:7b` (the process's own argv showed
+`--model ollama/qwen2.5-coder:7b`, proving the failover path fired for
+real) — when the user raised a legitimate concern: **running aider fully
+headless, with zero live visibility into what it's doing, is genuinely
+concerning, not just a minor inconvenience.** User chose to stop that
+run and fix visibility before continuing rather than let it finish and
+get today's pass/fail signal. `README.md` was never modified by either
+attempt, so item 1 is still not complete — but this is now considered
+correctly paused, not stalled/broken.
+
+**Visibility gap — FIXED, commit `870cb9a`.** Root cause: aider's
+stdout/stderr was fully captured by `run_monitored_subprocess` (bounded
+20K-char tail) but never surfaced anywhere live — not to a terminal, not
+to the MCP client, not even via the existing `on_tick` progress hook
+(which only ever printed a generic "still running" heartbeat with no
+access to the actual output). The only visibility was the tail dumped
+into an error message after the whole call already finished or failed.
+
+**Fix implemented, full TDD (106/106 tests passing):** added
+`on_output: Callable[[str], None] | None` to
+`run_monitored_subprocess` in `backends/common.py`, fired with each
+decoded chunk as it's read (main loop + the post-exit drain loop) —
+additive, backward-compatible, existing callers unaffected. Threaded
+through `BackendAdapter.run_backend`'s abstract interface and all 4
+backend implementations/stubs (aider real, codex/gemini/openrouter
+stubs). Wired in `server.py`'s `make_on_output` factory (mirroring the
+existing `make_on_tick`) to `print()` each chunk to the **local-coder
+MCP server's own stderr** immediately, prefixed with the model name
+(`[local-coder:ollama/qwen3-coder:30b] <chunk>`), alongside the existing
+on_tick heartbeat. Manually verified end-to-end with a real subprocess
+(not just unit tests) that chunks stream through as they arrive, not
+buffered until exit.
+
+**"Where do you watch stderr" OPEN QUESTION — ANSWERED (the answer is:
+you can't, so a log file was added instead).** Investigated via `lsof`
+on the running server process: Claude Code pipes an MCP server's stdout/
+stderr over an internal unix socket it owns directly (the socket's other
+end is held by the `claude` binary's own PID) — there is no external tap
+point without root/sudo access, which this session doesn't have. Also
+tested `claude --debug-file <path>`: confirmed it captures Claude Code's
+own tool-dispatch lifecycle (`Calling MCP tool: delegate_implementation`,
+`still running (Ns elapsed)`, etc.) but NOT the actual subprocess output
+`on_output` prints — so it does not solve this. **Fix: `on_output` now
+ALSO writes to a fixed log file,
+`mcp-servers/local-coder/local-coder-output.log`** (gitignored, in the
+worktree next to `server.py`), truncated fresh at the start of every
+`delegate_implementation` call, alongside the existing stderr print.
+`tail -f .worktrees/local-coder-impl/mcp-servers/local-coder/local-coder-output.log`
+in a separate terminal is the confirmed, verified way to watch a
+delegated backend's real output live going forward. Committed as
+`b3835fb` (TDD, 3 new tests, all genuinely RED-before/GREEN-after).
+
+**MUCH more important: attempting to actually USE this watch-live setup
+surfaced a real, previously-undiscovered bug — a genuine hang, not a
+slow model.** While waiting to watch the retry (before the log-file fix
+had even been tried), the delegation call sat at "still running" for
+480+ seconds — well past the 300s `stall_timeout_seconds` — with no
+failover and no error. Investigated with `ps aux` (the aider process had
+consumed only ~5s of CPU across 4+ minutes of wall-clock time — a strong
+signal of "blocked," not "slow") and `sample` (macOS's built-in
+non-invasive stack sampler, no sudo needed): **the aider subprocess's
+main thread was parked in a `read()` syscall under
+`builtin_input_impl`/`PyFile_GetLine` — genuinely blocked trying to read
+from stdin.** Root cause: `run_monitored_subprocess`'s `Popen` call never
+set `stdin=`, so the backend subprocess inherited THIS SERVER'S OWN
+stdin — the MCP stdio JSON-RPC pipe from Claude Code, which is an open
+pipe that receives data but never sends EOF. Whatever caused aider to
+attempt a stdin read (despite `--yes`) then blocked forever, and — this
+is the important part — **the stall-timeout mechanism did not catch it**,
+because that mechanism only watches for OUTPUT activity; a process
+blocked reading stdin can still look "recently active" from earlier
+startup output, so the stall timer's clock never restarts and never
+fires. This was a real, unbounded hang with no automatic recovery path.
+
+**Fixed: `stdin=subprocess.DEVNULL`** added to the `Popen` call, severing
+the child from the parent's stdin entirely — any read attempt now gets
+immediate EOF instead of blocking. TDD note worth preserving: the
+straightforward version of this test passed even against the buggy code
+(pytest's own stdin is already non-blocking in this environment, so it
+didn't reproduce the bug) — had to construct the actual failure scenario
+directly (a real open pipe, held open with no EOF, dup2'd onto a forked
+child's stdin before calling the function under test) to get a genuine
+RED result (`STALLED`) before the fix and GREEN (immediate EOF) after.
+Committed as `620cfc0`. **110/110 tests passing.**
+
+**`config.yaml` cleanup — DONE, same procedure as before.** Confirmed via
+`ps aux` that nothing was running (the hung process had been killed —
+see below), then `git checkout -- config.yaml` to fully revert the
+drift (both `fallback_models` and `target_repo_path`) back to match
+`dev`. `git diff config.yaml` shows zero changes.
+
+**The hung aider process (PID 8099) was killed manually** (`kill 8099`)
+rather than left to hang indefinitely, since no automatic recovery
+existed before the stdin fix landed. **This means the
+`delegate_implementation` MCP tool call in whatever Claude Code session
+initiated it never received a normal return** — that call's parent
+process (the local-coder server, PID 4335) also appears to have exited
+around the same time (not confirmed why — possibly it noticed its child
+died and exited, or the MCP connection itself dropped). **If resuming in
+that same session: it likely needs to be restarted/reconnected** — check
+`claude mcp list` for `local-coder`'s connection status, and if it shows
+disconnected, that session needs a fresh reconnect (or a new session
+entirely) before delegating again.
+
+**If resuming: item 1 (the smoke test) has still never completed
+successfully — but this time for a well-understood, now-fixed reason,
+not an open question.** The next attempt should just work: (a) ensure
+`local-coder` is connected in a session that has today's commits loaded
+(a fresh session, or a reconnected one), (b) start
+`tail -f mcp-servers/local-coder/local-coder-output.log` (from the
+worktree) in a separate terminal BEFORE sending the task, (c) re-send
+the same Quick Reference task (text preserved above under "Smoke test
+attempt #2"), (d) watch the tail output live this time, (e) record
+whether it completes. Both real gaps found this round (no live
+visibility, the stdin hang) are now fixed and tested — there is no known
+reason left for this to fail, but "no known reason" is not the same as
+"verified working," which is exactly what item 1 still needs.
+
+### Housekeeping for Phase 2
+
+- **Open question: which directory should Phase 2 sessions actually run
+  from?** The main repo root is on `dev` directly (not a worktree
+  checkout of `local-coder-impl`) but is where `local-coder` connects,
+  since that's where the plugin got enabled. The worktree at
+  `.worktrees/local-coder-impl/` is where all the git history/commits in
+  this handoff doc actually happened, and is the isolated branch Phase 2
+  commits are meant to land on — but a session started there doesn't see
+  `local-coder` as connected. **Until this is reconciled, treat them as
+  two different jobs**: use the main-repo-root session (on `dev`) for
+  anything that needs the actual `local-coder` MCP tools (the smoke test,
+  any future manual delegate_implementation testing); keep using the
+  worktree session for git/code/doc work on the `local-coder-impl`
+  branch. Don't commit from the repo-root session while it's sitting on
+  `dev` directly — check `git branch --show-current` before any commit
+  there to avoid accidentally committing straight to `dev`.
+- **Keep this handoff doc's "Where things stand NOW" section current.**
+  Update it after every Phase 2 item completes or every time a session
+  is about to end mid-work — the same discipline that governed Phase 1
+  below.
+- The `.superpowers/sdd/progress.md` ledger (git-ignored, local-only) was
+  Phase 1's task ledger. If Phase 2 work also goes through
+  `subagent-driven-development`, either reuse it (noting the phase
+  boundary) or start a fresh one — decide when Phase 2's first task
+  actually kicks off, don't decide preemptively here.
+- All of Phase 1's history (execution gotchas, the 5 rounds of
+  review-bot fix cycles, key design decisions, environment facts) is
+  preserved below under "Archive: Phase 1" — it's still useful context
+  (e.g. the `restore_working_tree` fix history matters if item 1's smoke
+  test surfaces a NEW bug in that function — see the explicit escalation
+  note in the archive about not auto-patching a 6th time), just no
+  longer the first thing a resuming session needs to read.
+
+### Resume prompt (paste this if a session ends mid-work / hits its limit)
+
+**Two different directories are in play right now — read this before
+picking which one to resume in:**
+- **Main repo root** (`/Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder`,
+  currently on `dev`) — this is where the `local-coder` plugin is
+  installed/connected. **Use this one to check on or re-run the smoke
+  test** (see "Smoke test attempt #2" above for the exact task to send).
+  Do NOT commit here without first checking `git branch --show-current`
+  — it's sitting on `dev` directly, not a feature branch.
+- **Worktree** (`.worktrees/local-coder-impl/`, branch `local-coder-impl`)
+  — this is where all git history/commits for this project have
+  actually happened, and where Phase 2 code/doc changes belong.
+  `local-coder` is NOT connected in a session started here (see the
+  "Housekeeping for Phase 2" open question above) — don't try to run the
+  smoke test from this one.
+
+Do code/doc work in the **worktree** session (`.worktrees/local-coder-impl/`,
+branch `local-coder-impl`). Only use a **main-repo-root** session (on
+`dev`, where the plugin is installed/connected) if you need to actually
+CALL `local-coder` MCP tools live — but item 7's next steps are
+spec/plan work, which do NOT need a live MCP connection. Paste this:
+
+```
+Read docs/superpowers/handoff/2026-07-21-local-coder-handoff.md in the
+superpowers-local-coder repo and resume Phase 2 work from exactly where
+it left off, per the "Where things stand NOW" section at the top. We are
+on Phase 2 item 7 (mid-flight communication for delegate_implementation).
+The design spec is written, committed, and USER-APPROVED
+(docs/superpowers/specs/2026-07-22-mid-flight-communication-design.md,
+ca18b09). The Phase 2a implementation plan is written and committed
+(docs/superpowers/plans/2026-07-22-mid-flight-visibility-phase2a.md,
+b9a38e4) — read it, do NOT rewrite it. The probe testing is DONE and the
+throwaway elicit-probe was removed — do NOT rebuild it. The immediate
+next step: ask the user whether to execute the plan via
+superpowers:subagent-driven-development (recommended) or inline
+executing-plans, then execute the 5 TDD tasks in order. Do NOT build 2b
+(interactive prompt-answering) — it's gated. Work in the worktree
+session on branch local-coder-impl. Suite is at 110 tests passing before
+execution; the gate throughout is zero failures. Don't re-derive context
+from git log — the handoff doc, spec, and plan are the source of truth.
+Keep the handoff doc updated after each task. Respect session-usage
+limits: do not burn into paid credits; if approaching the limit, update
+the handoff doc and stop.
+```
+
+If the plugin-connection blocker somehow regresses (e.g. `local-coder`
+shows disconnected again), the doc already contains the exact `claude
+plugin marketplace add` / `claude plugin install` commands and the
+directory-mismatch fix (start from repo root, not the worktree) under
+"Item 1 attempt — findings and next step" above.
+
+---
+
+## Archive: Phase 1 (complete, merged to `dev` via PR #2)
 
 **Phase:** Design + plan are done and merged. **Currently executing the
 implementation plan via `superpowers:subagent-driven-development`,
@@ -187,18 +948,15 @@ real gap but belongs in its own dedicated eval-harness pass, not bundled
 into a review-fix cycle. All 5 resolved via `resolveReviewThread`.
 **62/62 review threads now resolved. Zero open threads on PR #2.**
 
-**Current state: PR #2 is open, all review threads resolved, 101/101
-tests passing.** `restore_working_tree` went through 5 review-driven fix
-rounds this session. **If any NEW finding shows up against that same
-function in a future session, stop and raise it with the repo owner
-before fixing** — don't keep patching indefinitely; either the function
-needs a more fundamental rethink, or review-bot findings on it should
-stop being auto-actioned without a cost/benefit check first. If resuming:
-check `gh pr view 2 --repo normaltusker/superpowers-local-coder` for any
-NEW review activity since this handoff was written before assuming
-there's nothing left to do — CI/review bots may post more later. If
-truly nothing new, this work is done; merging the PR is the human's
-call, not something to do unprompted.
+**PR #2 merged to `dev` at commit `70f8ba3` on 2026-07-22** (see
+"Where things stand NOW" at the top of this file for current state).
+`restore_working_tree` went through 5 review-driven fix rounds during
+Phase 1. **If any NEW finding shows up against that same function in a
+future session (e.g. during Phase 2 item 1's smoke test), stop and raise
+it with the repo owner before fixing** — don't keep patching
+indefinitely; either the function needs a more fundamental rethink, or
+review-bot findings on it should stop being auto-actioned without a
+cost/benefit check first.
 
 **Plan file note:** `docs/superpowers/plans/2026-07-21-local-coder-phase1.md`
 now has a "Task 6.5" section inserted between Task 6 and Task 7 — this
@@ -314,11 +1072,11 @@ end to end.
 
 **Workspace:** isolated git worktree at
 `.worktrees/local-coder-impl/` (relative to the main repo checkout root),
-on branch `local-coder-impl`, pushed to `origin`, tracking `origin/dev`.
-**PR #2 is open** (`local-coder-impl` → `dev`) — see line 16 above for
-the link and current status. The worktree stays alive for iterating on
-review feedback; `finishing-a-development-branch`'s Option 2 ("push and
-create PR") is what opened it, and that step is already done.
+on branch `local-coder-impl`, pushed to `origin`. **PR #2 merged to `dev`
+on 2026-07-22** (commit `70f8ba3`) — see "Where things stand NOW" at the
+top of this file. The branch/worktree was reused (fast-forwarded to
+match `dev` post-merge) rather than torn down, since Phase 2 continues on
+it directly, per explicit direction.
 
 If resuming in a fresh session: `cd .worktrees/local-coder-impl` (or if
 that worktree doesn't exist in your checkout, `git worktree list` from the

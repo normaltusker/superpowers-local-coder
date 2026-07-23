@@ -296,6 +296,7 @@ def run_monitored_subprocess(
     stall_timeout_seconds: float,
     idle_notify_interval_seconds: float,
     on_tick: Callable[[], None] | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> subprocess.CompletedProcess:
     # Run with an unbuffered binary pipe (not text=True) so we can read
     # whatever bytes are actually available via a non-blocking os.read()
@@ -304,8 +305,22 @@ def run_monitored_subprocess(
     # trailing newline) and then goes quiet without closing its pipe would
     # otherwise block readline() past the next poll interval, bypassing the
     # tick/stall checks for that period.
+    # stdin=DEVNULL severs the child from this process's own stdin. Without
+    # it, Popen defaults to inheriting the parent's stdin — for this MCP
+    # server, that's the stdio JSON-RPC pipe from Claude Code: an open
+    # pipe that receives data but never sends EOF. A backend subprocess
+    # that tries to read stdin for any reason (confirmed in practice: a
+    # real aider run hung with its main thread parked in a stdin read
+    # syscall, having consumed only ~5s of CPU across 4+ minutes of
+    # wall-clock time) then blocks forever waiting for a byte that can
+    # never arrive — and the stall-timeout mechanism below does NOT catch
+    # this, since it only watches for OUTPUT activity; a process blocked
+    # reading stdin can still look "recently active" from earlier startup
+    # output, so the stall timer never restarts and never fires. With
+    # stdin explicitly closed, any read attempt gets immediate EOF instead.
     process = subprocess.Popen(
-        cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        cmd, cwd=cwd, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
 
     # Bounded tail buffer: append new text, then trim from the front
@@ -339,10 +354,13 @@ def run_monitored_subprocess(
                 except OSError:
                     data = b""
                 if data:
-                    output_tail += decoder.decode(data)
+                    decoded = decoder.decode(data)
+                    output_tail += decoded
                     if len(output_tail) > _MAX_OUTPUT_CHARS:
                         output_tail = output_tail[-_MAX_OUTPUT_CHARS:]
                     last_activity = time.monotonic()
+                    if on_output is not None and decoded:
+                        on_output(decoded)
 
             if process.poll() is not None and not data:
                 # Drain any remaining buffered output before exiting.
@@ -353,11 +371,17 @@ def run_monitored_subprocess(
                         remaining = b""
                     if not remaining:
                         break
-                    output_tail += decoder.decode(remaining)
+                    decoded = decoder.decode(remaining)
+                    output_tail += decoded
                     if len(output_tail) > _MAX_OUTPUT_CHARS:
                         output_tail = output_tail[-_MAX_OUTPUT_CHARS:]
+                    if on_output is not None and decoded:
+                        on_output(decoded)
                 # Flush any trailing partial multi-byte sequence.
-                output_tail += decoder.decode(b"", final=True)
+                final_decoded = decoder.decode(b"", final=True)
+                output_tail += final_decoded
+                if on_output is not None and final_decoded:
+                    on_output(final_decoded)
                 break
 
             now = time.monotonic()

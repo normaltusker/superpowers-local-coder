@@ -1,5 +1,7 @@
+import os
 import subprocess
 import sys
+import tempfile
 import time
 
 import pytest
@@ -365,6 +367,78 @@ def test_restore_working_tree_discards_staged_rename(git_repo):
     assert status.strip() == ""
 
 
+def test_run_monitored_subprocess_isolates_child_stdin():
+    # Without an explicit stdin=, Popen inherits the PARENT's stdin — for
+    # this MCP server, that's the stdio JSON-RPC pipe from Claude Code: an
+    # open pipe that receives data but never sends EOF. A backend
+    # subprocess that tries to read stdin for any reason (e.g. aider
+    # prompting for input despite --yes, in some code paths) then blocks
+    # forever waiting for a byte that can never arrive — confirmed via a
+    # real hang: `sample` on a genuinely stuck aider process showed its
+    # main thread parked in `read()` under `builtin_input_impl`, having
+    # consumed only ~5s of CPU across 4+ minutes of wall-clock time. The
+    # stall-timeout mechanism does NOT catch this, because it only
+    # watches for OUTPUT activity — a process blocked reading stdin can
+    # still look "recently active" from earlier startup output, so the
+    # timer never restarts and never fires. The subprocess's stdin MUST
+    # be explicitly severed so any read attempt gets immediate EOF.
+    #
+    # Reproducing this needs a parent stdin that is a genuinely open pipe
+    # with no EOF pending — pytest's own stdin (already redirected to a
+    # closed/empty source) doesn't reproduce the bug, so this test
+    # constructs the scenario directly: a pipe this test process holds
+    # open (never closing the write end) is dup2'd onto fd 0 in a forked
+    # child, which then calls run_monitored_subprocess. If child stdin
+    # isolation is missing, run_monitored_subprocess's own subprocess
+    # inherits that open pipe and hangs past its stall timeout.
+    outcome_fd, OUTCOME_PATH = tempfile.mkstemp(prefix="stdin_isolation_outcome_")
+    os.close(outcome_fd)
+
+    read_fd, write_fd = os.pipe()
+    child_pid = os.fork()
+    if child_pid == 0:
+        # Child: make our open pipe our own stdin, then run the function
+        # under test. Report the outcome via a temp file since we can't
+        # return a value across fork/exit.
+        os.dup2(read_fd, 0)
+        os.close(read_fd)
+        os.close(write_fd)
+        try:
+            result = common.run_monitored_subprocess(
+                [
+                    sys.executable, "-c",
+                    "import sys\nline = sys.stdin.readline()\nprint(f'got: {line!r}')",
+                ],
+                cwd=".",
+                stall_timeout_seconds=2, idle_notify_interval_seconds=0.2,
+            )
+            with open(OUTCOME_PATH, "w") as f:
+                f.write(f"OK:{result.returncode}:{result.stdout.strip()}")
+        except common.StallError:
+            with open(OUTCOME_PATH, "w") as f:
+                f.write("STALLED")
+        except Exception as e:
+            with open(OUTCOME_PATH, "w") as f:
+                f.write(f"ERROR:{e}")
+        os._exit(0)
+    else:
+        # Parent: keep the write end open (no EOF ever sent) until the
+        # child is done, then read back what happened.
+        os.close(read_fd)
+        os.waitpid(child_pid, 0)
+        os.close(write_fd)
+        with open(OUTCOME_PATH) as f:
+            outcome = f.read()
+        os.unlink(OUTCOME_PATH)
+
+    assert outcome.startswith("OK:0:"), (
+        f"expected the grandchild to see EOF on stdin and exit cleanly, "
+        f"got: {outcome!r} (STALLED means it hung reading inherited "
+        f"stdin past the stall timeout — the bug this test guards against)"
+    )
+    assert "got: ''" in outcome
+
+
 def test_run_monitored_subprocess_returns_completed_process_on_success():
     result = common.run_monitored_subprocess(
         ["echo", "hello"], cwd=".",
@@ -459,3 +533,67 @@ def test_run_monitored_subprocess_kills_process_when_on_tick_raises():
     proc = captured_pid["proc"]
     proc.wait(timeout=2)
     assert proc.poll() is not None  # process must have been killed, not leaked
+
+
+def test_run_monitored_subprocess_calls_on_output_with_each_chunk():
+    # A caller needs live visibility into a long-running backend's actual
+    # output (not just a generic "still running" heartbeat from on_tick),
+    # e.g. to stream aider's real progress to the server's own stderr as
+    # it happens, rather than only seeing a bounded tail after the whole
+    # call finishes.
+    chunks = []
+    result = common.run_monitored_subprocess(
+        ["python3", "-c", "import sys\nprint('hello')\nprint('world')\nsys.stdout.flush()"],
+        cwd=".",
+        stall_timeout_seconds=5, idle_notify_interval_seconds=1,
+        on_output=lambda chunk: chunks.append(chunk),
+    )
+    assert result.returncode == 0
+    assert "".join(chunks) == result.stdout
+
+
+def test_run_monitored_subprocess_on_output_receives_decoded_text_not_bytes():
+    chunks = []
+    common.run_monitored_subprocess(
+        ["echo", "hello"], cwd=".",
+        stall_timeout_seconds=5, idle_notify_interval_seconds=1,
+        on_output=lambda chunk: chunks.append(chunk),
+    )
+    assert all(isinstance(c, str) for c in chunks)
+
+
+def test_run_monitored_subprocess_on_output_is_optional():
+    # Existing callers that don't pass on_output must be unaffected —
+    # this is an additive, backward-compatible parameter.
+    result = common.run_monitored_subprocess(
+        ["echo", "hello"], cwd=".",
+        stall_timeout_seconds=5, idle_notify_interval_seconds=1,
+    )
+    assert result.returncode == 0
+
+
+def test_run_monitored_subprocess_kills_process_when_on_output_raises():
+    captured_pid = {}
+    real_popen = subprocess.Popen
+
+    def spying_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        captured_pid["pid"] = proc.pid
+        captured_pid["proc"] = proc
+        return proc
+
+    def blowup_on_output(chunk):
+        raise RuntimeError("on_output blew up")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(subprocess, "Popen", spying_popen)
+        with pytest.raises(RuntimeError, match="on_output blew up"):
+            common.run_monitored_subprocess(
+                ["echo", "hello"], cwd=".",
+                stall_timeout_seconds=5, idle_notify_interval_seconds=1,
+                on_output=blowup_on_output,
+            )
+
+    proc = captured_pid["proc"]
+    proc.wait(timeout=2)
+    assert proc.poll() is not None

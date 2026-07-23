@@ -9,6 +9,7 @@ class CompletionResult:
     files_changed: list[str] = field(default_factory=list)
     commit_sha: str | None = None
     error: str | None = None
+    output_tail: str = ""
 
 
 class BackendAdapter(ABC):
@@ -39,5 +40,6 @@ class BackendAdapter(ABC):
         config: dict,
         model: str | None = None,
         on_tick: Callable[[], None] | None = None,
+        on_output: Callable[[str], None] | None = None,
     ) -> CompletionResult:
         ...
