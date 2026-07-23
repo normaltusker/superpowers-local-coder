@@ -81,16 +81,33 @@ non-blocking:
   dict IS correctly per-attempt. If ever revisited: reset
   `latest_line[0] = ""` at the top of each failover-loop iteration.
 
-**NEXT STEP when resuming:** run `superpowers:finishing-a-development-branch`.
-This is a Phase 2 increment on the reused `local-coder-impl` branch that
-already merged as PR #2 — so "finishing" here most likely means **push +
-open a NEW PR** (2a as its own PR against `dev`), OR keep accumulating on
-the branch if more Phase 2 items are coming before the next PR. **Ask the
-user** whether to (a) open a PR for 2a now, or (b) hold and continue with
-another Phase 2 backlog item first. Do NOT build 2b (interactive
-prompt-answering) — it stays gated until real aider-prompt frequency is
-observed. Working tree is clean. Respect session-usage limits — if
-approaching, update this doc and stop rather than burning paid credits.
+**PR #3 IS OPEN (2026-07-23):**
+https://github.com/normaltusker/superpowers-local-coder/pull/3 —
+"Phase 2 item 7: make delegate_implementation observable and
+non-hanging" (`local-coder-impl` → `dev`, +1914/−41, 15 files).
+Scoped as the WHOLE item-7 arc (one coherent theme: "make delegation
+observable and non-hanging"), not just the 5-task 2a plan — because the
+branch also carries the earlier item-7 code fixes that were committed
+directly during smoke-test debugging and never PR'd (the stdin-hang fix
+`620cfc0`, log-file visibility `b3835fb`, stderr streaming `870cb9a`).
+The user chose this single-theme framing over splitting into a separate
+hang-fix PR. PR body (full template completed, honest fork-specific
+framing, model/harness/plugin disclosure) lives at the scratchpad path
+`pr-body-2a.md` if it needs editing. 117/117 tests passing; final
+whole-branch review was "Ready to merge: Yes."
+
+**NEXT STEP when resuming:** monitor PR #3 for CI / review-bot activity
+(cubic-dev-ai, CodeRabbit — both reviewed PR #2 heavily, expect the
+same here). Follow the established pattern from PR #2: for each finding,
+**verify empirically before fixing** (don't trust the bot's claim), fix
+real issues with TDD, reply on the thread + resolve, skip genuinely
+out-of-scope items with a documented reason, and keep THIS handoff doc
+current after each round. Do NOT touch pre-existing upstream defects —
+only findings in code THIS PR changed. Do NOT build 2b (interactive
+prompt-answering) — gated. Merging PR #3 is the human's call, not
+something to do unprompted. Working tree is clean. Respect session-usage
+limits — if approaching, update this doc and stop rather than burning
+paid credits.
 
 **Working branch:** `local-coder-impl` (same branch, same worktree at
 `.worktrees/local-coder-impl/`) — reused for Phase 2 rather than cutting a
