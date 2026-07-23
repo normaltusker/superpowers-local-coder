@@ -16,7 +16,7 @@
 - **Never revert `stdin=subprocess.DEVNULL`** in `run_monitored_subprocess` (commit `620cfc0`). Nothing in this plan touches subprocess stdin.
 - The live pulse must be throttled to the existing tick cadence (`on_tick`), NOT emitted per raw output chunk. `report_progress` is ephemeral; per-chunk emission only adds flicker and notification traffic.
 - Run tests with the venv: `mcp-servers/local-coder/.venv/bin/python -m pytest ...`, from `mcp-servers/local-coder/`.
-- All tests must stay green: the suite is at 110 passing before this plan.
+- All tests must stay green: run the full suite before starting and note the baseline count, then require zero failures throughout. The gate is "no failures and no reduction from baseline," not a specific hard-coded number (the suite grows as tasks add tests).
 
 ---
 
@@ -447,7 +447,7 @@ to:
 - [ ] **Step 5: Run the FULL suite to confirm nothing else regressed**
 
 Run: `cd mcp-servers/local-coder && .venv/bin/python -m pytest tests/ -q`
-Expected: all pass (114 = prior 110 + Task 1's 1 + Task 2's 3 + Task 3's 2 + Task 4's 1, minus none — recount if the number differs, but zero failures is the gate).
+Expected: all pass. The gate is zero failures and no reduction from the pre-plan baseline — do not assert a specific total, since the suite count grows as tasks add tests.
 
 - [ ] **Step 6: Commit**
 

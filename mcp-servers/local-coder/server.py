@@ -126,11 +126,18 @@ async def _delegate_implementation_impl(
     attempt_errors = []
     last_output_tail = ""
 
-    # Shared holder: on_output writes the most recent non-empty output line
-    # here; on_tick reads it so the periodic progress pulse carries real
-    # backend output instead of a static heartbeat. A one-element list is a
-    # simple mutable cell both closures can see.
+    # Shared holders (one-element mutable cells both closures can see):
+    #   latest_line   — the most recent COMPLETE output line; on_tick reads
+    #                   it so the periodic progress pulse carries real
+    #                   backend output instead of a static heartbeat.
+    #   partial_line  — buffer for a chunk that ended mid-line (no trailing
+    #                   newline); carried across on_output calls so the
+    #                   pulse never shows an arbitrary partial suffix.
+    # Both are RESET at the top of each failover attempt (see the loop
+    # below) so a fallback model's opening pulse can't relabel the previous
+    # model's last line as its own.
     latest_line = [""]
+    partial_line = [""]
 
     def make_on_tick(model_name: str):
         def on_tick():
@@ -169,13 +176,29 @@ async def _delegate_implementation_impl(
                     f"[local-coder] warning: failed to write output log: {e}",
                     file=sys.stderr, flush=True,
                 )
-            stripped = chunk.strip()
-            if stripped:
-                # Keep only the last line of a multi-line chunk.
-                latest_line[0] = stripped.splitlines()[-1]
+            # on_output receives RAW read chunks, which can split mid-line.
+            # Prepend any buffered partial from the previous chunk, then
+            # promote only COMPLETE lines (text up to the last newline) to
+            # latest_line; whatever follows the last newline is an
+            # incomplete line — buffer it until a later chunk finishes it,
+            # so the pulse never shows an arbitrary chunk suffix.
+            buffered = partial_line[0] + chunk
+            if "\n" in buffered:
+                complete, _, remainder = buffered.rpartition("\n")
+                partial_line[0] = remainder
+                complete_lines = [ln for ln in complete.splitlines() if ln.strip()]
+                if complete_lines:
+                    latest_line[0] = complete_lines[-1].strip()
+            else:
+                partial_line[0] = buffered
         return on_output
 
     for model in attempt_models:
+        # Reset the pulse holders so this attempt starts clean — otherwise
+        # this model's first tick, before it emits anything, would surface
+        # the PREVIOUS model's last line labeled as this model's output.
+        latest_line[0] = ""
+        partial_line[0] = ""
         try:
             result = await anyio.to_thread.run_sync(
                 lambda model=model: backend.run_backend(

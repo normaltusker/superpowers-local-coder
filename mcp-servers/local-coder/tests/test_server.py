@@ -264,6 +264,83 @@ async def test_on_tick_pulse_reflects_latest_output_line(isolated_config, git_re
             assert "Running tests..." in message
 
 
+async def test_on_tick_pulse_ignores_incomplete_trailing_line(isolated_config, git_repo_no_remote):
+    # on_output is fed RAW read chunks, which can split mid-line. The pulse
+    # must show the latest COMPLETE line, not an arbitrary partial suffix —
+    # so a chunk ending without a newline should not overwrite the pulse
+    # with its incomplete tail; the partial text is held until its line
+    # finishes in a later chunk.
+    captured = {}
+
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+        captured["on_tick"] = on_tick
+        captured["on_output"] = on_output
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    mock_ctx = MagicMock()
+    mock_ctx.report_progress = MagicMock()
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        with patch("anyio.from_thread.run") as mock_from_thread_run:
+            await server._delegate_implementation_impl(
+                task="add a.py", branch="feature-branch",
+                target_repo_path=str(git_repo_no_remote), ctx=mock_ctx,
+            )
+
+            on_tick = captured["on_tick"]
+            on_output = captured["on_output"]
+
+            # A complete line, then a partial (no trailing newline).
+            on_output("Applying edit...\n")
+            on_output("Running te")  # incomplete — must NOT become the pulse
+            on_tick()
+
+            message = mock_from_thread_run.call_args.args[3]
+            assert "Applying edit..." in message
+            assert "Running te" not in message
+
+            # Now the line completes in a later chunk — pulse updates.
+            on_output("sts...\n")
+            on_tick()
+            message2 = mock_from_thread_run.call_args.args[3]
+            assert "Running tests..." in message2
+
+
+async def test_pulse_holder_resets_between_failover_attempts(isolated_config, git_repo_no_remote):
+    # latest_line is shared across the failover loop. Without a reset, the
+    # first tick of a fallback model — before it has emitted anything —
+    # would relabel the PREVIOUS model's last line as the new model's
+    # output. Each attempt must start the pulse holder clean.
+    config_module.merge_config({"fallback_models": ["ollama/fallback-model:1b"]})
+
+    captured = {}
+
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+        # First (primary) model emits a line then "fails"; capture the
+        # SECOND (fallback) model's on_tick to inspect its first pulse.
+        if model == "ollama/fallback-model:1b":
+            captured["fallback_on_tick"] = on_tick
+            return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+        # primary: emit output, then fail so we fall over
+        on_output("primary model was working on X\n")
+        return CompletionResult(success=False, error="primary failed", output_tail="x")
+
+    mock_ctx = MagicMock()
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        with patch("anyio.from_thread.run") as mock_from_thread_run:
+            await server._delegate_implementation_impl(
+                task="add a.py", branch="feature-branch",
+                target_repo_path=str(git_repo_no_remote), ctx=mock_ctx,
+            )
+            # Fire the fallback's first tick BEFORE it emits anything.
+            captured["fallback_on_tick"]()
+            message = mock_from_thread_run.call_args.args[3]
+
+    # The fallback's opening pulse must NOT carry the primary model's line.
+    assert "primary model was working on X" not in message
+    assert "fallback-model" in message  # falls back to "Running {model}..."
+
+
 async def test_delegate_implementation_on_output_writes_to_log_file(
     isolated_config, git_repo_no_remote, tmp_path, monkeypatch
 ):
