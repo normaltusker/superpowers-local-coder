@@ -155,7 +155,17 @@ async def _delegate_implementation_impl(
         file=sys.stderr, flush=True,
     )
     if ctx is not None:
-        await ctx.report_progress(0, None, f"Output log: {output_log_path}")
+        # Best-effort: a progress-notification failure (dropped token,
+        # transport hiccup, client without progress support) must NOT abort
+        # the real implementation workflow before the backend even runs.
+        # Warn and continue.
+        try:
+            await ctx.report_progress(0, None, f"Output log: {output_log_path}")
+        except Exception as e:
+            print(
+                f"[local-coder] warning: failed to announce output log path: {e}",
+                file=sys.stderr, flush=True,
+            )
 
     attempt_models = [cfg["model"], *cfg.get("fallback_models", [])]
     attempt_errors = []

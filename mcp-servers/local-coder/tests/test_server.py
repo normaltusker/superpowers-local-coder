@@ -636,6 +636,40 @@ async def test_output_log_path_announced_early_for_live_tailing(isolated_config,
     )
 
 
+async def test_early_log_announce_failure_does_not_abort_delegation(isolated_config, git_repo_no_remote, capsys):
+    # The early log-path announce is a best-effort visibility convenience —
+    # if ctx.report_progress raises (client dropped the progress token,
+    # transport hiccup, unsupported capability), it must NOT abort the whole
+    # delegation before the backend even runs. Otherwise a notification
+    # failure turns a best-effort channel into a hard dependency for the
+    # primary implementation workflow.
+    ran = {"backend": False}
+
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+        ran["backend"] = True
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    mock_ctx = MagicMock()
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("progress channel is gone")
+
+    mock_ctx.report_progress = boom
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        with patch("anyio.from_thread.run"):  # keep on_tick bridging inert
+            result = await server._delegate_implementation_impl(
+                task="add a.py", branch="feature-branch",
+                target_repo_path=str(git_repo_no_remote), ctx=mock_ctx,
+            )
+
+    # The delegation still ran and succeeded despite the announce failure.
+    assert ran["backend"] is True
+    assert result["success"] is True
+    # The failure was surfaced as a warning, not an abort.
+    assert "failed to announce output log" in capsys.readouterr().err
+
+
 async def test_push_failure_response_includes_output_tail(isolated_config, git_repo_with_remote, monkeypatch):
     # A push failure after a successful backend attempt still has the
     # backend transcript in scope — surface it so the caller can see what
