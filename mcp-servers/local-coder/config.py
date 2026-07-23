@@ -1,5 +1,4 @@
 import contextlib
-import fcntl
 import os
 import tempfile
 from pathlib import Path
@@ -8,6 +7,16 @@ import yaml
 
 import ollama as ollama_module
 from backends.common import KNOWN_BACKENDS
+
+# Select the OS-appropriate file-locking primitive at import time. `fcntl`
+# does not exist on Windows (importing it unconditionally crashes the
+# server there); `msvcrt` is the Windows stdlib equivalent. Both are wrapped
+# behind _config_lock() below so callers are platform-agnostic.
+_IS_WINDOWS = os.name == "nt"
+if _IS_WINDOWS:
+    import msvcrt as _lock_module
+else:
+    import fcntl as _lock_module
 
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
 
@@ -33,20 +42,31 @@ def _config_lock():
     delegate_implementation call reading config) can't interleave and lose
     updates or persist a combination that was never validated together.
 
-    Uses fcntl.flock on a dedicated lockfile (not CONFIG_PATH itself, so
-    save_config's atomic replace of CONFIG_PATH is never affected by the
-    lock's own file lifecycle). POSIX-only (fcntl), consistent with this
-    project's documented macOS/Linux dev-environment scope — no
-    third-party dependency needed.
+    Uses a dedicated lockfile (not CONFIG_PATH itself, so save_config's
+    atomic replace of CONFIG_PATH is never affected by the lock's own file
+    lifecycle). Cross-platform: fcntl.flock on POSIX, msvcrt.locking on
+    Windows — no third-party dependency needed.
     """
     lock_path = _lock_path()
     lock_path.touch(exist_ok=True)
     with open(lock_path, "w") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+        if _IS_WINDOWS:
+            # Lock 1 byte at offset 0; LK_LOCK blocks until the lock is free.
+            lock_file.write("\0")
+            lock_file.flush()
+            lock_file.seek(0)
+            _lock_module.locking(lock_file.fileno(), _lock_module.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                _lock_module.locking(lock_file.fileno(), _lock_module.LK_UNLCK, 1)
+        else:
+            _lock_module.flock(lock_file, _lock_module.LOCK_EX)
+            try:
+                yield
+            finally:
+                _lock_module.flock(lock_file, _lock_module.LOCK_UN)
 
 
 def load_config() -> dict:

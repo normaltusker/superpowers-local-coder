@@ -269,3 +269,32 @@ def test_list_available_models_with_prefix_propagates_unavailable_error(isolated
     with patch.object(ollama_module, "list_ollama_models", side_effect=ollama_module.OllamaUnavailableError("no ollama")):
         with pytest.raises(ollama_module.OllamaUnavailableError):
             config_module.list_available_models_with_prefix()
+
+
+def test_config_lock_selects_platform_lock_module():
+    # The module must pick the OS-appropriate lock primitive at import:
+    # fcntl on POSIX, msvcrt on Windows. This guards against the current
+    # unconditional `import fcntl`, which crashes import on Windows.
+    import config as config_module
+    if config_module._IS_WINDOWS:
+        import msvcrt  # noqa: F401 — must be importable on Windows
+        assert config_module._lock_module.__name__ == "msvcrt"
+    else:
+        import fcntl  # noqa: F401
+        assert config_module._lock_module.__name__ == "fcntl"
+
+
+def test_config_lock_still_guards_the_critical_section(isolated_config):
+    # The lock must still actually serialize: acquiring it, then confirming
+    # the guarded save round-trips a value, proves the context manager
+    # yields and releases cleanly on this platform.
+    import config as config_module
+    with config_module._config_lock():
+        config_module.save_config({"backend": "aider", "model": "ollama/x",
+                                   "fallback_models": [], "max_fallback_models": 3,
+                                   "stall_timeout_seconds": 300, "target_repo_path": None,
+                                   "branch_prefix": "local-coder/", "open_pr": False,
+                                   "pr_base_branch": "main",
+                                   "idle_notify_interval_seconds": 20,
+                                   "extra_backend_args": []})
+    assert config_module.load_config()["model"] == "ollama/x"
