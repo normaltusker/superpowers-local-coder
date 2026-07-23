@@ -81,8 +81,17 @@ async def _delegate_implementation_impl(
     # Truncate at the start of every call, not just append forever — this
     # is a fixed path reused across the server's whole lifetime, so
     # without truncation a human tailing it during a new call would see
-    # stale output mixed in from a prior, unrelated attempt.
-    OUTPUT_LOG_PATH.write_text("")
+    # stale output mixed in from a prior, unrelated attempt. Best-effort:
+    # the log file is a debugging convenience, so a truncation failure
+    # (bad path, permission, disk full) must never abort the whole
+    # delegation before the backend even runs — warn and continue.
+    try:
+        OUTPUT_LOG_PATH.write_text("")
+    except OSError as e:
+        print(
+            f"[local-coder] warning: failed to truncate output log: {e}",
+            file=sys.stderr, flush=True,
+        )
 
     try:
         validate_branch_name(branch)
@@ -140,11 +149,26 @@ async def _delegate_implementation_impl(
         # records the latest non-empty line so the on_tick pulse above can
         # surface it in-chat. Kept throttled to the tick cadence — the tick
         # is what emits to report_progress; this callback only records.
-        def on_output(chunk: str):
+        def on_output(chunk: str) -> None:
             line = f"[local-coder:{model_name}] {chunk}"
             print(line, end="", file=sys.stderr, flush=True)
-            with open(OUTPUT_LOG_PATH, "a") as f:
-                f.write(chunk)
+            # The log file is a best-effort debugging convenience, not the
+            # primary channel (stderr above + the on_tick pulse are). A
+            # write failure here (disk full, permission denied, bad path)
+            # must NEVER propagate: run_monitored_subprocess kills the
+            # subprocess on any on_output exception, but only the
+            # StallError path in AiderBackend.run_backend runs the
+            # working-tree cleanup — so a raw OSError would bypass cleanup
+            # and leave partial backend writes to pollute the next fallback
+            # attempt. Swallow it, warn, and keep the real attempt running.
+            try:
+                with open(OUTPUT_LOG_PATH, "a") as f:
+                    f.write(chunk)
+            except OSError as e:
+                print(
+                    f"[local-coder] warning: failed to write output log: {e}",
+                    file=sys.stderr, flush=True,
+                )
             stripped = chunk.strip()
             if stripped:
                 # Keep only the last line of a multi-line chunk.
@@ -193,6 +217,7 @@ async def _delegate_implementation_impl(
                         "files_changed": result.files_changed,
                         "commit_sha": result.commit_sha,
                         "model_used": model,
+                        "output_tail": result.output_tail,
                     }
                 if push.returncode != 0:
                     return {
@@ -201,6 +226,7 @@ async def _delegate_implementation_impl(
                         "files_changed": result.files_changed,
                         "commit_sha": result.commit_sha,
                         "model_used": model,
+                        "output_tail": result.output_tail,
                     }
 
                 if cfg.get("open_pr"):

@@ -353,6 +353,76 @@ async def test_delegate_implementation_truncates_output_log_at_call_start(
     assert "stale output from a previous call" not in log_path.read_text()
 
 
+async def test_on_output_log_write_failure_does_not_abort_the_attempt(
+    isolated_config, git_repo_no_remote, tmp_path, monkeypatch, capsys
+):
+    # on_output writes each chunk to OUTPUT_LOG_PATH. If that write fails
+    # (disk full, permission denied, bad path), the exception must NOT
+    # propagate out of on_output: run_monitored_subprocess propagates any
+    # exception raised in on_output and kills the subprocess, but only the
+    # StallError path in AiderBackend.run_backend runs the working-tree
+    # cleanup — so a raw OSError here would bypass cleanup and leave partial
+    # aider writes on disk to pollute the next fallback attempt. A debug-log
+    # write failure must never abort a real, in-progress delegated attempt.
+    missing_parent = tmp_path / "does_not_exist" / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", missing_parent)
+
+    captured_on_output = {}
+
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+        captured_on_output["on_output"] = on_output
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        await server._delegate_implementation_impl(
+            task="add a.py", branch="feature-branch",
+            target_repo_path=str(git_repo_no_remote),
+            ctx=None,
+        )
+
+    on_output = captured_on_output["on_output"]
+    # Must not raise even though the log path is unwritable.
+    on_output("hello from aider\n")
+
+    captured = capsys.readouterr()
+    # The chunk still reached stderr (the primary live channel)...
+    assert "hello from aider" in captured.err
+    # ...and the log-write failure was surfaced as a warning, not an abort.
+    assert "failed to write output log" in captured.err
+
+
+async def test_push_failure_response_includes_output_tail(isolated_config, git_repo_with_remote, monkeypatch):
+    # A push failure after a successful backend attempt still has the
+    # backend transcript in scope — surface it so the caller can see what
+    # the model did, even though the failure was in the push step, not the
+    # backend. Mirrors the success + all-failed paths.
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+        return CompletionResult(
+            success=True, files_changed=["a.py"], commit_sha="abc123",
+            output_tail="backend transcript before push failed",
+        )
+
+    real_run = subprocess.run
+
+    def fake_push(*args, **kwargs):
+        cmd = args[0] if args else kwargs.get("args", [])
+        if isinstance(cmd, list) and "push" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="remote rejected")
+        return real_run(*args, **kwargs)
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        with patch("subprocess.run", side_effect=fake_push):
+            result = await server._delegate_implementation_impl(
+                task="add a.py", branch="feature-branch",
+                target_repo_path=str(git_repo_with_remote),
+                ctx=None,
+            )
+
+    assert result["success"] is False
+    assert "git push failed" in result["error"]
+    assert result["output_tail"] == "backend transcript before push failed"
+
+
 async def test_delegate_implementation_rejects_invalid_branch_name(isolated_config, git_repo_no_remote):
     with patch("subprocess.run") as mock_run:
         result = await server._delegate_implementation_impl(
