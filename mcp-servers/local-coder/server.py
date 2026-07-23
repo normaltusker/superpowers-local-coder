@@ -49,6 +49,16 @@ def _make_output_log_path() -> Path:
         f"{OUTPUT_LOG_PATH.stem}-{unique}{OUTPUT_LOG_PATH.suffix}"
     )
 
+
+# Cap on the in-memory buffer that holds an incomplete (not-yet-delimited)
+# output line for the progress pulse. A backend emitting a very long
+# delimiter-free stream (e.g. a huge single line, or carriage-return
+# progress on a terminal that we treat as delimited below) must not grow
+# this without bound. The durable transcript is capped separately in
+# run_monitored_subprocess (_MAX_OUTPUT_CHARS); this is only the pulse's
+# working buffer, so a small cap is plenty.
+_PARTIAL_LINE_MAX_CHARS = 8_000
+
 BACKENDS = {
     "aider": AiderBackend,
     "codex": CodexBackend,
@@ -131,6 +141,22 @@ async def _delegate_implementation_impl(
         return {"success": False, "error": f"unknown backend: {backend_name}"}
     backend = backend_cls()
 
+    # Announce the per-call log path up front — before run_backend — so a
+    # human can start `tail -f`-ing it while the backend is still running.
+    # (The same path is also returned in the final result dict, but that
+    # only arrives after the whole call, including push/PR, has finished,
+    # which is too late for live tailing.) Best-effort: to stderr always,
+    # and via the progress channel when a Context is available. We're in
+    # the async body here (not a worker thread), so await report_progress
+    # directly rather than bridging through anyio.from_thread.
+    print(
+        f"[local-coder] streaming backend output to {output_log_path} "
+        "(tail -f it to follow live)",
+        file=sys.stderr, flush=True,
+    )
+    if ctx is not None:
+        await ctx.report_progress(0, None, f"Output log: {output_log_path}")
+
     attempt_models = [cfg["model"], *cfg.get("fallback_models", [])]
     attempt_errors = []
     last_output_tail = ""
@@ -139,14 +165,21 @@ async def _delegate_implementation_impl(
     #   latest_line   — the most recent COMPLETE output line; on_tick reads
     #                   it so the periodic progress pulse carries real
     #                   backend output instead of a static heartbeat.
-    #   partial_line  — buffer for a chunk that ended mid-line (no trailing
-    #                   newline); carried across on_output calls so the
-    #                   pulse never shows an arbitrary partial suffix.
-    # Both are RESET at the top of each failover attempt (see the loop
-    # below) so a fallback model's opening pulse can't relabel the previous
-    # model's last line as its own.
+    #   partial_line  — buffer for a chunk that ended mid-line (no line
+    #                   delimiter yet); carried across on_output calls so
+    #                   the pulse never shows an arbitrary partial suffix.
+    #                   Bounded to _PARTIAL_LINE_MAX_CHARS so a long
+    #                   delimiter-free stream can't grow it without bound.
+    #   log_write_ok  — flips False after the first log-write failure so we
+    #                   warn once and stop retrying (a persistent failure
+    #                   must not flood stderr every chunk and bury the live
+    #                   output it's meant to surface).
+    # latest_line + partial_line are RESET at the top of each failover
+    # attempt (see the loop below) so a fallback model's opening pulse
+    # can't relabel the previous model's last line as its own.
     latest_line = [""]
     partial_line = [""]
+    log_write_ok = [True]
 
     def make_on_tick(model_name: str):
         def on_tick():
@@ -170,44 +203,62 @@ async def _delegate_implementation_impl(
             print(line, end="", file=sys.stderr, flush=True)
             # The log file is a best-effort debugging convenience, not the
             # primary channel (stderr above + the on_tick pulse are). A
-            # write failure here (disk full, permission denied, bad path)
-            # must NEVER propagate: run_monitored_subprocess kills the
-            # subprocess on any on_output exception, but only the
+            # write failure here must NEVER propagate: run_monitored_subprocess
+            # kills the subprocess on any on_output exception, but only the
             # StallError path in AiderBackend.run_backend runs the
-            # working-tree cleanup — so a raw OSError would bypass cleanup
-            # and leave partial backend writes to pollute the next fallback
-            # attempt. Swallow it, warn, and keep the real attempt running.
-            try:
-                with open(output_log_path, "a") as f:
-                    f.write(chunk)
-            except OSError as e:
-                print(
-                    f"[local-coder] warning: failed to write output log: {e}",
-                    file=sys.stderr, flush=True,
-                )
+            # working-tree cleanup — so an unhandled exception would bypass
+            # cleanup and leave partial backend writes to pollute the next
+            # fallback attempt. So: write with explicit UTF-8 (the stream is
+            # already UTF-8-decoded upstream; the default encoding on a
+            # non-UTF-8 locale could otherwise raise UnicodeEncodeError,
+            # which is NOT an OSError), and catch broadly. After the first
+            # failure, stop retrying and warn only once — a persistent
+            # failure must not flood stderr on every chunk and bury the live
+            # output this is meant to surface.
+            if log_write_ok[0]:
+                try:
+                    with open(output_log_path, "a", encoding="utf-8", errors="replace") as f:
+                        f.write(chunk)
+                except Exception as e:
+                    log_write_ok[0] = False
+                    print(
+                        f"[local-coder] warning: failed to write output log "
+                        f"(disabling further log writes for this call): {e}",
+                        file=sys.stderr, flush=True,
+                    )
             # on_output receives RAW read chunks, which can split mid-line.
             # Prepend any buffered partial from the previous chunk, then
-            # promote only COMPLETE lines (text up to the last newline) to
-            # latest_line; whatever follows the last newline is an
-            # incomplete line — buffer it until a later chunk finishes it,
-            # so the pulse never shows an arbitrary chunk suffix.
+            # promote only COMPLETE lines to latest_line; whatever follows
+            # the last delimiter is an incomplete line — buffer it (bounded)
+            # until a later chunk finishes it, so the pulse never shows an
+            # arbitrary chunk suffix. "\r" is treated as a delimiter too, so
+            # carriage-return progress output (aider/pip-style bars, which
+            # never send "\n") still updates the pulse and can't grow the
+            # buffer forever.
             buffered = partial_line[0] + chunk
-            if "\n" in buffered:
-                complete, _, remainder = buffered.rpartition("\n")
-                partial_line[0] = remainder
+            normalized = buffered.replace("\r\n", "\n").replace("\r", "\n")
+            if "\n" in normalized:
+                complete, _, remainder = normalized.rpartition("\n")
                 complete_lines = [ln for ln in complete.splitlines() if ln.strip()]
                 if complete_lines:
                     latest_line[0] = complete_lines[-1].strip()
             else:
-                partial_line[0] = buffered
+                remainder = normalized
+            # Bound the carried-over partial: keep only its tail, so a long
+            # delimiter-free stream can't exhaust memory.
+            partial_line[0] = remainder[-_PARTIAL_LINE_MAX_CHARS:]
         return on_output
 
     for model in attempt_models:
-        # Reset the pulse holders so this attempt starts clean — otherwise
-        # this model's first tick, before it emits anything, would surface
-        # the PREVIOUS model's last line labeled as this model's output.
+        # Reset the per-attempt holders so this attempt starts clean:
+        #  - pulse holders, so this model's first tick (before it emits
+        #    anything) can't surface the PREVIOUS model's last line as its
+        #    own;
+        #  - log_write_ok, so a log-write failure during one model's attempt
+        #    doesn't permanently disable logging for the next fallback.
         latest_line[0] = ""
         partial_line[0] = ""
+        log_write_ok[0] = True
         try:
             result = await anyio.to_thread.run_sync(
                 lambda model=model: backend.run_backend(

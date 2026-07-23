@@ -97,33 +97,58 @@ base branches). All 5 verified real against the code, all fixed:
   → output_tail="" (spec/plan/handoff); handoff branch-status "zero diff"
   was stale. All 5 CodeRabbit threads replied + resolved.
 
-**cubic-dev-ai review of PR #3 — DONE (2026-07-23).** 7 findings. 6
-resolved, 1 intentionally left open:
-- 3 were DUPLICATES of CodeRabbit findings already fixed (855/863 =
-  bounded-tail wording → doc fix `4880293`; the reset-per-attempt was
-  also the opus Minor). Replied pointing at the commits + resolved.
-- 3 genuinely-new, all fixed with TDD (commit `76e7147`): 3636019888
-  (partial-line pulse — buffer incomplete lines, promote only complete
-  ones); 3636019892 (reset latest_line + partial_line per failover
-  attempt so a fallback's pulse can't relabel the prior model's line);
-  3636019886 (plan's hard-coded test count → made count-agnostic).
-- 3636019872 (P2, concurrent-log corruption) fixed with a bigger change
-  (commit `c694d9d`): per-call unique log path
-  (local-coder-output-<pid>-<uuid>.log) returned in the result as
-  `output_log`; eliminates the shared-file clobber + interleave, and
-  removes the start-of-call truncation entirely (nothing stale per call).
-  README + .gitignore updated.
+**cubic-dev-ai review of PR #3 — ROUND 1 (run `d761dbc2`) DONE
+(2026-07-23).** 7 findings. Categorized precisely (an earlier version of
+this note double-counted the reset-per-attempt finding — corrected here):
+- 2 were CodeRabbit DUPLICATES already fixed (855/863 = bounded-tail
+  wording → doc fix `4880293`). Replied pointing at the commits +
+  resolved.
+- 4 were cubic-specific, all fixed with TDD (commit `76e7147`):
+  3636019888 (partial-line pulse — buffer incomplete lines, promote only
+  complete ones); 3636019892 (reset latest_line/partial_line per failover
+  attempt so a fallback's pulse can't relabel the prior model's line —
+  this one ALSO matched the opus final-review Minor, but it's counted
+  once, here, as a cubic fix); 3636019886 (plan's hard-coded test count →
+  count-agnostic); and 3636019872 (P2, concurrent-log corruption) fixed
+  in a separate bigger change (commit `c694d9d`): per-call unique log
+  path returned as `output_log`, eliminating the shared-file clobber and
+  removing start-of-call truncation. (2 + 4 = 6 fixed/resolved.)
 - **STILL OPEN (deliberate): 3636019858** — a stalled attempt returns
-  output_tail="". Retaining the captured tail through StallError (carry
-  it on the exception, copy into CompletionResult) is a real feature
-  change, scoped out of this visibility PR; replied + left the thread
-  open as tracked future work. Do NOT resolve it without doing the work.
+  output_tail="". Retaining the captured tail through StallError is a
+  real feature change, scoped out of this visibility PR; replied + left
+  open as tracked future work. Do NOT resolve without doing the work.
 
-**PR #3 state: 15/16 review threads resolved** (the 1 open = 3636019858,
-intentional). 121/121 tests passing. Both bots (CodeRabbit 5, cubic 7)
-fully triaged. Every finding verified empirically before acting; no false
-positives found, all were real. NEXT: watch for any further bot re-review
-after these pushes; otherwise PR #3 is ready for the human's merge call.
+**cubic-dev-ai ROUND 2 (run `8352b075`) — DONE (2026-07-23).** cubic
+re-reviewed the round-1 fix commits and found 7 real SECOND-ORDER issues
+those fixes introduced (the "each fix surfaces the next edge" pattern).
+Per user decision: fixed 4 code + 2 doc, deferred 1.
+- Code, all TDD (commit TBD-this-round): UnicodeEncodeError on the log
+  write (now `encoding="utf-8", errors="replace"` + catch broadly, since
+  UnicodeEncodeError is not an OSError); partial_line unbounded + no CR
+  handling (now treats `\r` as a delimiter so progress bars update the
+  pulse, and caps the buffer at `_PARTIAL_LINE_MAX_CHARS`=8000); stderr
+  flood on persistent log failure (now warns ONCE via `log_write_ok`
+  flag, reset per attempt); log path not discoverable for live tailing
+  (now announced early via `ctx.report_progress` + stderr, before
+  run_backend, in addition to the result dict).
+- Docs: README updated (early-announce for live tailing); these two
+  handoff self-consistency nits (the double-count above, and this
+  round-2 block replacing the stale "waiting for review" text below).
+- **DEFERRED (replied, left open): 3636207385** (P2) — per-call log
+  files accumulate indefinitely, no retention policy. Real, but it's a
+  genuine design question (size/age/count policy), not a one-line fix;
+  scoped as future work, not bolted onto this PR.
+
+**PR #3 CURRENT STATE (supersedes any older status text below):**
+126/126 tests passing. Both bots fully triaged across 2 cubic rounds +
+1 CodeRabbit round. Open threads left intentionally: 3636019858 (stall
+tail) and 3636207385 (log retention) — both real future work, replied +
+tracked, do NOT resolve without doing the work. Everything else fixed +
+resolved. Every finding was verified empirically before acting. NEXT:
+watch for any further bot re-review; otherwise PR #3 is ready for the
+human's merge call. **Note:** the "PR #3 IS OPEN" / "NEXT STEP" block
+below is now HISTORICAL (it predates these review rounds and says
+117/117 / "await review") — trust THIS block, not that one.
 
 **PR #3 IS OPEN (2026-07-23):**
 https://github.com/normaltusker/superpowers-local-coder/pull/3 —

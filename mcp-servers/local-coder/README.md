@@ -67,8 +67,10 @@ steps are needed to see what the backend is doing.
 
 For deep debugging, the raw backend output is also written to a per-call
 log file next to the server
-(`mcp-servers/local-coder/local-coder-output-<pid>-<id>.log`). The exact
-path for a given call is returned in the tool result as `output_log`, so
-you can `tail -f` it if you want the raw stream. Each call gets its own
-file so concurrent delegations never clobber each other's log. Tailing it
-is a power-user convenience, not the normal way to follow a run.
+(`mcp-servers/local-coder/local-coder-output-<pid>-<id>.log`). Each call
+gets its own file so concurrent delegations never clobber each other's
+log. The exact path is announced early (as a progress update, before the
+backend starts) AND returned in the final tool result as `output_log`, so
+you can start `tail -f`-ing it while the run is still in progress if you
+want the raw stream. Tailing it is a power-user convenience, not the
+normal way to follow a run.
