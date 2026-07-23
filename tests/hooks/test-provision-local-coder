@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+HOOK="$REPO_ROOT/hooks/provision-local-coder"
+
+FAILURES=0
+TEST_ROOT="$(mktemp -d)"
+trap 'rm -rf "$TEST_ROOT"' EXIT
+
+pass() { echo "  [PASS] $1"; }
+fail() { echo "  [FAIL] $1"; FAILURES=$((FAILURES + 1)); }
+
+# --- Test 1: creates the venv + stamp on first run ---
+DATA1="$TEST_ROOT/data1"
+mkdir -p "$DATA1"
+CLAUDE_PLUGIN_ROOT="$REPO_ROOT" CLAUDE_PLUGIN_DATA="$DATA1" bash "$HOOK" >/dev/null 2>&1
+if [ -x "$DATA1/local-coder/.venv/bin/python" ] || [ -x "$DATA1/local-coder/.venv/Scripts/python.exe" ]; then
+    pass "first run creates the venv"
+else
+    fail "first run creates the venv"
+fi
+if [ -f "$DATA1/local-coder/requirements.installed.txt" ]; then
+    pass "first run writes the stamp"
+else
+    fail "first run writes the stamp"
+fi
+
+# --- Test 2: idempotent (second run leaves venv mtime unchanged-ish) ---
+STAMP="$DATA1/local-coder/requirements.installed.txt"
+BEFORE="$(cat "$STAMP" 2>/dev/null || true)"
+CLAUDE_PLUGIN_ROOT="$REPO_ROOT" CLAUDE_PLUGIN_DATA="$DATA1" bash "$HOOK" >/dev/null 2>&1
+AFTER="$(cat "$STAMP" 2>/dev/null || true)"
+if [ "$BEFORE" = "$AFTER" ]; then
+    pass "second run is idempotent (stamp unchanged)"
+else
+    fail "second run is idempotent (stamp unchanged)"
+fi
+
+# --- Test 3: no CLAUDE_PLUGIN_DATA → skips silently, exits 0 ---
+if env -u CLAUDE_PLUGIN_DATA CLAUDE_PLUGIN_ROOT="$REPO_ROOT" bash "$HOOK" >/dev/null 2>&1; then
+    pass "exits 0 when CLAUDE_PLUGIN_DATA is unset"
+else
+    fail "exits 0 when CLAUDE_PLUGIN_DATA is unset"
+fi
+
+# --- Test 4: no usable python → exits 0, writes no venv ---
+DATA2="$TEST_ROOT/data2"
+mkdir -p "$DATA2"
+# Empty PATH so no python3/python/py is found. bash itself is invoked by
+# absolute path (resolved from the *current* PATH before it's emptied),
+# since execvp would otherwise try to resolve the bare "bash" command
+# through the new, empty PATH and fail before ever reaching the hook.
+BASH_BIN="$(command -v bash)"
+if env -i PATH="" CLAUDE_PLUGIN_ROOT="$REPO_ROOT" CLAUDE_PLUGIN_DATA="$DATA2" "$BASH_BIN" "$HOOK" >/dev/null 2>&1; then
+    pass "exits 0 when no python is available"
+else
+    fail "exits 0 when no python is available"
+fi
+if [ ! -e "$DATA2/local-coder/.venv" ]; then
+    pass "creates no venv when no python is available"
+else
+    fail "creates no venv when no python is available"
+fi
+
+if [ "$FAILURES" -gt 0 ]; then echo "STATUS: FAILED ($FAILURES)"; exit 1; fi
+echo "STATUS: PASSED"
