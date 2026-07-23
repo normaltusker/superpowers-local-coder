@@ -7,9 +7,30 @@ session end — a stale handoff is worse than none.
 
 ## Where things stand NOW (read this first)
 
-**Phase 1 is merged. Phase 2 in progress — currently on item 7.** PR #2
-(`local-coder-impl` → `dev`) merged at `70f8ba3`. `dev` has the full
-Phase 1 build.
+**Phase 1 merged (PR #2, `70f8ba3`). Phase 2 item 7 (mid-flight
+visibility) merged (PR #3, merge commit `ea3288c`, 2026-07-23).**
+`local-coder-impl` was fast-forwarded to `ea3288c` and is the clean base
+for the next Phase 2 work. `main` still untouched — everything lands on
+`dev`.
+
+**CURRENT FOCUS (2026-07-23): a cross-platform "launch/bootstrap"
+feature — Phase 2 items 2 + 3 combined, with item 1's smoke test as its
+acceptance validation.** The user chose to do items 1+2+3 together
+because they're tightly coupled: item 2 (fresh-install venv provisioning
+/ `${CLAUDE_PLUGIN_ROOT}` reachability) is what BLOCKED item 1's smoke
+test last time; item 3 (Windows) shares the same root (how the MCP server
+gets launched across environments). Plan: brainstorm → spec → plan →
+build one launcher/bootstrap that (a) provisions the venv on fresh
+install, (b) resolves paths cross-platform (POSIX `.venv/bin/python` vs
+Windows `.venv/Scripts/python.exe`; also `config.py`'s `fcntl` file
+locking is POSIX-only and needs a Windows story), then (c) run item 1's
+smoke test as the end-to-end acceptance check. One coherent PR. Currently
+in the BRAINSTORMING step. Item 7's two deferred follow-ups (stall-tail
+retention, log-retention policy) remain tracked, NOT part of this chunk.
+
+---
+
+### (Historical) item 7 design notes — kept for reference
 
 **LATEST (2026-07-22, item 7 = mid-flight communication):** Item 7 was
 selected as the Phase 2 focus (over the other backlog items). Ran
