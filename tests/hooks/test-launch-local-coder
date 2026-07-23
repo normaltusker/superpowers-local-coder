@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+HOOK="$REPO_ROOT/hooks/launch-local-coder"
+
+FAILURES=0
+TEST_ROOT="$(mktemp -d)"
+trap 'rm -rf "$TEST_ROOT"' EXIT
+pass() { echo "  [PASS] $1"; }
+fail() { echo "  [FAIL] $1"; FAILURES=$((FAILURES + 1)); }
+
+# --- Test 1: missing venv → exit 1 with a clear message ---
+DATA1="$TEST_ROOT/data1"; mkdir -p "$DATA1"
+OUT="$(CLAUDE_PLUGIN_DATA="$DATA1" bash "$HOOK" /nonexistent/server.py 2>&1)"; RC=$?
+if [ "$RC" -eq 1 ]; then pass "missing venv exits 1"; else fail "missing venv exits 1 (got $RC)"; fi
+if printf '%s' "$OUT" | grep -q "venv"; then pass "missing venv prints a clear reason"; else fail "missing venv prints a clear reason"; fi
+
+# --- Test 2: with a fake venv python, it execs that python on the arg ---
+DATA2="$TEST_ROOT/data2"
+mkdir -p "$DATA2/local-coder/.venv/bin"
+# Fake python that just echoes a marker + its arg, so we can prove exec.
+cat > "$DATA2/local-coder/.venv/bin/python" <<'FAKE'
+#!/usr/bin/env bash
+echo "FAKE_PY_RAN arg=$1"
+FAKE
+chmod +x "$DATA2/local-coder/.venv/bin/python"
+OUT="$(CLAUDE_PLUGIN_DATA="$DATA2" bash "$HOOK" /some/server.py 2>&1)"; RC=$?
+if [ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q "FAKE_PY_RAN arg=/some/server.py"; then
+    pass "execs the venv python on the server.py arg"
+else
+    fail "execs the venv python on the server.py arg (rc=$RC out=$OUT)"
+fi
+
+if [ "$FAILURES" -gt 0 ]; then echo "STATUS: FAILED ($FAILURES)"; exit 1; fi
+echo "STATUS: PASSED"

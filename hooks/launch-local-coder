@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# MCP launch hook: exec the local-coder server using the venv interpreter
+# provisioned into the persistent plugin-data dir by hooks/provision-local-coder.
+#
+# Extensionless (see docs/windows/polyglot-hooks.md); dispatched by
+# hooks/run-hook.cmd. Arg $1 is the absolute path to server.py.
+#
+# Unlike the provisioning hook, this does NOT silent-exit-0 on failure: an
+# MCP server that can't find its interpreter genuinely cannot run, so we
+# exit nonzero and let Claude Code surface it as a failed server rather than
+# a connected-but-dead one.
+set -uo pipefail
+
+SERVER_PY="${1:-}"
+if [ -z "$SERVER_PY" ]; then
+    echo "[local-coder] launch failed: no server.py path argument" >&2
+    exit 1
+fi
+
+VENV="${CLAUDE_PLUGIN_DATA:-}/local-coder/.venv"
+if [ -x "$VENV/bin/python" ]; then
+    exec "$VENV/bin/python" "$SERVER_PY"
+elif [ -x "$VENV/Scripts/python.exe" ]; then
+    exec "$VENV/Scripts/python.exe" "$SERVER_PY"
+fi
+
+echo "[local-coder] launch failed: venv interpreter not found at $VENV — the" \
+     "SessionStart provisioning hook did not complete (check its stderr)." >&2
+exit 1
