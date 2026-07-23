@@ -13,20 +13,68 @@ visibility) merged (PR #3, merge commit `ea3288c`, 2026-07-23).**
 for the next Phase 2 work. `main` still untouched — everything lands on
 `dev`.
 
-**CURRENT FOCUS (2026-07-23): a cross-platform "launch/bootstrap"
-feature — Phase 2 items 2 + 3 combined, with item 1's smoke test as its
-acceptance validation.** The user chose to do items 1+2+3 together
-because they're tightly coupled: item 2 (fresh-install venv provisioning
-/ `${CLAUDE_PLUGIN_ROOT}` reachability) is what BLOCKED item 1's smoke
-test last time; item 3 (Windows) shares the same root (how the MCP server
-gets launched across environments). Plan: brainstorm → spec → plan →
-build one launcher/bootstrap that (a) provisions the venv on fresh
-install, (b) resolves paths cross-platform (POSIX `.venv/bin/python` vs
-Windows `.venv/Scripts/python.exe`; also `config.py`'s `fcntl` file
-locking is POSIX-only and needs a Windows story), then (c) run item 1's
-smoke test as the end-to-end acceptance check. One coherent PR. Currently
-in the BRAINSTORMING step. Item 7's two deferred follow-ups (stall-tail
-retention, log-retention policy) remain tracked, NOT part of this chunk.
+**CURRENT FOCUS (2026-07-23): cross-platform "launch/bootstrap" feature
+(Phase 2 items 1+2+3) — BUILT, and being SMOKE-TESTED.** Spec:
+`docs/superpowers/specs/2026-07-23-launch-bootstrap-design.md`. Plan:
+`docs/superpowers/plans/2026-07-23-launch-bootstrap.md`. All 9 plan tasks
+built via subagent-driven-development, final whole-branch review clean,
+135 Python tests + 3 hook suites passing. Approach: a `SessionStart` hook
+(`hooks/provision-local-coder`, extensionless, dispatched by the existing
+`run-hook.cmd`) provisions the venv into `${CLAUDE_PLUGIN_DATA}/local-coder/.venv`
+(manifest-diff pattern); config.yaml + per-call logs also moved to
+`${CLAUDE_PLUGIN_DATA}` (out of the ephemeral `${CLAUDE_PLUGIN_ROOT}`);
+`config.py` lock is now fcntl(POSIX)/msvcrt(Windows); `.mcp.json` launches
+via `hooks/launch-local-coder`.
+
+**SMOKE TEST (2026-07-23) — provisioning PASSED, caught + fixed a REAL
+launch bug:**
+- ✅ Auto-provisioning works: the SessionStart hook created the venv +
+  stamp at `~/.claude/plugins/data/superpowers-superpowers-dev/local-coder/`
+  with zero manual steps (verified on disk; the venv's python imports
+  fastmcp).
+- ❌→✅ **Launch bug (fixed, commit `c12c9a9`):** the launch hook read the
+  plugin-data dir from the `CLAUDE_PLUGIN_DATA` *env var*, but Claude Code
+  does NOT reliably export that var into the MCP server subprocess's
+  environment (it DOES give it to the SessionStart hook — that's why
+  provisioning worked — and it DOES substitute `${CLAUDE_PLUGIN_DATA}`
+  into `.mcp.json` argv). So `${CLAUDE_PLUGIN_DATA:-}/local-coder/.venv`
+  collapsed to `/local-coder/.venv` and the server failed to connect. Fix:
+  `.mcp.json` now passes `${CLAUDE_PLUGIN_DATA}` as an explicit argv, and
+  `launch-local-coder` takes the data dir as `$1` / server.py as `$2`
+  (env-var fallback only for hook-test/dev). TDD test reproduces the exact
+  bug. Verified the real `run-hook.cmd` dispatch forwards args correctly.
+
+**RE-SMOKE-TEST PENDING** (the fix is committed but the INSTALLED plugin
+cache is still the pre-fix copy — see below). Item 7's two deferred
+follow-ups (stall-tail retention, log-retention policy) remain tracked,
+NOT part of this chunk.
+
+**HOW TO RE-SMOKE-TEST (the installed plugin cache is a STALE plain-copy;
+`claude plugin update` won't refresh it because the marketplace version is
+pinned at `6.1.1` and doesn't bump).** From the MAIN REPO ROOT
+(`/Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder`,
+where the plugin is enabled at project scope — enablement lives in that
+dir's `.claude/settings.json`):
+1. `claude plugin marketplace update superpowers-dev` (refresh the
+   directory source from the worktree).
+2. `claude plugin disable superpowers@superpowers-dev --scope project`
+3. `claude plugin uninstall superpowers@superpowers-dev --scope project`
+4. `claude plugin install superpowers@superpowers-dev --scope project`
+   (re-copies the current worktree into the cache; auto-re-enables).
+5. Verify the cache has the fix:
+   `grep -o "CLAUDE_PLUGIN_DATA" ~/.claude/plugins/cache/superpowers-dev/superpowers/*/.mcp.json`
+   (should print `CLAUDE_PLUGIN_DATA` — the fixed `.mcp.json`).
+6. Start a fresh session from the main repo root, `claude mcp list`,
+   confirm `plugin:superpowers:local-coder` is **Connected**. (Removing any
+   stray project `.mcp.json` registration first via
+   `claude mcp remove local-coder -s project` avoids a duplicate-name
+   collision — a stale one existed on the main checkout's `local-coder/test-branch`.)
+7. Then run a real `delegate_implementation` end-to-end.
+**Known Phase 2 gap this surfaced:** the pinned-`6.1.1`-version + plain-copy
+cache means a directory-source plugin needs uninstall/reinstall (or a
+version bump) to pick up source changes — worth noting in the PR as a
+real-install caveat, though it's a Claude Code plugin-update behavior, not
+our code.
 
 ---
 
