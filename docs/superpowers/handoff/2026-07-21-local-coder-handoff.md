@@ -44,10 +44,25 @@ launch bug:**
   (env-var fallback only for hook-test/dev). TDD test reproduces the exact
   bug. Verified the real `run-hook.cmd` dispatch forwards args correctly.
 
-**RE-SMOKE-TEST PENDING** (the fix is committed but the INSTALLED plugin
-cache is still the pre-fix copy — see below). Item 7's two deferred
-follow-ups (stall-tail retention, log-retention policy) remain tracked,
-NOT part of this chunk.
+**SMOKE TEST round 2 — caught + fixed a startup RACE (commit `49a7f6c`):**
+After the argv fix, re-testing showed a fresh install's SessionStart
+provisioning (~30s venv+pip) may not finish before Claude Code launches
+the MCP server, so the FIRST session showed `local-coder` disconnected
+(self-healed next session). **Fixed by construction:** extracted the
+provisioning logic into a shared `hooks/ensure-local-coder-venv`, and the
+LAUNCHER now calls it FIRST (provision-if-needed, then exec) — so a fresh
+install provisions on the fly during the first launch and connects
+immediately, regardless of startup ordering. `provision-local-coder` is
+now a thin SessionStart pre-warm wrapper. **Verified end-to-end:**
+launching against a completely fresh EMPTY data dir provisions the venv
+AND starts the server in one shot ("Starting MCP server 'local-coder'
+with transport 'stdio'"). All 4 hook suites + 135 Python tests passing.
+
+**RE-SMOKE-TEST PENDING** (all fixes committed — `c12c9a9` argv,
+`49a7f6c` launch-time provisioning — but the INSTALLED plugin cache is
+still pre-fix; needs the uninstall/reinstall refresh below). Item 7's two
+deferred follow-ups (stall-tail retention, log-retention policy) remain
+tracked, NOT part of this chunk.
 
 **HOW TO RE-SMOKE-TEST (the installed plugin cache is a STALE plain-copy;
 `claude plugin update` won't refresh it because the marketplace version is
