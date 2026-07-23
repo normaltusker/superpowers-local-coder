@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# SessionStart hook: provision the local-coder MCP server's Python venv into
-# the persistent plugin-data dir. Best-effort — NEVER fails the session.
+# SessionStart hook: PRE-WARM the local-coder MCP server's Python venv into
+# the persistent plugin-data dir, so it's ready before the first delegation.
 #
-# Extensionless on purpose (see docs/windows/polyglot-hooks.md): Claude Code
-# on Windows prepends `bash` to any command containing `.sh`. Dispatched by
-# hooks/run-hook.cmd. Emits NO stdout (unlike hooks/session-start, which has
-# a JSON stdout contract) — all diagnostics go to stderr.
+# This is a thin wrapper around hooks/ensure-local-coder-venv (the shared
+# provisioning logic). The launcher (hooks/launch-local-coder) also calls
+# that same script at launch time, so provisioning does NOT depend on this
+# SessionStart hook having finished first — this just warms it early.
+#
+# Best-effort — NEVER fails the session (always exit 0). Extensionless (see
+# docs/windows/polyglot-hooks.md); dispatched by hooks/run-hook.cmd. Emits
+# NO stdout (unlike hooks/session-start, which has a JSON stdout contract).
 set -uo pipefail
 
 # Only meaningful in an installed plugin, where CLAUDE_PLUGIN_DATA is set.
@@ -15,61 +19,10 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-REQ="${PLUGIN_ROOT}/mcp-servers/local-coder/requirements.txt"
-DATA_DIR="${CLAUDE_PLUGIN_DATA}/local-coder"
-VENV="${DATA_DIR}/.venv"
-STAMP="${DATA_DIR}/requirements.installed.txt"
 
-mkdir -p "$DATA_DIR"
-
-# Find a Python >=3.10 that actually runs (skips the Windows Store stub,
-# which exits nonzero on `-c ""`). No cygpath (per repo convention).
-PYTHON=""
-for candidate in "python3" "python" "py -3"; do
-    if $candidate -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" >/dev/null 2>&1; then
-        PYTHON="$candidate"
-        break
-    fi
-done
-if [ -z "$PYTHON" ]; then
-    echo "[local-coder] provisioning skipped: no Python >=3.10 found on PATH" >&2
-    exit 0
-fi
-
-# Up to date? (venv present AND stamp matches current requirements.txt)
-if [ -e "$VENV" ] && [ -f "$STAMP" ] && cmp -s "$REQ" "$STAMP"; then
-    exit 0
-fi
-
-echo "[local-coder] provisioning venv (first run or requirements changed)..." >&2
-
-# Create the venv if missing.
-if [ ! -e "$VENV" ]; then
-    if ! $PYTHON -m venv "$VENV" >&2; then
-        echo "[local-coder] provisioning failed: could not create venv" >&2
-        rm -f "$STAMP"
-        exit 0
-    fi
-fi
-
-# Locate the venv's python (POSIX vs Windows layout).
-if [ -x "$VENV/bin/python" ]; then
-    VENV_PY="$VENV/bin/python"
-elif [ -x "$VENV/Scripts/python.exe" ]; then
-    VENV_PY="$VENV/Scripts/python.exe"
-else
-    echo "[local-coder] provisioning failed: venv python not found" >&2
-    rm -f "$STAMP"
-    exit 0
-fi
-
-# Install deps. Stamp only on success (so a failure retries next session).
-if "$VENV_PY" -m pip install -r "$REQ" >&2; then
-    cp "$REQ" "$STAMP"
-    echo "[local-coder] provisioning complete" >&2
-else
-    echo "[local-coder] provisioning failed: pip install error" >&2
-    rm -f "$STAMP"
-fi
+# Call the shared provisioner; swallow its exit code — a provisioning
+# failure here must never break the session (the launcher will report a
+# real failure later if the venv still isn't usable at launch time).
+bash "${SCRIPT_DIR}/ensure-local-coder-venv" "$PLUGIN_ROOT" "$CLAUDE_PLUGIN_DATA" || true
 
 exit 0

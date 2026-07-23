@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# MCP launch hook: exec the local-coder server using the venv interpreter
-# provisioned into the persistent plugin-data dir by hooks/provision-local-coder.
+# MCP launch hook: ensure the local-coder venv exists, then exec the server
+# with the venv interpreter.
+#
+# It calls hooks/ensure-local-coder-venv FIRST (the same shared provisioner
+# the SessionStart hook uses), so a fresh install connects on the very first
+# session WITHOUT depending on the SessionStart provisioning hook having
+# finished — removing any startup-ordering race. If the venv already exists
+# and is current, ensure-local-coder-venv is a fast no-op.
 #
 # Extensionless (see docs/windows/polyglot-hooks.md); dispatched by
 # hooks/run-hook.cmd.
@@ -37,6 +43,14 @@ if [ -z "$SERVER_PY" ]; then
     exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Ensure the venv is present + current before launching. This is what makes
+# a fresh install work on the first session regardless of SessionStart
+# ordering. A fast no-op when the venv is already up to date.
+bash "${SCRIPT_DIR}/ensure-local-coder-venv" "$PLUGIN_ROOT" "$DATA_DIR" >&2 || true
+
 VENV="$DATA_DIR/local-coder/.venv"
 if [ -x "$VENV/bin/python" ]; then
     exec "$VENV/bin/python" "$SERVER_PY"
@@ -44,6 +58,6 @@ elif [ -x "$VENV/Scripts/python.exe" ]; then
     exec "$VENV/Scripts/python.exe" "$SERVER_PY"
 fi
 
-echo "[local-coder] launch failed: venv interpreter not found at $VENV — the" \
-     "SessionStart provisioning hook did not complete (check its stderr)." >&2
+echo "[local-coder] launch failed: venv interpreter not found at $VENV even" \
+     "after attempting to provision it (check the provisioning output above)." >&2
 exit 1
