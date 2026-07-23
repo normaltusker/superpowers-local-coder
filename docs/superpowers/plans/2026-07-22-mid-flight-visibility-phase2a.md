@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make `delegate_implementation` show real backend progress while it runs (a live pulse in the chat carrying the latest output line) and leave the full transcript in the persisted final result.
+**Goal:** Make `delegate_implementation` show real backend progress while it runs (a live pulse in the chat carrying the latest output line) and leave the bounded output tail (last `_MAX_OUTPUT_CHARS` = 20 000 chars, not a complete transcript) in the persisted final result.
 
 **Architecture:** Two independent additions to the existing local-coder MCP server. (1) A durable record: thread the backend's captured output tail up through `CompletionResult` into `delegate_implementation`'s returned dict, on both success and failure. (2) A live pulse: have the existing per-tick `report_progress` heartbeat carry the latest real output line (fed from the existing `on_output` chunk callback via a small shared buffer) instead of a static "still running" string, throttled to the existing tick cadence. No new MCP primitives, no new dependencies, no changes to `stdin=DEVNULL`.
 
@@ -92,7 +92,7 @@ git commit -m "local-coder: add output_tail field to CompletionResult"
 
 **Interfaces:**
 - Consumes: `CompletionResult(..., output_tail=...)` from Task 1; `run_monitored_subprocess` returning `CompletedProcess` whose `.stdout` is the bounded output tail.
-- Produces: `AiderBackend.run_backend` now returns `output_tail=result.stdout` on the non-zero-exit, no-commits, and success paths. (The pre-subprocess "no model" path and the `StallError` path have no captured `result`, so they keep `output_tail=""` — this is intentional; there is no subprocess output to report in those cases.)
+- Produces: `AiderBackend.run_backend` now returns `output_tail=result.stdout` on the non-zero-exit, no-commits, and success paths. (The pre-subprocess "no model" path has no `result` at all. The `StallError` path DOES have subprocess output captured up to the kill point, but this plan does not retain it — that path returns `output_tail=""`, so a stalled attempt yields an empty tail. Retaining partial output through `StallError` is a possible future improvement, deliberately out of scope here.)
 
 - [ ] **Step 1: Write the failing tests**
 

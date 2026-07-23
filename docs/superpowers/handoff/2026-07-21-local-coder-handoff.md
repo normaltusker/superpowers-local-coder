@@ -47,7 +47,10 @@ now WRITTEN and committed** (`b9a38e4`):
 1. Add `output_tail: str = ""` field to `CompletionResult` (base.py).
 2. Populate it in `AiderBackend.run_backend` from `result.stdout` on the
    3 result-bearing return paths (non-zero exit, no-commits, success);
-   the no-model and StallError paths keep `""` (no subprocess output).
+   the no-model path has no result, and the StallError path keeps `""`
+   — NOT because there's no output (a stall does capture output up to the
+   kill) but because that path currently discards it; retaining it is a
+   possible future improvement, out of scope for the visibility pass.
 3. Surface `output_tail` in `delegate_implementation`'s result dict on
    success + all-failed (all-failed uses the LAST attempt's tail).
 4. Live pulse: `make_on_tick`/`make_on_output` share a `latest_line`
@@ -112,11 +115,12 @@ paid credits.
 **Working branch:** `local-coder-impl` (same branch, same worktree at
 `.worktrees/local-coder-impl/`) — reused for Phase 2 rather than cutting a
 new branch, per explicit direction. It was fast-forwarded to match `dev`
-right after the merge, so it currently has zero diff against `dev`; Phase
-2 commits land on top of it from here. **`main` is untouched — Phase 2
-work merges to `dev` only. Merging `dev` to `main` happens later, once
-Phase 2's basics are complete, and is explicitly the human's call, not
-something to do unprompted.**
+right after PR #2 merged, and now carries the Phase 2 item-7 commits on
+top — so it is **ahead of `dev` and is the source branch for PR #3**.
+Further Phase 2 commits land on top of it from here. **`main` is
+untouched — Phase 2 work merges to `dev` only. Merging `dev` to `main`
+happens later, once Phase 2's basics are complete, and is explicitly the
+human's call, not something to do unprompted.**
 
 ### Phase 2 backlog
 

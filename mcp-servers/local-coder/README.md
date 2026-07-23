@@ -59,9 +59,11 @@ these are a best-effort mitigation, not a guarantee against this timeout.
 
 While `delegate_implementation` runs, its progress appears live in the
 Claude Code conversation — the latest line of backend output surfaces
-as a progress update, and the full output transcript is included in the
-tool's final result (the `output_tail` field). No extra steps are needed
-to see what the backend is doing.
+as a progress update, and a bounded tail of the backend output is
+included in the tool's final result (the `output_tail` field). That tail
+is truncated to the last 20,000 characters, so for a long or chatty run
+it is the recent output, not the entire backend transcript. No extra
+steps are needed to see what the backend is doing.
 
 For deep debugging, the raw backend output is also written to
 `mcp-servers/local-coder/local-coder-output.log` (truncated at the start

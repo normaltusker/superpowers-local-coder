@@ -105,12 +105,16 @@ Rationale for reusing `on_tick`'s cadence rather than `on_output`'s raw rate:
 `report_progress` is ephemeral, so emitting faster buys nothing visible; it
 only adds notification traffic. The tick is the right clock for the pulse.
 
-### 2a.2 Durable record — full transcript in the final result
+### 2a.2 Durable record — bounded output tail in the final result
 
 Because `report_progress` is ephemeral, once the call finishes the live
-pulse is gone. The user needs the complete story to remain in the
-conversation. The final tool result already persists (it's normal tool
-output) — so attach the captured output to it.
+pulse is gone. The user needs a durable record of what happened to remain
+in the conversation. The final tool result already persists (it's normal
+tool output) — so attach the captured output tail to it. Note this is the
+**bounded** tail (the last `_MAX_OUTPUT_CHARS` = 20 000 chars), not a
+complete transcript: a very long or chatty backend run's earliest output
+is already dropped by the time the call ends. That is an accepted
+trade-off (see the bound note below), not a full log.
 
 **Change:** add an `output_tail` field to `delegate_implementation`'s
 returned dict, on BOTH success and failure paths.
@@ -128,8 +132,14 @@ returned dict, on BOTH success and failure paths.
   response dict.
 - On failure, the aggregated error already summarizes per-model failures;
   `output_tail` additionally gives the raw backend output for the *last*
-  attempt so the user can see what the model was actually doing when it
-  failed.
+  attempt so the user can see what the model was doing when it failed —
+  **with one exception**: on a stall (`StallError`), the captured output
+  up to the kill point is currently NOT retained (`AiderBackend`'s
+  StallError path returns an empty `output_tail`), so a stalled last
+  attempt yields `output_tail == ""`. Non-stall failures (non-zero exit,
+  no-commits) do carry the tail. Retaining partial output through
+  `StallError` is a possible future improvement, out of scope for this
+  visibility pass; the stall case is already the one gap noted here.
 
 **Interface change:** `CompletionResult` (backends/base.py) gains an
 `output_tail: str = ""` field. `AiderBackend.run_backend` populates it from
