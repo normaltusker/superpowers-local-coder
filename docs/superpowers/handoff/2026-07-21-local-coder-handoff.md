@@ -122,7 +122,7 @@ this note double-counted the reset-per-attempt finding — corrected here):
 re-reviewed the round-1 fix commits and found 7 real SECOND-ORDER issues
 those fixes introduced (the "each fix surfaces the next edge" pattern).
 Per user decision: fixed 4 code + 2 doc, deferred 1.
-- Code, all TDD (commit TBD-this-round): UnicodeEncodeError on the log
+- Code, all TDD (commit `6c14cef`): UnicodeEncodeError on the log
   write (now `encoding="utf-8", errors="replace"` + catch broadly, since
   UnicodeEncodeError is not an OSError); partial_line unbounded + no CR
   handling (now treats `\r` as a delimiter so progress bars update the
@@ -149,6 +149,17 @@ watch for any further bot re-review; otherwise PR #3 is ready for the
 human's merge call. **Note:** the "PR #3 IS OPEN" / "NEXT STEP" block
 below is now HISTORICAL (it predates these review rounds and says
 117/117 / "await review") — trust THIS block, not that one.
+
+**REVIEW-ROUND CAP REACHED (user directive, 2026-07-23): no more than 3
+rounds of automated review-response, and all 3 are now DONE** (CodeRabbit
+×1, cubic ×2). Do NOT open a 4th automated fix round if bots post again.
+The 2 remaining open threads (3636019858 stall-tail retention,
+3636207385 log retention) are legitimate, intentional deferrals — replied
+with reasoning, tracked as future work, and must NOT be resolved without
+actually doing that work. Any FURTHER bot comments: read them, and if
+something is a genuine correctness bug, surface it to the human for a
+decision rather than auto-fixing — the automated triage/fix budget for
+this PR is spent. PR #3 is ready for the human's merge call.
 
 **PR #3 IS OPEN (2026-07-23):**
 https://github.com/normaltusker/superpowers-local-coder/pull/3 —
