@@ -97,19 +97,33 @@ base branches). All 5 verified real against the code, all fixed:
   → output_tail="" (spec/plan/handoff); handoff branch-status "zero diff"
   was stale. All 5 CodeRabbit threads replied + resolved.
 
-**cubic-dev-ai ALSO reviewed PR #3 — 7 findings, NOT yet triaged/fixed
-(comment ids 3636019855/58/63/72/86/88/92).** Several DUPLICATE what
-CodeRabbit already flagged + I already fixed (855/863 = 20K-tail-not-full;
-858 = stall empty tail; 892 = stale-pulse-across-failover, also the opus
-final-review Minor). Genuinely-new ones: 3636019872 (P2 — overlapping/
-concurrent delegate_implementation calls corrupt the shared log file:
-call B truncates call A's active log, callbacks interleave); 3636019886
-(P3 — plan's hard-coded baseline test count goes stale); 3636019888 (P3 —
-progress pulse can show an arbitrary chunk suffix, not a clean line, since
-on_output gets raw read chunks with partial lines). NEXT: triage these 7
-(verify each empirically), reply to the duplicates pointing at the commits
-that already fixed them + resolve, decide on the 3 new ones. Await user
-scope call before fixing the new ones — session-usage-limited.
+**cubic-dev-ai review of PR #3 — DONE (2026-07-23).** 7 findings. 6
+resolved, 1 intentionally left open:
+- 3 were DUPLICATES of CodeRabbit findings already fixed (855/863 =
+  bounded-tail wording → doc fix `4880293`; the reset-per-attempt was
+  also the opus Minor). Replied pointing at the commits + resolved.
+- 3 genuinely-new, all fixed with TDD (commit `76e7147`): 3636019888
+  (partial-line pulse — buffer incomplete lines, promote only complete
+  ones); 3636019892 (reset latest_line + partial_line per failover
+  attempt so a fallback's pulse can't relabel the prior model's line);
+  3636019886 (plan's hard-coded test count → made count-agnostic).
+- 3636019872 (P2, concurrent-log corruption) fixed with a bigger change
+  (commit `c694d9d`): per-call unique log path
+  (local-coder-output-<pid>-<uuid>.log) returned in the result as
+  `output_log`; eliminates the shared-file clobber + interleave, and
+  removes the start-of-call truncation entirely (nothing stale per call).
+  README + .gitignore updated.
+- **STILL OPEN (deliberate): 3636019858** — a stalled attempt returns
+  output_tail="". Retaining the captured tail through StallError (carry
+  it on the exception, copy into CompletionResult) is a real feature
+  change, scoped out of this visibility PR; replied + left the thread
+  open as tracked future work. Do NOT resolve it without doing the work.
+
+**PR #3 state: 15/16 review threads resolved** (the 1 open = 3636019858,
+intentional). 121/121 tests passing. Both bots (CodeRabbit 5, cubic 7)
+fully triaged. Every finding verified empirically before acting; no false
+positives found, all were real. NEXT: watch for any further bot re-review
+after these pushes; otherwise PR #3 is ready for the human's merge call.
 
 **PR #3 IS OPEN (2026-07-23):**
 https://github.com/normaltusker/superpowers-local-coder/pull/3 —
