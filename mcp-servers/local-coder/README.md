@@ -83,3 +83,39 @@ the backend starts) AND returned in the final tool result as `output_log`, so
 you can start `tail -f`-ing it while the run is still in progress if you
 want the raw stream. Tailing it is a power-user convenience, not the
 normal way to follow a run.
+
+## Known issues
+
+### Aider crashes importing scipy on macOS 26+ (repo-map)
+
+**Symptom.** A delegation fails within seconds, and the backend output
+(see the log file above) ends in a scipy traceback:
+
+```
+ImportError: dlopen(.../scipy/sparse/linalg/_propack/_spropack.cpython-312-darwin.so):
+  section '__DATA/__thread_bss' has a zero-fill section type, but offset field is not zero
+```
+
+**Cause.** This is an OS/toolchain incompatibility, not a `local-coder`
+bug and not a broken install — recent macOS versions' dyld rejects the
+thread-local-storage section layout in scipy's precompiled `_propack`
+extension. Reinstalling scipy or aider does **not** fix it; the same error
+reproduces with freshly downloaded wheels and with `aider` run directly.
+
+Only Aider's **repo-map** feature reaches this code (it ranks files with
+networkx's pagerank, which pulls in `scipy.sparse`). Aider crashes while
+building the repo-map, before it ever contacts the model.
+
+**Workaround.** Disable the repo-map by passing `--map-tokens 0` through
+to Aider. From chat:
+
+```
+You: set local-coder's extra_backend_args to --map-tokens 0
+Claude Code: [calls configure(extra_backend_args=["--map-tokens", "0"])]
+```
+
+Delegations then run normally. The tradeoff is that Aider loses the
+repo-map, so it has less automatic context about files you didn't name —
+worth restoring (`extra_backend_args: []`) once your platform ships a fix.
+This is left as opt-in configuration rather than a default because the
+repo-map is genuinely useful on larger repositories.
