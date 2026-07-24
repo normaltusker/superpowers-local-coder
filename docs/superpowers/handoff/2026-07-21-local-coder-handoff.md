@@ -567,7 +567,9 @@ described in root `CLAUDE.md` — a clean session). Exact steps for that
 fresh session:
 
 ```bash
-REPO_ROOT="$(git rev-parse --show-toplevel)"
+# --git-common-dir resolves to the MAIN checkout's .git even when run from
+# a linked worktree; --show-toplevel would return the worktree itself.
+REPO_ROOT="$(cd "$(git rev-parse --git-common-dir)/.." && pwd)"
 claude plugin marketplace add "$REPO_ROOT/.worktrees/local-coder-impl" --scope project
 claude plugin install superpowers@superpowers-dev --scope project
 ```

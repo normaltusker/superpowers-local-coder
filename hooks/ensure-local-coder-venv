@@ -87,14 +87,39 @@ for _ in $(seq 1 600); do   # ~10 min ceiling; a cold pip install is ~30s
         echo $$ > "$LOCK_DIR/pid" 2>/dev/null || true
         break
     fi
-    # Reclaim the lock only if the recorded holder is gone (crash/kill).
+    # Reclaim the lock if the recorded holder is gone (crash/kill), OR if no
+    # readable pid was ever recorded. A missing pid means the holder died in
+    # the window between `mkdir` and writing the pid file (or could not
+    # write it at all) — without this branch such a lock is never
+    # reclaimable, and since a wait timeout is now fatal, provisioning would
+    # be wedged permanently. Give the pid a grace period first, so a holder
+    # that is merely slow to write it is not treated as dead.
     LOCK_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
-    if [ -n "$LOCK_PID" ] && ! kill -0 "$LOCK_PID" 2>/dev/null; then
+    LOCK_IS_STALE=""
+    if [ -z "$LOCK_PID" ]; then
+        MISSING_PID_TICKS=$((${MISSING_PID_TICKS:-0} + 1))
+        if [ "$MISSING_PID_TICKS" -ge 5 ]; then
+            echo "[local-coder] provisioning lock has no readable pid after" \
+                 "${MISSING_PID_TICKS}s; treating it as abandoned" >&2
+            LOCK_IS_STALE=1
+        fi
+    else
+        MISSING_PID_TICKS=0
+        if ! kill -0 "$LOCK_PID" 2>/dev/null; then
+            LOCK_IS_STALE=1
+        fi
+    fi
+    if [ -n "$LOCK_IS_STALE" ]; then
         DEAD_DIR="${LOCK_DIR}.dead.$$"
         if mv "$LOCK_DIR" "$DEAD_DIR" 2>/dev/null; then
             # We won the takeover: the lock is ours to clear.
+            # Re-verify AFTER the atomic mv: if the pid changed, the lock
+            # changed hands between our check and our takeover, and if the
+            # pid we captured is now alive we misjudged it. Either way the
+            # lock belongs to someone else and must go back.
             RECLAIMED_PID="$(cat "$DEAD_DIR/pid" 2>/dev/null || true)"
-            if [ "$RECLAIMED_PID" = "$LOCK_PID" ]; then
+            if [ "$RECLAIMED_PID" = "$LOCK_PID" ] && \
+               { [ -z "$RECLAIMED_PID" ] || ! kill -0 "$RECLAIMED_PID" 2>/dev/null; }; then
                 echo "[local-coder] cleared a stale provisioning lock (pid $LOCK_PID is gone)" >&2
                 rm -rf "$DEAD_DIR"
             else

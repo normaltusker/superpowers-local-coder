@@ -154,6 +154,18 @@ else
 fi
 kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
 
+# --- Test 7b: a lock dir with NO pid file is eventually reclaimed ---
+# Regression: a holder that died between `mkdir` and writing its pid leaves
+# a lock with no pid. Reclaim keyed only on a dead pid never fired, and
+# since a wait timeout is now fatal, provisioning would wedge forever.
+DATA7B="$TEST_ROOT/data7b"; mkdir -p "$DATA7B/local-coder"
+mkdir -p "$DATA7B/local-coder/.provision.lock"    # no pid file inside
+if bash "$ENSURE" "$REPO_ROOT" "$DATA7B" >/dev/null 2>&1; then
+    pass "reclaims a lock dir that has no pid file"
+else
+    fail "reclaims a lock dir that has no pid file"
+fi
+
 # --- Test 8: a lock orphaned by a DEAD process is reclaimed ---
 DATA8="$TEST_ROOT/data8"; mkdir -p "$DATA8/local-coder"
 LOCK8="$DATA8/local-coder/.provision.lock"

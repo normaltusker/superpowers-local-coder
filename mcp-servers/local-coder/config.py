@@ -138,15 +138,35 @@ def load_config() -> dict:
                 # network filesystems). Fall back to an O_CREAT|O_EXCL
                 # create, which is also atomic and also refuses to clobber —
                 # the two properties this seeding actually needs.
+                # Create an EXCLUSIVE SENTINEL first, then write, then
+                # os.replace() the finished file into place. Opening
+                # CONFIG_PATH itself with O_EXCL would publish the
+                # destination at open() — before write() — so a concurrent
+                # reader could load an empty file, and an interrupted write
+                # would leave a corrupt config that later loads never
+                # reseed (the path exists, so the exists() check passes).
+                sentinel = CONFIG_PATH.with_name(CONFIG_PATH.name + ".seeding")
                 try:
-                    fd2 = os.open(
-                        CONFIG_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644
+                    sentinel_fd = os.open(
+                        sentinel, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644
                     )
                 except FileExistsError:
-                    pass  # Lost the race; the config exists, which is success.
+                    # Another process is mid-seed. It will publish shortly;
+                    # falling through to the read below is safe because the
+                    # replace() is atomic — we either see no file (and fail
+                    # loudly) or a complete one.
+                    pass
                 else:
-                    with os.fdopen(fd2, "w") as f:
-                        f.write(_DEFAULT_CONFIG_PATH.read_text())
+                    try:
+                        with os.fdopen(sentinel_fd, "w") as f:
+                            f.write(_DEFAULT_CONFIG_PATH.read_text())
+                            f.flush()
+                            os.fsync(f.fileno())
+                        if not CONFIG_PATH.exists():
+                            os.replace(sentinel, CONFIG_PATH)
+                    finally:
+                        with contextlib.suppress(FileNotFoundError):
+                            os.unlink(sentinel)
         finally:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(tmp_path)

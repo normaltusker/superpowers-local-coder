@@ -359,6 +359,37 @@ def test_load_config_seeding_never_clobbers_a_concurrently_created_config(
     assert cfg["model"] == "ollama/rival-wrote-this"  # not reset to the template
 
 
+def test_load_config_seeding_never_publishes_a_partial_file(tmp_path, monkeypatch):
+    # The os.link path is skipped on filesystems without hard links, so the
+    # fallback must be atomic too: a concurrent reader must never observe an
+    # empty or half-written config.yaml. Force the fallback by making
+    # os.link fail, and assert the file is complete the instant it appears.
+    import config as config_module
+    fresh = tmp_path / "config.yaml"
+    monkeypatch.setattr(config_module, "CONFIG_PATH", fresh)
+    monkeypatch.setattr(
+        config_module.os,
+        "link",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("no hard links here")),
+    )
+
+    observed = []
+    real_replace = config_module.os.replace
+
+    def watch_replace(src, dst, *a, **k):
+        # Before publish, the destination must not exist at all.
+        observed.append(os.path.exists(dst))
+        return real_replace(src, dst, *a, **k)
+
+    monkeypatch.setattr(config_module.os, "replace", watch_replace)
+
+    cfg = config_module.load_config()
+
+    assert observed == [False]  # never published before the content was ready
+    assert cfg["backend"] == "aider"
+    assert fresh.read_text().strip() != ""
+
+
 def test_load_config_seeding_leaves_no_temp_files_behind(tmp_path, monkeypatch):
     # Seeding writes a temp file then links it into place; the temp file
     # must be cleaned up, not left littering the persistent data dir.
