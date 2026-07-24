@@ -129,6 +129,50 @@ tried repeatedly and twice BROKE the aider install (once
 both times: `uv tool uninstall aider-chat && uv tool install aider-chat
 --python 3.12`.
 
+**SUBAGENT DELEGATION NOW WORKS END-TO-END (2026-07-24) — the MVP loop
+is closed.** `subagent-driven-development` -> local-coder-implementer
+subagent -> local-coder -> aider -> Ollama -> real commit, verified
+independently (branch `local-coder/divide-test`, commit `7b3be47`,
+`divide(10,4)=2.5`, zero-guard raises, `add()` untouched).
+
+**Root cause of the old 17s no-op:** the agent declared
+`mcp__local-coder__delegate_implementation`, but Claude Code namespaces a
+PLUGIN-bundled MCP server's tools as
+`mcp__plugin_<plugin>_<server>__<tool>`. Under a plugin install that name
+never existed, so the subagent was dispatched with NO delegation tool and
+silently did nothing — no tool call meant no server-side log, which is why
+the failure looked like a connection problem. Fixed in `c0d7092` by
+declaring BOTH names (a project-scoped `.mcp.json` install genuinely uses
+the bare form), removing the hardcoded name from prose, and adding a
+BLOCKED guardrail so a missing tool fails loudly instead of silently.
+Docs: https://code.claude.com/docs/en/mcp.md#plugin-provided-mcp-servers
+
+**TWO GOTCHAS THAT COST TIME HERE — check these FIRST next time:**
+
+1. **Agent/skill edits need a plugin REINSTALL, not just a restart.** The
+   install is a plain COPY (not a symlink) at
+   `~/.claude/plugins/cache/superpowers-dev/superpowers/6.1.1/`. The
+   marketplace source IS the worktree, so
+   `claude plugin marketplace update superpowers-dev` +
+   `claude plugin install superpowers@superpowers-dev --scope project`
+   picks up committed changes. Worktree `.claude/settings.json` (plugin
+   enablement) is UNTRACKED and does not survive; enablement is registered
+   against the MAIN checkout path.
+
+2. **A reinstall RESETS `config.yaml` in the plugin data dir.** It came
+   back as `qwen3-coder:30b` with `extra_backend_args: []`, losing the
+   `--map-tokens 0` scipy workaround and crashing the first attempt. NOTE
+   the open question this raises: PR #4 moved config to
+   `${CLAUDE_PLUGIN_DATA}` specifically to survive plugin UPDATES —
+   surviving a REINSTALL is a different case and it does NOT. Worth
+   checking whether an ordinary update also wipes it; if so, part of what
+   PR #4 shipped is undermined.
+
+   ALSO: different sessions can use DIFFERENT data dirs
+   (`superpowers-inline` vs `superpowers-superpowers-dev`). Check the
+   newest `local-coder-output-*.log` mtime to find which one a given
+   session actually used before editing config.
+
 **HOW THE SCIPY FAILURE PRESENTED (important — it is a MID-CALL crash,
 not a connection failure).** Proven by diffing the two server logs in
 `${CLAUDE_PLUGIN_DATA}/local-coder/`, both from the same server PID:
