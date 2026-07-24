@@ -129,14 +129,33 @@ tried repeatedly and twice BROKE the aider install (once
 both times: `uv tool uninstall aider-chat && uv tool install aider-chat
 --python 3.12`.
 
-**GOTCHA — delegation must be called DIRECTLY, not via the
-`superpowers:local-coder-implementer` subagent.** A subagent does not
-inherit the parent session's MCP connections: dispatching the implementer
-agent failed in ~17s without ever attempting the task (target file
-untouched). The agent declares `mcp__local-coder__delegate_implementation`
-while the connected server registers under the plugin namespace
-`plugin:superpowers:local-coder` — that naming mismatch is the thing to
-investigate if this is picked up later. It does NOT gate this PR.
+**HOW THE SCIPY FAILURE PRESENTED (important — it is a MID-CALL crash,
+not a connection failure).** Proven by diffing the two server logs in
+`${CLAUDE_PLUGIN_DATA}/local-coder/`, both from the same server PID:
+the failed run logged `Repo-map: using 4096.0 tokens, auto refresh` and
+the successful run logged `Repo-map: disabled` — that single line is the
+only meaningful difference. The MCP server connected, spawned aider, and
+aider crashed while BUILDING THE REPO-MAP (networkx pagerank →
+`to_scipy_sparse_array` → `scipy.sparse` → `_propack`), before ever
+contacting Ollama. local-coder behaved correctly throughout: it streamed
+aider's traceback back and reported failure promptly rather than hanging
+to the 300s stall timeout (item 7's mid-flight visibility working as
+intended). **Diagnostic tip: when a delegation fails, read
+`${CLAUDE_PLUGIN_DATA}/local-coder/local-coder-output-*.log` FIRST — the
+per-call logs make this kind of question answerable in one step.**
+
+**GOTCHA — call delegation DIRECTLY rather than via the
+`superpowers:local-coder-implementer` subagent.** Dispatching the
+implementer agent failed in ~17s with the target file untouched, and
+produced NO server-side log at all — so the tool call almost certainly
+never reached the server and no aider process was spawned. The exact
+mechanism is UNCONFIRMED (an earlier version of this doc asserted
+"subagents don't inherit MCP connections" — that was stated with more
+confidence than the evidence supports; do not treat it as established).
+One thing worth checking if this is picked up: the agent declares
+`mcp__local-coder__delegate_implementation`, while the connected server
+registers under the plugin namespace `plugin:superpowers:local-coder`.
+This does NOT gate this PR; direct calls work.
 **When this failure happens, do not let it be misdiagnosed as a stale
 `.mcp.json` worktree path** — that wrong diagnosis has now surfaced twice
 in different sessions (see the "Note" above: the worktree exists, is
