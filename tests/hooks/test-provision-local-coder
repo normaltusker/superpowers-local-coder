@@ -48,12 +48,18 @@ fi
 # --- Test 4: no usable python → exits 0, writes no venv ---
 DATA2="$TEST_ROOT/data2"
 mkdir -p "$DATA2"
-# Empty PATH so no python3/python/py is found. bash itself is invoked by
-# absolute path (resolved from the *current* PATH before it's emptied),
-# since execvp would otherwise try to resolve the bare "bash" command
-# through the new, empty PATH and fail before ever reaching the hook.
+# A PATH holding the shell + coreutils the hook needs, but NO python. An
+# EMPTY PATH does not test this: the hook shells out to `bash`, which
+# cannot be resolved without a PATH, so the hook fails before ever reaching
+# Python discovery — it would only prove the wrapper swallows a missing
+# bash. Symlinking the needed tools into a python-free bin directory makes
+# this actually exercise the "no Python >=3.10 found" branch.
 BASH_BIN="$(command -v bash)"
-if env -i PATH="" CLAUDE_PLUGIN_ROOT="$REPO_ROOT" CLAUDE_PLUGIN_DATA="$DATA2" "$BASH_BIN" "$HOOK" >/dev/null 2>&1; then
+NOPY_BIN="$TEST_ROOT/nopy-bin-2"; mkdir -p "$NOPY_BIN"
+for tool in bash dirname cat cmp mkdir rm cp seq sleep kill; do
+    src="$(command -v "$tool" 2>/dev/null)" && ln -sf "$src" "$NOPY_BIN/$tool"
+done
+if env -i PATH="$NOPY_BIN" CLAUDE_PLUGIN_ROOT="$REPO_ROOT" CLAUDE_PLUGIN_DATA="$DATA2" "$BASH_BIN" "$HOOK" >/dev/null 2>&1; then
     pass "exits 0 when no python is available"
 else
     fail "exits 0 when no python is available"

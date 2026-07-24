@@ -1,3 +1,4 @@
+import os
 import shutil
 from pathlib import Path
 from unittest.mock import patch
@@ -325,3 +326,47 @@ def test_load_config_uses_existing_file_when_present(tmp_path, monkeypatch):
     cfg = config_module.load_config()
 
     assert cfg["model"] == "ollama/custom"  # existing file wins, not re-seeded
+
+
+def test_load_config_seeding_never_clobbers_a_concurrently_created_config(
+    tmp_path, monkeypatch
+):
+    # Two servers can start at once and both observe a missing config. The
+    # loser of that race must NOT overwrite the winner's file — doing so
+    # would silently reset a user's configured model back to defaults.
+    # Simulated by creating the file after the exists() check has passed.
+    import config as config_module
+    fresh = tmp_path / "config.yaml"
+    monkeypatch.setattr(config_module, "CONFIG_PATH", fresh)
+
+    real_link = config_module.os.link
+
+    def link_but_a_rival_got_there_first(src, dst, *args, **kwargs):
+        # Stand in for another process creating the real config in the
+        # window between the exists() check and this link.
+        if not os.path.exists(dst):
+            with open(dst, "w") as f:
+                f.write(
+                    "backend: aider\nmodel: ollama/rival-wrote-this\n"
+                    "fallback_models: []\n"
+                )
+        return real_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(config_module.os, "link", link_but_a_rival_got_there_first)
+
+    cfg = config_module.load_config()
+
+    assert cfg["model"] == "ollama/rival-wrote-this"  # not reset to the template
+
+
+def test_load_config_seeding_leaves_no_temp_files_behind(tmp_path, monkeypatch):
+    # Seeding writes a temp file then links it into place; the temp file
+    # must be cleaned up, not left littering the persistent data dir.
+    import config as config_module
+    fresh = tmp_path / "config.yaml"
+    monkeypatch.setattr(config_module, "CONFIG_PATH", fresh)
+
+    config_module.load_config()
+
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name != "config.yaml"]
+    assert leftovers == []

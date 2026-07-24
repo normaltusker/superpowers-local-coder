@@ -1,6 +1,7 @@
 import contextlib
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import yaml
@@ -57,13 +58,30 @@ def _config_lock():
     """
     lock_path = _lock_path()
     lock_path.touch(exist_ok=True)
-    with open(lock_path, "w") as lock_file:
+    # Open r+ (never "w"): "w" TRUNCATES, so a second process opening the
+    # lockfile would clobber it while the first holds a lock on it.
+    with open(lock_path, "r+b") as lock_file:
         if _IS_WINDOWS:
-            # Lock 1 byte at offset 0; LK_LOCK blocks until the lock is free.
-            lock_file.write("\0")
-            lock_file.flush()
-            lock_file.seek(0)
-            _lock_module.locking(lock_file.fileno(), _lock_module.LK_LOCK, 1)
+            # Lock 1 byte at offset 0. Do NOT write before locking — on
+            # Windows a write into a range another process has locked fails,
+            # so writing first made contenders error out instead of waiting.
+            # Windows locks a byte RANGE and the range need not contain data,
+            # so locking offset 0 of an empty file is valid.
+            #
+            # LK_LOCK does not block indefinitely: it retries ~10 times at
+            # 1-second intervals, then raises OSError. That contradicts this
+            # function's "blocks until free" contract, so retry around it —
+            # matching flock's indefinite wait on POSIX.
+            while True:
+                try:
+                    lock_file.seek(0)
+                    _lock_module.locking(lock_file.fileno(), _lock_module.LK_LOCK, 1)
+                    break
+                except OSError:
+                    # Contention only; keep waiting. Any genuinely fatal
+                    # condition (bad fd, permissions) recurs and would spin,
+                    # so bound the wait with a short sleep to stay cheap.
+                    time.sleep(0.1)
             try:
                 yield
             finally:
@@ -84,7 +102,30 @@ def load_config() -> dict:
     # pointless self-copy.)
     if not CONFIG_PATH.exists() and CONFIG_PATH != _DEFAULT_CONFIG_PATH:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(_DEFAULT_CONFIG_PATH.read_text())
+        # Seed atomically, like save_config(): write a same-directory temp
+        # file and link it into place. Two servers starting at once could
+        # otherwise both see the file missing and have a reader observe a
+        # partially-written YAML.
+        #
+        # os.link() rather than os.replace() because this must NOT clobber:
+        # if another process (or a configure() call) created a real config
+        # between the exists() check and here, replacing it would silently
+        # reset the user's settings to defaults. link() fails with
+        # FileExistsError instead, and losing that race is success — the
+        # config now exists, which is all this block wanted.
+        fd, tmp_path = tempfile.mkstemp(
+            dir=CONFIG_PATH.parent, prefix=".config.yaml.seed.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(_DEFAULT_CONFIG_PATH.read_text())
+            try:
+                os.link(tmp_path, CONFIG_PATH)
+            except FileExistsError:
+                pass
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp_path)
     with open(CONFIG_PATH) as f:
         return yaml.safe_load(f)
 

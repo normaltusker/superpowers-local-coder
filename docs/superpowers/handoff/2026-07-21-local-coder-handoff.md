@@ -14,11 +14,11 @@ for the next Phase 2 work. `main` still untouched — everything lands on
 `dev`.
 
 **CURRENT FOCUS (2026-07-23): cross-platform "launch/bootstrap" feature
-(Phase 2 items 1+2+3) — BUILT, and being SMOKE-TESTED.** Spec:
+(Phase 2 items 1+2+3) — BUILT, SMOKE-TESTED, and OPEN AS PR #4.** Spec:
 `docs/superpowers/specs/2026-07-23-launch-bootstrap-design.md`. Plan:
 `docs/superpowers/plans/2026-07-23-launch-bootstrap.md`. All 9 plan tasks
 built via subagent-driven-development, final whole-branch review clean,
-135 Python tests + 3 hook suites passing. Approach: a `SessionStart` hook
+135 Python tests + 4 hook suites passing. Approach: a `SessionStart` hook
 (`hooks/provision-local-coder`, extensionless, dispatched by the existing
 `run-hook.cmd`) provisions the venv into `${CLAUDE_PLUGIN_DATA}/local-coder/.venv`
 (manifest-diff pattern); config.yaml + per-call logs also moved to
@@ -168,7 +168,7 @@ duplicate registration there would be a regression.
 **HOW TO RE-SMOKE-TEST (the installed plugin cache is a STALE plain-copy;
 `claude plugin update` won't refresh it because the marketplace version is
 pinned at `6.1.1` and doesn't bump).** From the MAIN REPO ROOT
-(`/Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder`,
+(`<repo-root>`,
 where the plugin is enabled at project scope — enablement lives in that
 dir's `.claude/settings.json`):
 1. `claude plugin marketplace update superpowers-dev` (refresh the
@@ -567,7 +567,7 @@ described in root `CLAUDE.md` — a clean session). Exact steps for that
 fresh session:
 
 ```bash
-claude plugin marketplace add /Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder/.worktrees/local-coder-impl --scope project
+claude plugin marketplace add <repo-root>/.worktrees/local-coder-impl --scope project
 claude plugin install superpowers@superpowers-dev --scope project
 ```
 Then restart/start a new `claude` session from
@@ -583,7 +583,7 @@ working, MCP connection UNBLOCKED.** The install genuinely worked, but
 one path detail bit us: `claude plugin marketplace add`/`install
 --scope project` write their enablement record to **the main repo
 root's** `.claude/settings.json`
-(`/Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder/.claude/settings.json`),
+(`<repo-root>/.claude/settings.json`),
 not into the worktree — this is git-worktree-shared `--scope project`
 behavior in Claude Code, not a bug: all worktrees of one repo share one
 project-scope settings file at the git common dir. A session started
@@ -591,7 +591,7 @@ project-scope settings file at the git common dir. A session started
 didn't pick up the enablement, so `local-coder` still failed
 (`CLAUDE_PLUGIN_ROOT` still missing) on the first retry. **Fix: start
 the session from the MAIN REPO ROOT
-(`/Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder`,
+(`<repo-root>`,
 currently on `dev`, which already has everything from the merged PR),
 not from the worktree.** Confirmed via `claude mcp list` in that
 session:
@@ -718,7 +718,7 @@ issuing the `configure`/`delegate_implementation` calls has its shell
 repo-root copy is still untouched (`fallback_models: []`,
 `target_repo_path: null`); the worktree copy now has
 `fallback_models: [ollama/qwen2.5-coder:7b]` and
-`target_repo_path: /Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder`
+`target_repo_path: <repo-root>`
 (the repo root's own absolute path, written by the `configure` call
 presumably resolving its own cwd). This makes sense once you trace it:
 `${CLAUDE_PLUGIN_ROOT}` resolves to wherever the plugin's marketplace
@@ -901,7 +901,7 @@ reason left for this to fail, but "no known reason" is not the same as
 
 **Two different directories are in play right now — read this before
 picking which one to resume in:**
-- **Main repo root** (`/Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder`,
+- **Main repo root** (`<repo-root>`,
   currently on `dev`) — this is where the `local-coder` plugin is
   installed/connected. **Use this one to check on or re-run the smoke
   test** (see "Smoke test attempt #2" above for the exact task to send).

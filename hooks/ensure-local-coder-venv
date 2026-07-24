@@ -36,56 +36,134 @@ STAMP="${DATA_DIR}/requirements.installed.txt"
 
 # Returns the venv's python path on stdout of a command-substitution, or
 # empty if not found. (Used only internally; not the script's own stdout.)
+# Only reports an interpreter that ACTUALLY RUNS and is >=3.10 — an
+# interrupted `venv` creation can leave an executable-but-broken python
+# behind, and treating that as usable made the fast path unrecoverable
+# (every later run skipped creation and then failed on pip).
 venv_python() {
+    local candidate=""
     if [ -x "$VENV/bin/python" ]; then
-        printf '%s' "$VENV/bin/python"
+        candidate="$VENV/bin/python"
     elif [ -x "$VENV/Scripts/python.exe" ]; then
-        printf '%s' "$VENV/Scripts/python.exe"
+        candidate="$VENV/Scripts/python.exe"
+    fi
+    if [ -n "$candidate" ] && \
+       "$candidate" -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" >/dev/null 2>&1; then
+        printf '%s' "$candidate"
     fi
 }
 
 # Fast path: venv present, usable, and up to date with requirements.txt.
+# Lock-free on purpose — the overwhelmingly common case is "already
+# provisioned", and it only reads.
 if [ -n "$(venv_python)" ] && [ -f "$STAMP" ] && cmp -s "$REQ" "$STAMP"; then
     exit 0
 fi
 
 mkdir -p "$DATA_DIR"
 
-# Find a Python >=3.10 that actually runs (skips the Windows Store stub,
-# which exits nonzero on `-c ""`). No cygpath (per repo convention).
-PYTHON=""
-for candidate in "python3" "python" "py -3"; do
-    if $candidate -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" >/dev/null 2>&1; then
-        PYTHON="$candidate"
+# Serialize the create/install/stamp sequence across processes. Concurrent
+# Claude sessions (and this script's two callers, the SessionStart hook and
+# the launcher) can otherwise reach here together: one would observe a
+# half-built venv, or two pip installs would write the same site-packages
+# at once and corrupt it.
+#
+# mkdir is the lock primitive: it is atomic on POSIX and Windows, needs no
+# flock/msvcrt split, and works in plain bash. The holder's PID is recorded
+# so a lock orphaned by a killed process can be detected and reclaimed
+# rather than wedging provisioning forever.
+LOCK_DIR="${DATA_DIR}/.provision.lock"
+HAVE_LOCK=""
+for _ in $(seq 1 600); do   # ~10 min ceiling; a cold pip install is ~30s
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        HAVE_LOCK=1
+        echo $$ > "$LOCK_DIR/pid" 2>/dev/null || true
         break
     fi
+    # Reclaim the lock if the recorded holder is gone (crash/kill).
+    LOCK_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    if [ -n "$LOCK_PID" ] && ! kill -0 "$LOCK_PID" 2>/dev/null; then
+        echo "[local-coder] clearing a stale provisioning lock (pid $LOCK_PID is gone)" >&2
+        rm -rf "$LOCK_DIR"
+        continue
+    fi
+    sleep 1
 done
-if [ -z "$PYTHON" ]; then
-    echo "[local-coder] provisioning failed: no Python >=3.10 found on PATH" >&2
-    exit 1
+
+if [ -n "$HAVE_LOCK" ]; then
+    trap 'rm -rf "$LOCK_DIR"' EXIT
+else
+    # Never block the launch forever on a lock we cannot take: fall through
+    # and let the re-check below decide. Worst case we race, which is what
+    # the situation already was before this lock existed.
+    echo "[local-coder] proceeding without the provisioning lock (timed out waiting)" >&2
+fi
+
+# Re-check under the lock: another process may have completed provisioning
+# while we waited, in which case there is nothing left to do.
+if [ -n "$(venv_python)" ] && [ -f "$STAMP" ] && cmp -s "$REQ" "$STAMP"; then
+    exit 0
 fi
 
 echo "[local-coder] provisioning venv (first run or requirements changed)..." >&2
 
-# Create the venv if missing.
-if [ ! -e "$VENV" ]; then
+# If the venv already has a working interpreter, we only need to (re)install
+# dependencies — and we can do that with the venv's OWN python. Checking
+# this BEFORE searching PATH means a requirements change still succeeds on a
+# machine where python has since left PATH (e.g. a pyenv shim that only
+# resolves in an interactive shell).
+VENV_PY="$(venv_python)"
+
+if [ -z "$VENV_PY" ]; then
+    # Need to build (or rebuild) the venv, which requires a base interpreter.
+    # Find a Python >=3.10 that actually runs (skips the Windows Store stub,
+    # which exits nonzero on `-c ""`). No cygpath (per repo convention).
+    PYTHON=""
+    for candidate in "python3" "python" "py -3"; do
+        if $candidate -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" >/dev/null 2>&1; then
+            PYTHON="$candidate"
+            break
+        fi
+    done
+    if [ -z "$PYTHON" ]; then
+        echo "[local-coder] provisioning failed: no Python >=3.10 found on PATH" >&2
+        exit 1
+    fi
+
+    # A pre-existing $VENV here means it's present but BROKEN (venv_python
+    # validated it and found no working interpreter) — e.g. an interrupted
+    # creation, or a base python that was upgraded/removed underneath it.
+    # `python -m venv` cannot always repair such a tree in place, so remove
+    # it and rebuild; otherwise it stays broken forever.
+    if [ -e "$VENV" ]; then
+        echo "[local-coder] existing venv is unusable; rebuilding it" >&2
+        rm -rf "$VENV"
+    fi
+
     if ! $PYTHON -m venv "$VENV" >&2; then
         echo "[local-coder] provisioning failed: could not create venv" >&2
         rm -f "$STAMP"
         exit 1
     fi
-fi
 
-VENV_PY="$(venv_python)"
-if [ -z "$VENV_PY" ]; then
-    echo "[local-coder] provisioning failed: venv python not found after venv creation" >&2
-    rm -f "$STAMP"
-    exit 1
+    VENV_PY="$(venv_python)"
+    if [ -z "$VENV_PY" ]; then
+        echo "[local-coder] provisioning failed: venv python not usable after venv creation" >&2
+        rm -f "$STAMP"
+        exit 1
+    fi
 fi
 
 # Install deps. Stamp only on success (so a failure retries next time).
 if "$VENV_PY" -m pip install -r "$REQ" >&2; then
-    cp "$REQ" "$STAMP"
+    # A failed stamp write must NOT report success: the venv would be
+    # correct but every later run would redo the whole install.
+    if ! cp "$REQ" "$STAMP"; then
+        echo "[local-coder] provisioning failed: could not write the requirements stamp" \
+             "to $STAMP (dependencies installed, but this would reinstall every launch)" >&2
+        rm -f "$STAMP"
+        exit 1
+    fi
     echo "[local-coder] provisioning complete" >&2
     exit 0
 fi

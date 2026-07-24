@@ -24,9 +24,14 @@ fail() { echo "  [FAIL] $1"; FAILURES=$((FAILURES + 1)); }
 make_fake_venv() {
     local data="$1" req="$REPO_ROOT/mcp-servers/local-coder/requirements.txt"
     mkdir -p "$data/local-coder/.venv/bin"
+    # Must satisfy ensure-venv's version probe (`-c "import sys; ..."`) so
+    # the fast path treats it as usable, AND echo its arg so launch tests
+    # can assert what it was exec'd with.
     cat > "$data/local-coder/.venv/bin/python" <<'FAKE'
 #!/usr/bin/env bash
+if [ "$1" = "-c" ]; then exit 0; fi
 echo "FAKE_PY_RAN arg=$1"
+echo "FAKE_PY_DATA=${CLAUDE_PLUGIN_DATA:-<unset>}"
 FAKE
     chmod +x "$data/local-coder/.venv/bin/python"
     # A stamp matching requirements.txt makes ensure-venv's fast path a no-op.
@@ -51,12 +56,31 @@ else
     fail "uses the data-dir ARG, not the CLAUDE_PLUGIN_DATA env var (rc=$RC out=$OUT)"
 fi
 
+# --- Test 2b: exports CLAUDE_PLUGIN_DATA into the server process ---
+# server.py resolves config.yaml + per-call logs via plugin_data_dir(),
+# which reads the CLAUDE_PLUGIN_DATA *env var*. The launcher receives the
+# dir as argv, so it must export it — otherwise the server silently falls
+# back to the in-tree dir under ${CLAUDE_PLUGIN_ROOT}, which plugin
+# updates wipe (the exact failure this feature exists to prevent).
+DATA2B="$TEST_ROOT/data2b"; make_fake_venv "$DATA2B"
+OUT="$(env -u CLAUDE_PLUGIN_DATA bash "$HOOK" "$DATA2B" /some/server.py 2>&1)"; RC=$?
+if printf '%s' "$OUT" | grep -q "FAKE_PY_DATA=$DATA2B"; then
+    pass "exports CLAUDE_PLUGIN_DATA to the server process"
+else
+    fail "exports CLAUDE_PLUGIN_DATA to the server process (out=$OUT)"
+fi
+
 # --- Test 3: cannot provision AND no venv → exit 1 with a clear message ---
-# Empty PATH so ensure-venv finds no python and can't build a venv; the
-# launcher must then hard-fail. Resolve bash absolutely first (env -i gotcha).
+# PATH with shell/coreutils but NO python, so ensure-venv genuinely reaches
+# its Python-discovery branch and fails there. An empty PATH would instead
+# break the launcher on its own `bash`/`dirname` calls and prove nothing.
 BASH_BIN="$(command -v bash)"
+NOPY_BIN="$TEST_ROOT/nopy-bin"; mkdir -p "$NOPY_BIN"
+for tool in bash dirname cat cmp mkdir rm cp seq sleep kill pwd; do
+    src="$(command -v "$tool" 2>/dev/null)" && ln -sf "$src" "$NOPY_BIN/$tool"
+done
 DATA3="$TEST_ROOT/data3"; mkdir -p "$DATA3"
-OUT="$(env -i PATH="" "$BASH_BIN" "$HOOK" "$DATA3" /some/server.py 2>&1)"; RC=$?
+OUT="$(env -i PATH="$NOPY_BIN" "$BASH_BIN" "$HOOK" "$DATA3" /some/server.py 2>&1)"; RC=$?
 if [ "$RC" -eq 1 ]; then pass "unprovisionable venv exits 1"; else fail "unprovisionable venv exits 1 (got $RC)"; fi
 if printf '%s' "$OUT" | grep -q "venv"; then pass "unprovisionable venv prints a clear reason"; else fail "unprovisionable venv prints a clear reason"; fi
 
@@ -72,6 +96,35 @@ fi
 DATA5="$TEST_ROOT/data5"; make_fake_venv "$DATA5"
 OUT="$(bash "$HOOK" "$DATA5" "" 2>&1)"; RC=$?
 if [ "$RC" -eq 1 ]; then pass "empty server.py arg exits 1"; else fail "empty server.py arg exits 1 (got $RC)"; fi
+
+# --- Test 5b: a FAILED refresh must not launch the stale venv ---
+# A venv exists, but requirements.txt has changed and the reinstall fails.
+# The launcher previously ignored the provisioner's exit status (`|| true`)
+# and exec'd the stale interpreter anyway — starting the server against
+# dependencies that no longer match requirements.txt.
+DATA5B="$TEST_ROOT/data5b"; make_fake_venv "$DATA5B"
+# Stale stamp → ensure-venv must reinstall. Make the venv python pass the
+# version probe (so it counts as usable) but FAIL `-m pip install`, which
+# is exactly the "requirements changed and the reinstall failed" case.
+cat > "$DATA5B/local-coder/.venv/bin/python" <<'FAILPIP'
+#!/usr/bin/env bash
+if [ "$1" = "-c" ]; then exit 0; fi
+if [ "$1" = "-m" ]; then echo "pip install failed" >&2; exit 1; fi
+echo "FAKE_PY_RAN arg=$1"
+FAILPIP
+chmod +x "$DATA5B/local-coder/.venv/bin/python"
+echo "a-package-that-changed==9.9.9" > "$DATA5B/local-coder/requirements.installed.txt"
+OUT="$(bash "$HOOK" "$DATA5B" /some/server.py 2>&1)"; RC=$?
+if [ "$RC" -eq 1 ]; then
+    pass "failed venv refresh exits 1 instead of launching a stale venv"
+else
+    fail "failed venv refresh exits 1 instead of launching a stale venv (got $RC)"
+fi
+if ! printf '%s' "$OUT" | grep -q "FAKE_PY_RAN"; then
+    pass "failed venv refresh never execs the stale interpreter"
+else
+    fail "failed venv refresh never execs the stale interpreter (out=$OUT)"
+fi
 
 
 # --- Test 6: the hook must be DIRECTLY EXECUTABLE (no-shell spawn) ---

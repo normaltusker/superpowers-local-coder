@@ -15,8 +15,9 @@ instead of Claude Code's own Edit/Write tools.
   prefix; not required if you're using a remote backend/model.
 - `gh` CLI installed and authenticated (`gh auth status`) — only needed if
   `open_pr` is enabled.
-- The server's Python dependencies are provisioned **automatically**: when
-  the plugin is installed, a `SessionStart` hook creates a virtualenv under
+- The server's Python dependencies are provisioned **automatically**: on
+  the first session after install, a `SessionStart` hook (or the MCP
+  launcher itself, whichever runs first) creates a virtualenv under
   the plugin's persistent data directory (`${CLAUDE_PLUGIN_DATA}/local-coder/.venv`)
   and installs `requirements.txt` into it, re-installing only when
   `requirements.txt` changes. You need a Python 3.10+ interpreter on `PATH`
@@ -25,10 +26,11 @@ instead of Claude Code's own Edit/Write tools.
   through Git Bash (the same requirement as all Superpowers hooks — see
   `docs/windows/polyglot-hooks.md`).
 
-  For local development outside a plugin install, create the venv manually:
+  For local development outside a plugin install, create the venv manually
+  (POSIX; on Windows use `.venv\Scripts\python.exe -m pip` instead):
   ```bash
   cd mcp-servers/local-coder
-  python3.13 -m venv .venv
+  python3 -m venv .venv
   .venv/bin/pip install -r requirements.txt
   ```
 
