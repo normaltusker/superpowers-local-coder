@@ -1,15 +1,39 @@
 import contextlib
-import fcntl
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import yaml
 
 import ollama as ollama_module
 from backends.common import KNOWN_BACKENDS
+from paths import plugin_data_dir
 
-CONFIG_PATH = Path(__file__).parent / "config.yaml"
+# Select the OS-appropriate file-locking primitive at import time. `fcntl`
+# does not exist on Windows (importing it unconditionally crashes the
+# server there); `msvcrt` is the Windows stdlib equivalent. Both are wrapped
+# behind _config_lock() below so callers are platform-agnostic.
+# How long _config_lock() waits for a contended lock on Windows before
+# giving up. Generous relative to the guarded critical section (a
+# load->merge->validate->save of one small YAML file), so this is only
+# reached when something is genuinely wrong rather than merely busy.
+_WINDOWS_LOCK_TIMEOUT_SECONDS = 60.0
+
+_IS_WINDOWS = os.name == "nt"
+if _IS_WINDOWS:
+    import msvcrt as _lock_module
+else:
+    import fcntl as _lock_module
+
+# The bundled default config that ships with the plugin — used as a
+# read-only template to seed the real config on first use.
+_DEFAULT_CONFIG_PATH = Path(__file__).parent / "config.yaml"
+
+# The live, user-mutable config lives in the persistent plugin-data dir so
+# it survives plugin updates (the plugin root is wiped on update). Falls
+# back to the in-tree path outside a plugin (tests/dev) via plugin_data_dir.
+CONFIG_PATH = plugin_data_dir() / "config.yaml"
 
 # Sentinel accepted only for target_repo_path, to explicitly clear it back
 # to null. A bare `None` override means "don't change this field" (see
@@ -33,23 +57,76 @@ def _config_lock():
     delegate_implementation call reading config) can't interleave and lose
     updates or persist a combination that was never validated together.
 
-    Uses fcntl.flock on a dedicated lockfile (not CONFIG_PATH itself, so
-    save_config's atomic replace of CONFIG_PATH is never affected by the
-    lock's own file lifecycle). POSIX-only (fcntl), consistent with this
-    project's documented macOS/Linux dev-environment scope — no
-    third-party dependency needed.
+    Uses a dedicated lockfile (not CONFIG_PATH itself, so save_config's
+    atomic replace of CONFIG_PATH is never affected by the lock's own file
+    lifecycle). Cross-platform: fcntl.flock on POSIX, msvcrt.locking on
+    Windows — no third-party dependency needed.
     """
     lock_path = _lock_path()
     lock_path.touch(exist_ok=True)
-    with open(lock_path, "w") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+    # Open r+ (never "w"): "w" TRUNCATES, so a second process opening the
+    # lockfile would clobber it while the first holds a lock on it.
+    with open(lock_path, "r+b") as lock_file:
+        if _IS_WINDOWS:
+            # Lock 1 byte at offset 0. Do NOT write before locking — on
+            # Windows a write into a range another process has locked fails,
+            # so writing first made contenders error out instead of waiting.
+            # Windows locks a byte RANGE and the range need not contain data,
+            # so locking offset 0 of an empty file is valid.
+            #
+            # LK_LOCK does not block indefinitely: it retries ~10 times at
+            # 1-second intervals, then raises OSError. That contradicts this
+            # function's "blocks until free" contract, so retry around it —
+            # matching flock's indefinite wait on POSIX.
+            # Bounded, so a PERMANENT failure (bad descriptor, permissions,
+            # a filesystem that cannot lock) surfaces as an error instead of
+            # hanging the MCP call forever. Retrying indefinitely would turn
+            # every fatal lock error into an infinite tool call.
+            deadline = time.monotonic() + _WINDOWS_LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    lock_file.seek(0)
+                    _lock_module.locking(lock_file.fileno(), _lock_module.LK_LOCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.1)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                _lock_module.locking(lock_file.fileno(), _lock_module.LK_UNLCK, 1)
+        else:
+            _lock_module.flock(lock_file, _lock_module.LOCK_EX)
+            try:
+                yield
+            finally:
+                _lock_module.flock(lock_file, _lock_module.LOCK_UN)
 
 
 def load_config() -> dict:
+    # First use in a fresh install: the persistent config doesn't exist yet.
+    # Seed it from the bundled default template. (Skip when the resolved
+    # path IS the template itself — the in-tree/dev fallback — to avoid a
+    # pointless self-copy.)
+    if not CONFIG_PATH.exists() and CONFIG_PATH != _DEFAULT_CONFIG_PATH:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # Single-writer seeding, deliberately simple.
+        #
+        # Concurrent first-run seeding was attempted during review (hard
+        # link, then an O_EXCL sentinel) and both approaches introduced
+        # worse failures than the race they addressed: a stale sentinel
+        # bricked startup permanently, and the publish step could silently
+        # reset a config another process had just written. Making this
+        # genuinely safe needs a real inter-process lock around every
+        # reader and writer of config.yaml, which is a design change, not
+        # a patch — tracked as separate work.
+        #
+        # The exposure here is narrow: two servers starting in the same
+        # instant on a brand-new install, where both would write identical
+        # template content anyway.
+        CONFIG_PATH.write_text(_DEFAULT_CONFIG_PATH.read_text())
     with open(CONFIG_PATH) as f:
         return yaml.safe_load(f)
 

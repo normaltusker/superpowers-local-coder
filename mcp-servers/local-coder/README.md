@@ -15,13 +15,30 @@ instead of Claude Code's own Edit/Write tools.
   prefix; not required if you're using a remote backend/model.
 - `gh` CLI installed and authenticated (`gh auth status`) — only needed if
   `open_pr` is enabled.
-- This server's own dependencies installed into its venv:
+- The server's Python dependencies are provisioned **automatically**: on
+  the first session after install, a `SessionStart` hook (or the MCP
+  launcher itself, whichever runs first) creates a virtualenv under
+  the plugin's persistent data directory (`${CLAUDE_PLUGIN_DATA}/local-coder/.venv`)
+  and installs `requirements.txt` into it, re-installing only when
+  `requirements.txt` changes. You need a Python 3.10+ interpreter on `PATH`
+  (`python3`, `python`, or the `py` launcher on Windows) and network access
+  on first run; nothing else. On Windows, provisioning and launch run
+  through Git Bash (the same requirement as all Superpowers hooks — see
+  `docs/windows/polyglot-hooks.md`).
+
+  For local development outside a plugin install, create the venv manually.
+  POSIX:
   ```bash
   cd mcp-servers/local-coder
-  python3.13 -m venv .venv
+  python3 -m venv .venv
   .venv/bin/pip install -r requirements.txt
   ```
-  Use a Python 3.10+ interpreter explicitly (e.g. `python3.13`), not a bare `python3` — `fastmcp` requires >=3.10 and an older system `python3` will fail the install with an explicit Python-version-incompatibility error.
+  Windows (PowerShell or cmd):
+  ```
+  cd mcp-servers\local-coder
+  py -3 -m venv .venv
+  .venv\Scripts\python.exe -m pip install -r requirements.txt
+  ```
 
 ## Configuring backend/model
 
@@ -66,11 +83,47 @@ it is the recent output, not the entire backend transcript. No extra
 steps are needed to see what the backend is doing.
 
 For deep debugging, the raw backend output is also written to a per-call
-log file next to the server
-(`mcp-servers/local-coder/local-coder-output-<pid>-<id>.log`). Each call
-gets its own file so concurrent delegations never clobber each other's
-log. The exact path is announced early (as a progress update, before the
-backend starts) AND returned in the final tool result as `output_log`, so
+log file under the plugin's persistent data directory
+(`${CLAUDE_PLUGIN_DATA}/local-coder/local-coder-output-<pid>-<id>.log`).
+Each call gets its own file so concurrent delegations never clobber each
+other's log. The exact path is announced early (as a progress update, before
+the backend starts) AND returned in the final tool result as `output_log`, so
 you can start `tail -f`-ing it while the run is still in progress if you
 want the raw stream. Tailing it is a power-user convenience, not the
 normal way to follow a run.
+
+## Known issues
+
+### Aider crashes importing scipy on macOS 26+ (repo-map)
+
+**Symptom.** A delegation fails within seconds, and the backend output
+(see the log file above) ends in a scipy traceback:
+
+```
+ImportError: dlopen(.../scipy/sparse/linalg/_propack/_spropack.cpython-312-darwin.so):
+  section '__DATA/__thread_bss' has a zero-fill section type, but offset field is not zero
+```
+
+**Cause.** This is an OS/toolchain incompatibility, not a `local-coder`
+bug and not a broken install — recent macOS versions' dyld rejects the
+thread-local-storage section layout in scipy's precompiled `_propack`
+extension. Reinstalling scipy or aider does **not** fix it; the same error
+reproduces with freshly downloaded wheels and with `aider` run directly.
+
+Only Aider's **repo-map** feature reaches this code (it ranks files with
+networkx's pagerank, which pulls in `scipy.sparse`). Aider crashes while
+building the repo-map, before it ever contacts the model.
+
+**Workaround.** Disable the repo-map by passing `--map-tokens 0` through
+to Aider. From chat:
+
+```
+You: set local-coder's extra_backend_args to --map-tokens 0
+Claude Code: [calls configure(extra_backend_args=["--map-tokens", "0"])]
+```
+
+Delegations then run normally. The tradeoff is that Aider loses the
+repo-map, so it has less automatic context about files you didn't name —
+worth restoring (`extra_backend_args: []`) once your platform ships a fix.
+This is left as opt-in configuration rather than a default because the
+repo-map is genuinely useful on larger repositories.

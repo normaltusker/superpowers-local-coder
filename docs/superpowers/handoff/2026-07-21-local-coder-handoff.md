@@ -7,9 +7,194 @@ session end — a stale handoff is worse than none.
 
 ## Where things stand NOW (read this first)
 
-**Phase 1 is merged. Phase 2 in progress — currently on item 7.** PR #2
-(`local-coder-impl` → `dev`) merged at `70f8ba3`. `dev` has the full
-Phase 1 build.
+**Phase 1 merged (PR #2, `70f8ba3`). Phase 2 item 7 (mid-flight
+visibility) merged (PR #3, merge commit `ea3288c`, 2026-07-23).**
+`local-coder-impl` was fast-forwarded to `ea3288c` and is the clean base
+for the next Phase 2 work. `main` still untouched — everything lands on
+`dev`.
+
+**CURRENT FOCUS (2026-07-23): cross-platform "launch/bootstrap" feature
+(Phase 2 items 1+2+3) — BUILT, SMOKE-TESTED, and OPEN AS PR #4.** Spec:
+`docs/superpowers/specs/2026-07-23-launch-bootstrap-design.md`. Plan:
+`docs/superpowers/plans/2026-07-23-launch-bootstrap.md`. All 9 plan tasks
+built via subagent-driven-development, final whole-branch review clean,
+135 Python tests + 4 hook suites passing. Approach: a `SessionStart` hook
+(`hooks/provision-local-coder`, extensionless, dispatched by the existing
+`run-hook.cmd`) provisions the venv into `${CLAUDE_PLUGIN_DATA}/local-coder/.venv`
+(manifest-diff pattern); config.yaml + per-call logs also moved to
+`${CLAUDE_PLUGIN_DATA}` (out of the ephemeral `${CLAUDE_PLUGIN_ROOT}`);
+`config.py` lock is now fcntl(POSIX)/msvcrt(Windows); `.mcp.json` launches
+via `hooks/launch-local-coder`.
+
+**SMOKE TEST (2026-07-23) — provisioning PASSED, caught + fixed a REAL
+launch bug:**
+- ✅ Auto-provisioning works: the SessionStart hook created the venv +
+  stamp at `~/.claude/plugins/data/superpowers-superpowers-dev/local-coder/`
+  with zero manual steps (verified on disk; the venv's python imports
+  fastmcp).
+- ❌→✅ **Launch bug (fixed, commit `c12c9a9`):** the launch hook read the
+  plugin-data dir from the `CLAUDE_PLUGIN_DATA` *env var*, but Claude Code
+  does NOT reliably export that var into the MCP server subprocess's
+  environment (it DOES give it to the SessionStart hook — that's why
+  provisioning worked — and it DOES substitute `${CLAUDE_PLUGIN_DATA}`
+  into `.mcp.json` argv). So `${CLAUDE_PLUGIN_DATA:-}/local-coder/.venv`
+  collapsed to `/local-coder/.venv` and the server failed to connect. Fix:
+  `.mcp.json` now passes `${CLAUDE_PLUGIN_DATA}` as an explicit argv, and
+  `launch-local-coder` takes the data dir as `$1` / server.py as `$2`
+  (env-var fallback only for hook-test/dev). TDD test reproduces the exact
+  bug. Verified the real `run-hook.cmd` dispatch forwards args correctly.
+
+**SMOKE TEST round 2 — caught + fixed a startup RACE (commit `49a7f6c`):**
+After the argv fix, re-testing showed a fresh install's SessionStart
+provisioning (~30s venv+pip) may not finish before Claude Code launches
+the MCP server, so the FIRST session showed `local-coder` disconnected
+(self-healed next session). **Fixed by construction:** extracted the
+provisioning logic into a shared `hooks/ensure-local-coder-venv`, and the
+LAUNCHER now calls it FIRST (provision-if-needed, then exec) — so a fresh
+install provisions on the fly during the first launch and connects
+immediately, regardless of startup ordering. `provision-local-coder` is
+now a thin SessionStart pre-warm wrapper. **Verified end-to-end:**
+launching against a completely fresh EMPTY data dir provisions the venv
+AND starts the server in one shot ("Starting MCP server 'local-coder'
+with transport 'stdio'"). All 4 hook suites + 135 Python tests passing.
+
+**SMOKE TEST round 3 — THE root cause found and fixed (commit `ba297aa`).
+`local-coder` now shows ✔ Connected in a real session.** The actual
+error, obtained via `claude --debug-file` (should have done this FIRST):
+```
+ENOEXEC: unknown error, posix_spawn '.../hooks/run-hook.cmd'
+```
+**Claude Code `posix_spawn`s an MCP server's `command` DIRECTLY — no
+shell** (unlike `hooks.json` commands, which DO go through one).
+`hooks/run-hook.cmd` is a deliberately shebang-less CMD/bash polyglot (it
+starts with `: << 'CMDBLOCK'`), so spawning it directly fails with
+"exec format error". Fix: `.mcp.json` now points `command` straight at
+`hooks/launch-local-coder`, which HAS `#!/usr/bin/env bash` and is
+executable — so posix_spawn works. This also matches the plugin docs' own
+MCP example (`command` → a directly-executable file). `run-hook.cmd`
+remains the dispatcher for `hooks.json` (shell context) — unchanged.
+
+**PROCESS LESSON (important for future work): every hook test invoked the
+script as `bash run-hook.cmd ...`, which always worked — so four rounds
+of "verified working" tested a launch path Claude Code never uses.** When
+an MCP server won't connect, get the real error with
+`claude --debug-file <path> mcp list` and grep for the server name BEFORE
+theorizing. Added 3 regression tests to `tests/hooks/test-launch-local-coder`:
+the launch hook must have a shebang, must be executable, and must spawn
+via `subprocess.Popen` with NO shell (the ENOEXEC reproducer).
+
+**Note:** the MCP command legitimately points into
+`.worktrees/local-coder-impl/` — that's the marketplace source the plugin
+was installed from, NOT a stale path. Nothing to repoint.
+
+**SMOKE TEST STATUS: PASSED, INCLUDING A REAL END-TO-END DELEGATION
+(2026-07-24).** Auto-provisioning ✅, launch chain ✅,
+fresh-empty-data-dir provision-then-start ✅, `local-coder` ✔ Connected in
+a real restarted session ✅, **real `delegate_implementation` run ✅**.
+Item 7's two deferred follow-ups (stall-tail retention, log-retention
+policy) remain tracked, NOT part of this chunk.
+
+**End-to-end delegation result (2026-07-24).** Scratch repo with
+`calculator.py` containing only `add()`; task "Add a subtract(a, b)
+function that returns a - b … Keep the existing add() function
+unchanged"; model `ollama/qwen2.5-coder:7b`. Result: branch
+`local-coder/smoke-test` created (correct configured prefix), one commit
+`cbaa43d` ("feat(calculator.py): Add subtract function"), diff exactly the
+requested change with `add()` untouched, and the resulting module imports
+and computes correctly (`add(2,3)=5`, `subtract(10,4)=6`). Verified
+independently by reading the repo, not by trusting the tool's own report.
+
+**KNOWN ISSUE (environmental, NOT a local-coder bug): aider's scipy
+import fails on macOS 27 beta — workaround `--map-tokens 0`.** On this
+machine aider crashes on startup with a dyld error loading
+`_spropack.cpython-312-darwin.so`: "section '__DATA/__thread_bss' has a
+zero-fill section type, but offset field is not zero". Confirmed NOT ours
+and NOT a bad wheel: reproduces with a freshly downloaded, non-cached
+scipy, under both Python 3.12 and 3.13, and reproduces running `aider`
+standalone with no local-coder involved. The binary is a legitimate arm64
+build targeting macOS 14.0 — this is macOS 27 beta's dyld rejecting a
+Fortran/gfortran-compiled TLS section. Only aider's **repo-map** feature
+pulls scipy in (via networkx pagerank), so `--map-tokens 0` disables the
+repo map and avoids the import entirely. Applied for the smoke test via
+runtime config `extra_backend_args: ["--map-tokens", "0"]`.
+**This is currently ad-hoc LOCAL runtime config only — it is NOT in the
+repo and NOT part of the launch/bootstrap PR.** Open decision: document it
+as a known-issue note (recommended — the root cause is an OS regression
+local-coder shouldn't permanently paper over), make it a default, or
+leave it as user config.
+Do NOT try to "fix" this by reinstalling scipy or aider: that path was
+tried repeatedly and twice BROKE the aider install (once
+`ModuleNotFoundError: aider.commands` from `--force --reinstall`, once
+`pyaudioop` missing after being silently moved to Python 3.13). Recovery
+both times: `uv tool uninstall aider-chat && uv tool install aider-chat
+--python 3.12`.
+
+**HOW THE SCIPY FAILURE PRESENTED (important — it is a MID-CALL crash,
+not a connection failure).** Proven by diffing the two server logs in
+`${CLAUDE_PLUGIN_DATA}/local-coder/`, both from the same server PID:
+the failed run logged `Repo-map: using 4096.0 tokens, auto refresh` and
+the successful run logged `Repo-map: disabled` — that single line is the
+only meaningful difference. The MCP server connected, spawned aider, and
+aider crashed while BUILDING THE REPO-MAP (networkx pagerank →
+`to_scipy_sparse_array` → `scipy.sparse` → `_propack`), before ever
+contacting Ollama. local-coder behaved correctly throughout: it streamed
+aider's traceback back and reported failure promptly rather than hanging
+to the 300s stall timeout (item 7's mid-flight visibility working as
+intended). **Diagnostic tip: when a delegation fails, read
+`${CLAUDE_PLUGIN_DATA}/local-coder/local-coder-output-*.log` FIRST — the
+per-call logs make this kind of question answerable in one step.**
+
+**GOTCHA — call delegation DIRECTLY rather than via the
+`superpowers:local-coder-implementer` subagent.** Dispatching the
+implementer agent failed in ~17s with the target file untouched, and
+produced NO server-side log at all — so the tool call almost certainly
+never reached the server and no aider process was spawned. The exact
+mechanism is UNCONFIRMED (an earlier version of this doc asserted
+"subagents don't inherit MCP connections" — that was stated with more
+confidence than the evidence supports; do not treat it as established).
+One thing worth checking if this is picked up: the agent declares
+`mcp__local-coder__delegate_implementation`, while the connected server
+registers under the plugin namespace `plugin:superpowers:local-coder`.
+This does NOT gate this PR; direct calls work.
+**When this failure happens, do not let it be misdiagnosed as a stale
+`.mcp.json` worktree path** — that wrong diagnosis has now surfaced twice
+in different sessions (see the "Note" above: the worktree exists, is
+registered, and the launcher is present and executable there). The repo
+root's own `.mcp.json` is legitimately `{"mcpServers": {}}` because the
+root is on `local-coder/test-branch`, where this feature does not exist;
+the plugin is installed from the `local-coder-impl` worktree. Adding a
+duplicate registration there would be a regression.
+
+**HOW TO RE-SMOKE-TEST (the installed plugin cache is a STALE plain-copy;
+`claude plugin update` won't refresh it because the marketplace version is
+pinned at `6.1.1` and doesn't bump).** From the MAIN REPO ROOT
+(`<repo-root>`,
+where the plugin is enabled at project scope — enablement lives in that
+dir's `.claude/settings.json`):
+1. `claude plugin marketplace update superpowers-dev` (refresh the
+   directory source from the worktree).
+2. `claude plugin disable superpowers@superpowers-dev --scope project`
+3. `claude plugin uninstall superpowers@superpowers-dev --scope project`
+4. `claude plugin install superpowers@superpowers-dev --scope project`
+   (re-copies the current worktree into the cache; auto-re-enables).
+5. Verify the cache has the fix:
+   `grep -o "CLAUDE_PLUGIN_DATA" ~/.claude/plugins/cache/superpowers-dev/superpowers/*/.mcp.json`
+   (should print `CLAUDE_PLUGIN_DATA` — the fixed `.mcp.json`).
+6. Start a fresh session from the main repo root, `claude mcp list`,
+   confirm `plugin:superpowers:local-coder` is **Connected**. (Removing any
+   stray project `.mcp.json` registration first via
+   `claude mcp remove local-coder -s project` avoids a duplicate-name
+   collision — a stale one existed on the main checkout's `local-coder/test-branch`.)
+7. Then run a real `delegate_implementation` end-to-end.
+**Known Phase 2 gap this surfaced:** the pinned-`6.1.1`-version + plain-copy
+cache means a directory-source plugin needs uninstall/reinstall (or a
+version bump) to pick up source changes — worth noting in the PR as a
+real-install caveat, though it's a Claude Code plugin-update behavior, not
+our code.
+
+---
+
+### (Historical) item 7 design notes — kept for reference
 
 **LATEST (2026-07-22, item 7 = mid-flight communication):** Item 7 was
 selected as the Phase 2 focus (over the other backlog items). Ran
@@ -382,7 +567,10 @@ described in root `CLAUDE.md` — a clean session). Exact steps for that
 fresh session:
 
 ```bash
-claude plugin marketplace add /Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder/.worktrees/local-coder-impl --scope project
+# --git-common-dir resolves to the MAIN checkout's .git even when run from
+# a linked worktree; --show-toplevel would return the worktree itself.
+REPO_ROOT="$(cd "$(git rev-parse --git-common-dir)/.." && pwd)"
+claude plugin marketplace add "$REPO_ROOT/.worktrees/local-coder-impl" --scope project
 claude plugin install superpowers@superpowers-dev --scope project
 ```
 Then restart/start a new `claude` session from
@@ -398,7 +586,7 @@ working, MCP connection UNBLOCKED.** The install genuinely worked, but
 one path detail bit us: `claude plugin marketplace add`/`install
 --scope project` write their enablement record to **the main repo
 root's** `.claude/settings.json`
-(`/Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder/.claude/settings.json`),
+(`<repo-root>/.claude/settings.json`),
 not into the worktree — this is git-worktree-shared `--scope project`
 behavior in Claude Code, not a bug: all worktrees of one repo share one
 project-scope settings file at the git common dir. A session started
@@ -406,7 +594,7 @@ project-scope settings file at the git common dir. A session started
 didn't pick up the enablement, so `local-coder` still failed
 (`CLAUDE_PLUGIN_ROOT` still missing) on the first retry. **Fix: start
 the session from the MAIN REPO ROOT
-(`/Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder`,
+(`<repo-root>`,
 currently on `dev`, which already has everything from the merged PR),
 not from the worktree.** Confirmed via `claude mcp list` in that
 session:
@@ -533,7 +721,7 @@ issuing the `configure`/`delegate_implementation` calls has its shell
 repo-root copy is still untouched (`fallback_models: []`,
 `target_repo_path: null`); the worktree copy now has
 `fallback_models: [ollama/qwen2.5-coder:7b]` and
-`target_repo_path: /Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder`
+`target_repo_path: <repo-root>`
 (the repo root's own absolute path, written by the `configure` call
 presumably resolving its own cwd). This makes sense once you trace it:
 `${CLAUDE_PLUGIN_ROOT}` resolves to wherever the plugin's marketplace
@@ -716,7 +904,7 @@ reason left for this to fail, but "no known reason" is not the same as
 
 **Two different directories are in play right now — read this before
 picking which one to resume in:**
-- **Main repo root** (`/Users/niravthakker/Downloads/Nirav/Personal/Coding/superpowers-local-coder`,
+- **Main repo root** (`<repo-root>`,
   currently on `dev`) — this is where the `local-coder` plugin is
   installed/connected. **Use this one to check on or re-run the smoke
   test** (see "Smoke test attempt #2" above for the exact task to send).
