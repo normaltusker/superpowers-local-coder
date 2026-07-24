@@ -14,6 +14,12 @@ from paths import plugin_data_dir
 # does not exist on Windows (importing it unconditionally crashes the
 # server there); `msvcrt` is the Windows stdlib equivalent. Both are wrapped
 # behind _config_lock() below so callers are platform-agnostic.
+# How long _config_lock() waits for a contended lock on Windows before
+# giving up. Generous relative to the guarded critical section (a
+# load->merge->validate->save of one small YAML file), so this is only
+# reached when something is genuinely wrong rather than merely busy.
+_WINDOWS_LOCK_TIMEOUT_SECONDS = 60.0
+
 _IS_WINDOWS = os.name == "nt"
 if _IS_WINDOWS:
     import msvcrt as _lock_module
@@ -72,15 +78,19 @@ def _config_lock():
             # 1-second intervals, then raises OSError. That contradicts this
             # function's "blocks until free" contract, so retry around it —
             # matching flock's indefinite wait on POSIX.
+            # Bounded, so a PERMANENT failure (bad descriptor, permissions,
+            # a filesystem that cannot lock) surfaces as an error instead of
+            # hanging the MCP call forever. Retrying indefinitely would turn
+            # every fatal lock error into an infinite tool call.
+            deadline = time.monotonic() + _WINDOWS_LOCK_TIMEOUT_SECONDS
             while True:
                 try:
                     lock_file.seek(0)
                     _lock_module.locking(lock_file.fileno(), _lock_module.LK_LOCK, 1)
                     break
                 except OSError:
-                    # Contention only; keep waiting. Any genuinely fatal
-                    # condition (bad fd, permissions) recurs and would spin,
-                    # so bound the wait with a short sleep to stay cheap.
+                    if time.monotonic() >= deadline:
+                        raise
                     time.sleep(0.1)
             try:
                 yield
@@ -123,6 +133,20 @@ def load_config() -> dict:
                 os.link(tmp_path, CONFIG_PATH)
             except FileExistsError:
                 pass
+            except OSError:
+                # Hard links are not available everywhere (some Windows and
+                # network filesystems). Fall back to an O_CREAT|O_EXCL
+                # create, which is also atomic and also refuses to clobber —
+                # the two properties this seeding actually needs.
+                try:
+                    fd2 = os.open(
+                        CONFIG_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644
+                    )
+                except FileExistsError:
+                    pass  # Lost the race; the config exists, which is success.
+                else:
+                    with os.fdopen(fd2, "w") as f:
+                        f.write(_DEFAULT_CONFIG_PATH.read_text())
         finally:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(tmp_path)

@@ -72,6 +72,13 @@ mkdir -p "$DATA_DIR"
 # flock/msvcrt split, and works in plain bash. The holder's PID is recorded
 # so a lock orphaned by a killed process can be detected and reclaimed
 # rather than wedging provisioning forever.
+#
+# Stale reclamation is done by RENAMING the lock aside, never by deleting it
+# in place. A plain `rm -rf` after observing a dead PID is a TOCTOU race:
+# between the check and the delete, another process can legitimately acquire
+# the lock, and we would then delete THEIR lock and both would install at
+# once. `mv` is atomic, so exactly one racer can win the takeover; the loser's
+# mv fails and it goes back to waiting.
 LOCK_DIR="${DATA_DIR}/.provision.lock"
 HAVE_LOCK=""
 for _ in $(seq 1 600); do   # ~10 min ceiling; a cold pip install is ~30s
@@ -80,11 +87,22 @@ for _ in $(seq 1 600); do   # ~10 min ceiling; a cold pip install is ~30s
         echo $$ > "$LOCK_DIR/pid" 2>/dev/null || true
         break
     fi
-    # Reclaim the lock if the recorded holder is gone (crash/kill).
+    # Reclaim the lock only if the recorded holder is gone (crash/kill).
     LOCK_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
     if [ -n "$LOCK_PID" ] && ! kill -0 "$LOCK_PID" 2>/dev/null; then
-        echo "[local-coder] clearing a stale provisioning lock (pid $LOCK_PID is gone)" >&2
-        rm -rf "$LOCK_DIR"
+        DEAD_DIR="${LOCK_DIR}.dead.$$"
+        if mv "$LOCK_DIR" "$DEAD_DIR" 2>/dev/null; then
+            # We won the takeover: the lock is ours to clear.
+            RECLAIMED_PID="$(cat "$DEAD_DIR/pid" 2>/dev/null || true)"
+            if [ "$RECLAIMED_PID" = "$LOCK_PID" ]; then
+                echo "[local-coder] cleared a stale provisioning lock (pid $LOCK_PID is gone)" >&2
+                rm -rf "$DEAD_DIR"
+            else
+                # The lock changed hands between our check and our mv — put
+                # it back rather than destroying a live holder's lock.
+                mv "$DEAD_DIR" "$LOCK_DIR" 2>/dev/null || rm -rf "$DEAD_DIR"
+            fi
+        fi
         continue
     fi
     sleep 1
@@ -92,11 +110,24 @@ done
 
 if [ -n "$HAVE_LOCK" ]; then
     trap 'rm -rf "$LOCK_DIR"' EXIT
+elif [ -n "$(venv_python)" ] && [ -f "$STAMP" ] && cmp -s "$REQ" "$STAMP"; then
+    # We never got the lock, but whoever held it finished the job for us.
+    # Nothing left to do, so this is success rather than a timeout failure.
+    exit 0
 else
-    # Never block the launch forever on a lock we cannot take: fall through
-    # and let the re-check below decide. Worst case we race, which is what
-    # the situation already was before this lock existed.
-    echo "[local-coder] proceeding without the provisioning lock (timed out waiting)" >&2
+    # Do NOT proceed unlocked. Installing concurrently with the lock holder
+    # is precisely the corruption this lock exists to prevent (interleaved
+    # venv creation, two pips writing one site-packages, racing stamp
+    # writes). After a ~10 minute wait the holder is either genuinely still
+    # working or wedged in a way we must not paper over — fail loudly and
+    # let the caller decide (the SessionStart wrapper swallows it; the
+    # launcher reports a clear failure).
+    #
+    # A concurrent holder that SUCCEEDS is already handled: it completes the
+    # venv, and our re-check below the fast path would have returned 0.
+    echo "[local-coder] provisioning failed: timed out waiting for another" \
+         "process's provisioning lock at $LOCK_DIR" >&2
+    exit 1
 fi
 
 # Re-check under the lock: another process may have completed provisioning

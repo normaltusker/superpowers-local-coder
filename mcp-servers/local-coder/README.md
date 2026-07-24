@@ -26,12 +26,18 @@ instead of Claude Code's own Edit/Write tools.
   through Git Bash (the same requirement as all Superpowers hooks — see
   `docs/windows/polyglot-hooks.md`).
 
-  For local development outside a plugin install, create the venv manually
-  (POSIX; on Windows use `.venv\Scripts\python.exe -m pip` instead):
+  For local development outside a plugin install, create the venv manually.
+  POSIX:
   ```bash
   cd mcp-servers/local-coder
   python3 -m venv .venv
   .venv/bin/pip install -r requirements.txt
+  ```
+  Windows (PowerShell or cmd):
+  ```
+  cd mcp-servers\local-coder
+  py -3 -m venv .venv
+  .venv\Scripts\python.exe -m pip install -r requirements.txt
   ```
 
 ## Configuring backend/model

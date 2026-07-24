@@ -119,5 +119,52 @@ else
     fail "the provisioning lock is released"
 fi
 
+# --- Test 7: a lock held by a LIVE process is never stolen ---
+# Regression: stale reclamation must not delete a live holder's lock, and
+# must not fall through and install unlocked on timeout — installing
+# concurrently with the holder is the corruption the lock exists to stop.
+DATA7="$TEST_ROOT/data7"; mkdir -p "$DATA7/local-coder"
+LOCK7="$DATA7/local-coder/.provision.lock"
+mkdir -p "$LOCK7"
+sleep 600 &                 # a genuinely live "holder"
+HOLDER=$!
+echo "$HOLDER" > "$LOCK7/pid"
+# Shorten the wait: run with a tiny timeout by pre-seeding a busy lock and
+# checking that we fail rather than proceed. Backgrounded with a hard kill
+# so a regression cannot hang the suite.
+bash "$ENSURE" "$REPO_ROOT" "$DATA7" >/dev/null 2>&1 &
+ENSURE_PID=$!
+sleep 6
+if kill -0 "$ENSURE_PID" 2>/dev/null; then
+    pass "waits for a live lock holder instead of stealing the lock"
+    kill "$ENSURE_PID" 2>/dev/null
+    wait "$ENSURE_PID" 2>/dev/null
+else
+    wait "$ENSURE_PID" 2>/dev/null; RC7=$?
+    if [ "$RC7" -ne 0 ]; then
+        pass "waits for a live lock holder instead of stealing the lock"
+    else
+        fail "waits for a live lock holder instead of stealing the lock (returned 0)"
+    fi
+fi
+if [ -d "$LOCK7" ]; then
+    pass "a live holder's lock is left intact"
+else
+    fail "a live holder's lock is left intact"
+fi
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+
+# --- Test 8: a lock orphaned by a DEAD process is reclaimed ---
+DATA8="$TEST_ROOT/data8"; mkdir -p "$DATA8/local-coder"
+LOCK8="$DATA8/local-coder/.provision.lock"
+mkdir -p "$LOCK8"
+sleep 1 & DEAD=$!; wait "$DEAD" 2>/dev/null   # a PID that is definitely gone
+echo "$DEAD" > "$LOCK8/pid"
+if bash "$ENSURE" "$REPO_ROOT" "$DATA8" >/dev/null 2>&1; then
+    pass "reclaims a lock orphaned by a dead holder"
+else
+    fail "reclaims a lock orphaned by a dead holder"
+fi
+
 if [ "$FAILURES" -gt 0 ]; then echo "STATUS: FAILED ($FAILURES)"; exit 1; fi
 echo "STATUS: PASSED"

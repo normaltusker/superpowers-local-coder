@@ -567,7 +567,8 @@ described in root `CLAUDE.md` — a clean session). Exact steps for that
 fresh session:
 
 ```bash
-claude plugin marketplace add <repo-root>/.worktrees/local-coder-impl --scope project
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+claude plugin marketplace add "$REPO_ROOT/.worktrees/local-coder-impl" --scope project
 claude plugin install superpowers@superpowers-dev --scope project
 ```
 Then restart/start a new `claude` session from
