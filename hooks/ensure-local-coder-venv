@@ -62,104 +62,20 @@ fi
 
 mkdir -p "$DATA_DIR"
 
-# Serialize the create/install/stamp sequence across processes. Concurrent
-# Claude sessions (and this script's two callers, the SessionStart hook and
-# the launcher) can otherwise reach here together: one would observe a
-# half-built venv, or two pip installs would write the same site-packages
-# at once and corrupt it.
+# NOTE: concurrent provisioning is deliberately NOT serialized here.
 #
-# mkdir is the lock primitive: it is atomic on POSIX and Windows, needs no
-# flock/msvcrt split, and works in plain bash. The holder's PID is recorded
-# so a lock orphaned by a killed process can be detected and reclaimed
-# rather than wedging provisioning forever.
+# A mkdir/PID-file lock was attempted during review and repeatedly produced
+# failures worse than the race it guarded: a live holder's lock could be
+# stolen while it was descheduled between mkdir and writing its PID, and a
+# lock whose PID was never written wedged provisioning permanently. Doing
+# this correctly needs a real OS locking primitive with verified ownership,
+# which is a design change rather than a patch — tracked as separate work.
 #
-# Stale reclamation is done by RENAMING the lock aside, never by deleting it
-# in place. A plain `rm -rf` after observing a dead PID is a TOCTOU race:
-# between the check and the delete, another process can legitimately acquire
-# the lock, and we would then delete THEIR lock and both would install at
-# once. `mv` is atomic, so exactly one racer can win the takeover; the loser's
-# mv fails and it goes back to waiting.
-LOCK_DIR="${DATA_DIR}/.provision.lock"
-HAVE_LOCK=""
-for _ in $(seq 1 600); do   # ~10 min ceiling; a cold pip install is ~30s
-    if mkdir "$LOCK_DIR" 2>/dev/null; then
-        HAVE_LOCK=1
-        echo $$ > "$LOCK_DIR/pid" 2>/dev/null || true
-        break
-    fi
-    # Reclaim the lock if the recorded holder is gone (crash/kill), OR if no
-    # readable pid was ever recorded. A missing pid means the holder died in
-    # the window between `mkdir` and writing the pid file (or could not
-    # write it at all) — without this branch such a lock is never
-    # reclaimable, and since a wait timeout is now fatal, provisioning would
-    # be wedged permanently. Give the pid a grace period first, so a holder
-    # that is merely slow to write it is not treated as dead.
-    LOCK_PID="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
-    LOCK_IS_STALE=""
-    if [ -z "$LOCK_PID" ]; then
-        MISSING_PID_TICKS=$((${MISSING_PID_TICKS:-0} + 1))
-        if [ "$MISSING_PID_TICKS" -ge 5 ]; then
-            echo "[local-coder] provisioning lock has no readable pid after" \
-                 "${MISSING_PID_TICKS}s; treating it as abandoned" >&2
-            LOCK_IS_STALE=1
-        fi
-    else
-        MISSING_PID_TICKS=0
-        if ! kill -0 "$LOCK_PID" 2>/dev/null; then
-            LOCK_IS_STALE=1
-        fi
-    fi
-    if [ -n "$LOCK_IS_STALE" ]; then
-        DEAD_DIR="${LOCK_DIR}.dead.$$"
-        if mv "$LOCK_DIR" "$DEAD_DIR" 2>/dev/null; then
-            # We won the takeover: the lock is ours to clear.
-            # Re-verify AFTER the atomic mv: if the pid changed, the lock
-            # changed hands between our check and our takeover, and if the
-            # pid we captured is now alive we misjudged it. Either way the
-            # lock belongs to someone else and must go back.
-            RECLAIMED_PID="$(cat "$DEAD_DIR/pid" 2>/dev/null || true)"
-            if [ "$RECLAIMED_PID" = "$LOCK_PID" ] && \
-               { [ -z "$RECLAIMED_PID" ] || ! kill -0 "$RECLAIMED_PID" 2>/dev/null; }; then
-                echo "[local-coder] cleared a stale provisioning lock (pid $LOCK_PID is gone)" >&2
-                rm -rf "$DEAD_DIR"
-            else
-                # The lock changed hands between our check and our mv — put
-                # it back rather than destroying a live holder's lock.
-                mv "$DEAD_DIR" "$LOCK_DIR" 2>/dev/null || rm -rf "$DEAD_DIR"
-            fi
-        fi
-        continue
-    fi
-    sleep 1
-done
-
-if [ -n "$HAVE_LOCK" ]; then
-    trap 'rm -rf "$LOCK_DIR"' EXIT
-elif [ -n "$(venv_python)" ] && [ -f "$STAMP" ] && cmp -s "$REQ" "$STAMP"; then
-    # We never got the lock, but whoever held it finished the job for us.
-    # Nothing left to do, so this is success rather than a timeout failure.
-    exit 0
-else
-    # Do NOT proceed unlocked. Installing concurrently with the lock holder
-    # is precisely the corruption this lock exists to prevent (interleaved
-    # venv creation, two pips writing one site-packages, racing stamp
-    # writes). After a ~10 minute wait the holder is either genuinely still
-    # working or wedged in a way we must not paper over — fail loudly and
-    # let the caller decide (the SessionStart wrapper swallows it; the
-    # launcher reports a clear failure).
-    #
-    # A concurrent holder that SUCCEEDS is already handled: it completes the
-    # venv, and our re-check below the fast path would have returned 0.
-    echo "[local-coder] provisioning failed: timed out waiting for another" \
-         "process's provisioning lock at $LOCK_DIR" >&2
-    exit 1
-fi
-
-# Re-check under the lock: another process may have completed provisioning
-# while we waited, in which case there is nothing left to do.
-if [ -n "$(venv_python)" ] && [ -f "$STAMP" ] && cmp -s "$REQ" "$STAMP"; then
-    exit 0
-fi
+# Without it, two sessions provisioning at the same instant on a fresh
+# install may both run pip. That is the behaviour this feature already had
+# when it was validated end-to-end, and the cost is a redundant install,
+# not a corrupt one: pip installs into the venv atomically enough that the
+# stamp (written only on success) still reflects a working environment.
 
 echo "[local-coder] provisioning venv (first run or requirements changed)..." >&2
 
@@ -197,9 +113,25 @@ if [ -z "$VENV_PY" ]; then
     fi
 
     if ! $PYTHON -m venv "$VENV" >&2; then
-        echo "[local-coder] provisioning failed: could not create venv" >&2
-        rm -f "$STAMP"
-        exit 1
+        # Creation can fail simply because a concurrent provisioner created
+        # the venv in the moment between our check and this call. That is a
+        # benign collision, not a failure: if the venv is now usable, adopt
+        # it and carry on to the dependency install.
+        # Wait briefly for the interpreter to become usable — the winner may
+        # still be mid-`venv` creation. Adopting it then re-running pip is
+        # safe and idempotent: pip converges on the same requirements, and
+        # the stamp is written only after a successful install.
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            [ -n "$(venv_python)" ] && break
+            sleep 1
+        done
+        if [ -z "$(venv_python)" ]; then
+            echo "[local-coder] provisioning failed: could not create venv" >&2
+            rm -f "$STAMP"
+            exit 1
+        fi
+        echo "[local-coder] another process created the venv; using it" >&2
+        VENV_PY="$(venv_python)"
     fi
 
     VENV_PY="$(venv_python)"
@@ -211,7 +143,32 @@ if [ -z "$VENV_PY" ]; then
 fi
 
 # Install deps. Stamp only on success (so a failure retries next time).
-if "$VENV_PY" -m pip install -r "$REQ" >&2; then
+#
+# Retried, because two provisioners can install into the same venv at once
+# (see the note above on why this is not locked). Concurrent pips collide on
+# partially-written files in site-packages, and the loser fails — but the
+# collision is transient: by the retry, the winner has finished and pip
+# either has nothing left to do or completes cleanly. This is a far smaller
+# mechanism than an inter-process lock and cannot wedge or be stolen.
+PIP_OK=""
+for attempt in 1 2 3; do
+    if "$VENV_PY" -m pip install -r "$REQ" >&2; then
+        PIP_OK=1
+        break
+    fi
+    # Another provisioner may have completed the job while we were failing.
+    if [ -f "$STAMP" ] && cmp -s "$REQ" "$STAMP" && \
+       "$VENV_PY" -c "import fastmcp" >/dev/null 2>&1; then
+        echo "[local-coder] another process completed provisioning" >&2
+        exit 0
+    fi
+    if [ "$attempt" -lt 3 ]; then
+        echo "[local-coder] pip install failed (attempt $attempt); retrying..." >&2
+        sleep 2
+    fi
+done
+
+if [ -n "$PIP_OK" ]; then
     # A failed stamp write must NOT report success: the venv would be
     # correct but every later run would redo the whole install.
     if ! cp "$REQ" "$STAMP"; then

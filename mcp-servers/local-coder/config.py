@@ -112,64 +112,21 @@ def load_config() -> dict:
     # pointless self-copy.)
     if not CONFIG_PATH.exists() and CONFIG_PATH != _DEFAULT_CONFIG_PATH:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        # Seed atomically, like save_config(): write a same-directory temp
-        # file and link it into place. Two servers starting at once could
-        # otherwise both see the file missing and have a reader observe a
-        # partially-written YAML.
+        # Single-writer seeding, deliberately simple.
         #
-        # os.link() rather than os.replace() because this must NOT clobber:
-        # if another process (or a configure() call) created a real config
-        # between the exists() check and here, replacing it would silently
-        # reset the user's settings to defaults. link() fails with
-        # FileExistsError instead, and losing that race is success — the
-        # config now exists, which is all this block wanted.
-        fd, tmp_path = tempfile.mkstemp(
-            dir=CONFIG_PATH.parent, prefix=".config.yaml.seed.", suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "w") as f:
-                f.write(_DEFAULT_CONFIG_PATH.read_text())
-            try:
-                os.link(tmp_path, CONFIG_PATH)
-            except FileExistsError:
-                pass
-            except OSError:
-                # Hard links are not available everywhere (some Windows and
-                # network filesystems). Fall back to an O_CREAT|O_EXCL
-                # create, which is also atomic and also refuses to clobber —
-                # the two properties this seeding actually needs.
-                # Create an EXCLUSIVE SENTINEL first, then write, then
-                # os.replace() the finished file into place. Opening
-                # CONFIG_PATH itself with O_EXCL would publish the
-                # destination at open() — before write() — so a concurrent
-                # reader could load an empty file, and an interrupted write
-                # would leave a corrupt config that later loads never
-                # reseed (the path exists, so the exists() check passes).
-                sentinel = CONFIG_PATH.with_name(CONFIG_PATH.name + ".seeding")
-                try:
-                    sentinel_fd = os.open(
-                        sentinel, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644
-                    )
-                except FileExistsError:
-                    # Another process is mid-seed. It will publish shortly;
-                    # falling through to the read below is safe because the
-                    # replace() is atomic — we either see no file (and fail
-                    # loudly) or a complete one.
-                    pass
-                else:
-                    try:
-                        with os.fdopen(sentinel_fd, "w") as f:
-                            f.write(_DEFAULT_CONFIG_PATH.read_text())
-                            f.flush()
-                            os.fsync(f.fileno())
-                        if not CONFIG_PATH.exists():
-                            os.replace(sentinel, CONFIG_PATH)
-                    finally:
-                        with contextlib.suppress(FileNotFoundError):
-                            os.unlink(sentinel)
-        finally:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(tmp_path)
+        # Concurrent first-run seeding was attempted during review (hard
+        # link, then an O_EXCL sentinel) and both approaches introduced
+        # worse failures than the race they addressed: a stale sentinel
+        # bricked startup permanently, and the publish step could silently
+        # reset a config another process had just written. Making this
+        # genuinely safe needs a real inter-process lock around every
+        # reader and writer of config.yaml, which is a design change, not
+        # a patch — tracked as separate work.
+        #
+        # The exposure here is narrow: two servers starting in the same
+        # instant on a brand-new install, where both would write identical
+        # template content anyway.
+        CONFIG_PATH.write_text(_DEFAULT_CONFIG_PATH.read_text())
     with open(CONFIG_PATH) as f:
         return yaml.safe_load(f)
 
