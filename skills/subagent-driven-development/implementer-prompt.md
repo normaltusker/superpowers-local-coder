@@ -40,7 +40,12 @@ Subagent (local-coder-implementer):
     ## Your Job
 
     Once you're clear on requirements:
-    1. Call `mcp__local-coder__delegate_implementation` with:
+    1. Call local-coder's `delegate_implementation` tool with:
+       (its full name depends on the install — it is
+       `mcp__plugin_superpowers_local-coder__delegate_implementation` under a
+       plugin install, or `mcp__local-coder__delegate_implementation` under a
+       project-scoped `.mcp.json`. Use whichever is in your toolset; if
+       neither is, report BLOCKED rather than editing files yourself.)
        - `task`: the task brief's requirements, written as a clear
          implementation instruction (not just pasted verbatim — synthesize the
          brief's acceptance criteria into a task description local-coder's
