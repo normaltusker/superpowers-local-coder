@@ -87,12 +87,64 @@ via `subprocess.Popen` with NO shell (the ENOEXEC reproducer).
 `.worktrees/local-coder-impl/` — that's the marketplace source the plugin
 was installed from, NOT a stale path. Nothing to repoint.
 
-**SMOKE TEST STATUS: PASSED.** Auto-provisioning ✅, launch chain ✅,
+**SMOKE TEST STATUS: PASSED, INCLUDING A REAL END-TO-END DELEGATION
+(2026-07-24).** Auto-provisioning ✅, launch chain ✅,
 fresh-empty-data-dir provision-then-start ✅, `local-coder` ✔ Connected in
-a real restarted session ✅. Remaining optional step: a real
-`delegate_implementation` run end-to-end. Item 7's two deferred follow-ups
-(stall-tail retention, log-retention policy) remain tracked, NOT part of
-this chunk.
+a real restarted session ✅, **real `delegate_implementation` run ✅**.
+Item 7's two deferred follow-ups (stall-tail retention, log-retention
+policy) remain tracked, NOT part of this chunk.
+
+**End-to-end delegation result (2026-07-24).** Scratch repo with
+`calculator.py` containing only `add()`; task "Add a subtract(a, b)
+function that returns a - b … Keep the existing add() function
+unchanged"; model `ollama/qwen2.5-coder:7b`. Result: branch
+`local-coder/smoke-test` created (correct configured prefix), one commit
+`cbaa43d` ("feat(calculator.py): Add subtract function"), diff exactly the
+requested change with `add()` untouched, and the resulting module imports
+and computes correctly (`add(2,3)=5`, `subtract(10,4)=6`). Verified
+independently by reading the repo, not by trusting the tool's own report.
+
+**KNOWN ISSUE (environmental, NOT a local-coder bug): aider's scipy
+import fails on macOS 27 beta — workaround `--map-tokens 0`.** On this
+machine aider crashes on startup with a dyld error loading
+`_spropack.cpython-312-darwin.so`: "section '__DATA/__thread_bss' has a
+zero-fill section type, but offset field is not zero". Confirmed NOT ours
+and NOT a bad wheel: reproduces with a freshly downloaded, non-cached
+scipy, under both Python 3.12 and 3.13, and reproduces running `aider`
+standalone with no local-coder involved. The binary is a legitimate arm64
+build targeting macOS 14.0 — this is macOS 27 beta's dyld rejecting a
+Fortran/gfortran-compiled TLS section. Only aider's **repo-map** feature
+pulls scipy in (via networkx pagerank), so `--map-tokens 0` disables the
+repo map and avoids the import entirely. Applied for the smoke test via
+runtime config `extra_backend_args: ["--map-tokens", "0"]`.
+**This is currently ad-hoc LOCAL runtime config only — it is NOT in the
+repo and NOT part of the launch/bootstrap PR.** Open decision: document it
+as a known-issue note (recommended — the root cause is an OS regression
+local-coder shouldn't permanently paper over), make it a default, or
+leave it as user config.
+Do NOT try to "fix" this by reinstalling scipy or aider: that path was
+tried repeatedly and twice BROKE the aider install (once
+`ModuleNotFoundError: aider.commands` from `--force --reinstall`, once
+`pyaudioop` missing after being silently moved to Python 3.13). Recovery
+both times: `uv tool uninstall aider-chat && uv tool install aider-chat
+--python 3.12`.
+
+**GOTCHA — delegation must be called DIRECTLY, not via the
+`superpowers:local-coder-implementer` subagent.** A subagent does not
+inherit the parent session's MCP connections: dispatching the implementer
+agent failed in ~17s without ever attempting the task (target file
+untouched). The agent declares `mcp__local-coder__delegate_implementation`
+while the connected server registers under the plugin namespace
+`plugin:superpowers:local-coder` — that naming mismatch is the thing to
+investigate if this is picked up later. It does NOT gate this PR.
+**When this failure happens, do not let it be misdiagnosed as a stale
+`.mcp.json` worktree path** — that wrong diagnosis has now surfaced twice
+in different sessions (see the "Note" above: the worktree exists, is
+registered, and the launcher is present and executable there). The repo
+root's own `.mcp.json` is legitimately `{"mcpServers": {}}` because the
+root is on `local-coder/test-branch`, where this feature does not exist;
+the plugin is installed from the `local-coder-impl` worktree. Adding a
+duplicate registration there would be a regression.
 
 **HOW TO RE-SMOKE-TEST (the installed plugin cache is a STALE plain-copy;
 `claude plugin update` won't refresh it because the marketplace version is
