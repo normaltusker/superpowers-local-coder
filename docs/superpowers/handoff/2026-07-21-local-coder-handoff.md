@@ -58,11 +58,41 @@ launching against a completely fresh EMPTY data dir provisions the venv
 AND starts the server in one shot ("Starting MCP server 'local-coder'
 with transport 'stdio'"). All 4 hook suites + 135 Python tests passing.
 
-**RE-SMOKE-TEST PENDING** (all fixes committed — `c12c9a9` argv,
-`49a7f6c` launch-time provisioning — but the INSTALLED plugin cache is
-still pre-fix; needs the uninstall/reinstall refresh below). Item 7's two
-deferred follow-ups (stall-tail retention, log-retention policy) remain
-tracked, NOT part of this chunk.
+**SMOKE TEST round 3 — THE root cause found and fixed (commit `ba297aa`).
+`local-coder` now shows ✔ Connected in a real session.** The actual
+error, obtained via `claude --debug-file` (should have done this FIRST):
+```
+ENOEXEC: unknown error, posix_spawn '.../hooks/run-hook.cmd'
+```
+**Claude Code `posix_spawn`s an MCP server's `command` DIRECTLY — no
+shell** (unlike `hooks.json` commands, which DO go through one).
+`hooks/run-hook.cmd` is a deliberately shebang-less CMD/bash polyglot (it
+starts with `: << 'CMDBLOCK'`), so spawning it directly fails with
+"exec format error". Fix: `.mcp.json` now points `command` straight at
+`hooks/launch-local-coder`, which HAS `#!/usr/bin/env bash` and is
+executable — so posix_spawn works. This also matches the plugin docs' own
+MCP example (`command` → a directly-executable file). `run-hook.cmd`
+remains the dispatcher for `hooks.json` (shell context) — unchanged.
+
+**PROCESS LESSON (important for future work): every hook test invoked the
+script as `bash run-hook.cmd ...`, which always worked — so four rounds
+of "verified working" tested a launch path Claude Code never uses.** When
+an MCP server won't connect, get the real error with
+`claude --debug-file <path> mcp list` and grep for the server name BEFORE
+theorizing. Added 3 regression tests to `tests/hooks/test-launch-local-coder`:
+the launch hook must have a shebang, must be executable, and must spawn
+via `subprocess.Popen` with NO shell (the ENOEXEC reproducer).
+
+**Note:** the MCP command legitimately points into
+`.worktrees/local-coder-impl/` — that's the marketplace source the plugin
+was installed from, NOT a stale path. Nothing to repoint.
+
+**SMOKE TEST STATUS: PASSED.** Auto-provisioning ✅, launch chain ✅,
+fresh-empty-data-dir provision-then-start ✅, `local-coder` ✔ Connected in
+a real restarted session ✅. Remaining optional step: a real
+`delegate_implementation` run end-to-end. Item 7's two deferred follow-ups
+(stall-tail retention, log-retention policy) remain tracked, NOT part of
+this chunk.
 
 **HOW TO RE-SMOKE-TEST (the installed plugin cache is a STALE plain-copy;
 `claude plugin update` won't refresh it because the marketplace version is
