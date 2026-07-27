@@ -897,6 +897,14 @@ def test_configure_returns_full_config(isolated_config):
     assert result["backend"] == "aider"
 
 
+def test_configure_persists_first_output_timeout_seconds(isolated_config):
+    # The cold-load grace window must be settable through the configure MCP
+    # tool (the README tells users never to hand-edit config.yaml), not just
+    # present in config.py's validation.
+    result = server._configure_impl(first_output_timeout_seconds=900)
+    assert result["first_output_timeout_seconds"] == 900
+
+
 def test_configure_rejects_invalid_model_with_clean_error(isolated_config):
     with patch("ollama.list_ollama_models", return_value=[]):
         result = server._configure_impl(model="ollama/nonexistent:1b")

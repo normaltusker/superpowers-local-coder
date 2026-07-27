@@ -20,9 +20,19 @@ KNOWN_BACKENDS = ("aider", "codex", "gemini", "openrouter")
 
 
 class StallError(Exception):
-    def __init__(self, stall_timeout_seconds: float):
-        self.stall_timeout_seconds = stall_timeout_seconds
-        super().__init__(f"stalled: no output for {stall_timeout_seconds}s")
+    def __init__(self, timeout_seconds: float, phase: str = "stall"):
+        # phase is "first-output" (killed before the first byte of output,
+        # i.e. a cold-load that never produced anything within its grace
+        # window) or "stall" (went silent after producing output). The
+        # stall_timeout_seconds attribute name is preserved for existing
+        # callers/tests and holds whichever budget actually fired.
+        self.stall_timeout_seconds = timeout_seconds
+        self.phase = phase
+        if phase == "first-output":
+            msg = f"stalled: no first output within {timeout_seconds}s (cold-load grace)"
+        else:
+            msg = f"stalled: no output for {timeout_seconds}s"
+        super().__init__(msg)
 
 
 def validate_branch_name(branch: str) -> None:
@@ -297,6 +307,7 @@ def run_monitored_subprocess(
     idle_notify_interval_seconds: float,
     on_tick: Callable[[], None] | None = None,
     on_output: Callable[[str], None] | None = None,
+    first_output_timeout_seconds: float | None = None,
 ) -> subprocess.CompletedProcess:
     # Run with an unbuffered binary pipe (not text=True) so we can read
     # whatever bytes are actually available via a non-blocking os.read()
@@ -330,6 +341,28 @@ def run_monitored_subprocess(
     last_activity = time.monotonic()
     last_tick = time.monotonic()
 
+    # Cold-load grace. A large local model loading into memory can run for a
+    # long time producing no *useful* output — but the backend (e.g. aider)
+    # still prints a startup banner within the first second or two, before it
+    # ever contacts the model. So the grace window cannot end on "the first
+    # byte of output": that byte is the banner, not the model's first token,
+    # and ending grace there would drop us onto the short stall clock while
+    # the model is still loading.
+    #
+    # Instead, first_budget is a hard MINIMUM runtime floor: no stall is
+    # declared until the process has run for at least first_budget seconds,
+    # regardless of banner output. After that floor, the normal inactivity
+    # check against stall_timeout_seconds governs. When
+    # first_output_timeout_seconds is None, first_budget == stall_timeout_seconds,
+    # so the floor and the inactivity window coincide and behavior is exactly
+    # the original single-window stall detection.
+    start_time = last_activity
+    first_budget = (
+        first_output_timeout_seconds
+        if first_output_timeout_seconds is not None
+        else stall_timeout_seconds
+    )
+
     # Incremental UTF-8 decoder so multi-byte characters split across two
     # reads aren't corrupted — partial bytes are buffered internally by the
     # decoder until a full character is available.
@@ -344,7 +377,25 @@ def run_monitored_subprocess(
             # Poll for output without blocking indefinitely, so the loop
             # keeps evaluating tick/stall timing even when the subprocess
             # produces no output at all (e.g. `sleep`).
-            poll_timeout = min(idle_notify_interval_seconds, 0.5)
+            #
+            # Bound the wait by the nearest upcoming deadline so a short
+            # first_budget (or a short stall_timeout_seconds) is honored to
+            # within a small slop rather than being overshot by a longer
+            # idle_notify_interval_seconds. The deadlines: the next tick, and
+            # the stall check — the floor while nothing has been emitted, or
+            # the later of the floor and the inactivity window once output has
+            # flowed. Clamp to a small floor so we never busy-spin.
+            now = time.monotonic()
+            next_tick = last_tick + idle_notify_interval_seconds
+            if last_activity == start_time:
+                next_stall = start_time + first_budget
+            else:
+                next_stall = max(
+                    start_time + first_budget,
+                    last_activity + stall_timeout_seconds,
+                )
+            poll_timeout = min(next_tick, next_stall) - now
+            poll_timeout = max(0.01, min(poll_timeout, idle_notify_interval_seconds, 0.5))
             ready = selector.select(timeout=poll_timeout)
 
             data = b""
@@ -355,12 +406,17 @@ def run_monitored_subprocess(
                     data = b""
                 if data:
                     decoded = decoder.decode(data)
-                    output_tail += decoded
-                    if len(output_tail) > _MAX_OUTPUT_CHARS:
-                        output_tail = output_tail[-_MAX_OUTPUT_CHARS:]
-                    last_activity = time.monotonic()
-                    if on_output is not None and decoded:
-                        on_output(decoded)
+                    # A read can yield bytes that decode to "" (an incomplete
+                    # multi-byte UTF-8 sequence buffered inside the decoder).
+                    # Only real decoded text counts as activity — guard the
+                    # inactivity clock and the on_output callback with it.
+                    if decoded:
+                        output_tail += decoded
+                        if len(output_tail) > _MAX_OUTPUT_CHARS:
+                            output_tail = output_tail[-_MAX_OUTPUT_CHARS:]
+                        last_activity = time.monotonic()
+                        if on_output is not None:
+                            on_output(decoded)
 
             if process.poll() is not None and not data:
                 # Drain any remaining buffered output before exiting.
@@ -390,10 +446,38 @@ def run_monitored_subprocess(
                     on_tick()
                 last_tick = now
 
-            if now - last_activity > stall_timeout_seconds:
+            # Two distinct kill conditions, keyed on whether the process has
+            # ever produced real (decoded, non-empty) output.
+            #
+            # Cold-load floor (never_emitted): a process that has emitted
+            # nothing is still loading. It is killed only once it has run for
+            # first_budget seconds — the cold-load grace window. This bounds
+            # the silent wait to first_budget EXACTLY, whether first_budget is
+            # longer OR shorter than stall_timeout_seconds; a deliberately
+            # short cold-load window is honored, not overridden by the stall
+            # window. During the floor, banner output does not apply here
+            # (that flips the process to the emitted branch) and silence does
+            # not kill.
+            #
+            # Steady-state stall (has emitted): once real output has flowed,
+            # the normal inactivity window governs — a gap of more than
+            # stall_timeout_seconds since the last real output — but never
+            # before the floor elapses, so a banner printed at startup can't
+            # drop a still-cold-loading model onto the short stall clock.
+            never_emitted = last_activity == start_time
+            if never_emitted:
+                stalled = now - start_time > first_budget
+            else:
+                stalled = (
+                    now - start_time > first_budget
+                    and now - last_activity > stall_timeout_seconds
+                )
+            if stalled:
                 process.kill()
                 process.wait()
-                raise StallError(stall_timeout_seconds)
+                if never_emitted:
+                    raise StallError(first_budget, phase="first-output")
+                raise StallError(stall_timeout_seconds, phase="stall")
     finally:
         selector.close()
         if process.poll() is None:

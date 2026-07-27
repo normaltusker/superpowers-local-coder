@@ -72,6 +72,35 @@ starting Claude Code. `local-coder` sends periodic progress
 notifications and stderr log lines while a backend subprocess runs, but
 these are a best-effort mitigation, not a guarantee against this timeout.
 
+## Cold-load latency and the stall timeout
+
+Once a backend has been running past its cold-load floor (below), a gap of
+more than `stall_timeout_seconds` (default `300`) with no output is treated
+as a stall and killed. But the FIRST call to a large local model after it has
+gone idle can be slow purely from **cold-load** — the weights are read into
+memory before a single token is generated, and that phase emits no output.
+Counting cold-load time against the stall window would kill a model that is
+loading normally, so the floor below suspends stall detection until the
+cold-load window has elapsed.
+
+`first_output_timeout_seconds` (default `600`) governs this. It is a hard
+minimum-runtime **floor**: no stall is declared until the backend has run for
+at least this long — the cold-load grace window. Startup banner output during
+the floor does not end the grace, and silence during the floor does not kill,
+so a model that prints a banner and then loads quietly for minutes is not
+mistaken for a stall. Once the floor elapses, `stall_timeout_seconds` governs
+inactivity as usual (a gap of more than that since the last real output). A
+backend that never emits anything is killed the moment the floor passes. Both
+are set from chat via `configure`, never by hand-editing `config.yaml`.
+
+When `first_output_timeout_seconds` is omitted from a config, it falls back
+to `stall_timeout_seconds`, so the floor and the inactivity window coincide
+and a config predating this setting behaves exactly as before.
+
+For large primary models, also configure `fallback_models`: if a genuine
+cold-load failure does occur, the call fails over to the next model instead
+of aborting outright.
+
 ## Watching a delegation run
 
 While `delegate_implementation` runs, its progress appears live in the

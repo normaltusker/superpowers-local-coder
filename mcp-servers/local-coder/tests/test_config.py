@@ -167,6 +167,34 @@ def test_configure_with_validation_accepts_positive_idle_notify_interval(isolate
     assert result["idle_notify_interval_seconds"] == 30
 
 
+def test_shipped_config_has_first_output_timeout_default():
+    import yaml
+    default_path = Path(__file__).parent.parent / "config.yaml"
+    data = yaml.safe_load(default_path.read_text())
+    assert data["first_output_timeout_seconds"] == 600
+
+
+def test_configure_with_validation_rejects_non_positive_first_output_timeout(isolated_config):
+    with pytest.raises(config_module.ConfigValidationError, match="first_output_timeout_seconds"):
+        config_module.configure_with_validation({"first_output_timeout_seconds": 0})
+    with pytest.raises(config_module.ConfigValidationError, match="first_output_timeout_seconds"):
+        config_module.configure_with_validation({"first_output_timeout_seconds": -10})
+
+
+def test_configure_with_validation_accepts_positive_first_output_timeout(isolated_config):
+    result = config_module.configure_with_validation({"first_output_timeout_seconds": 900})
+    assert result["first_output_timeout_seconds"] == 900
+
+
+def test_configure_with_validation_leaves_first_output_timeout_unchanged_when_absent(isolated_config):
+    # A configure() call that doesn't mention the key must not disturb it.
+    # (The absent-key fallback to stall_timeout_seconds happens at read time
+    # in the backend, not here.)
+    before = config_module.load_config().get("first_output_timeout_seconds")
+    result = config_module.configure_with_validation({"idle_notify_interval_seconds": 20})
+    assert result.get("first_output_timeout_seconds") == before
+
+
 def test_configure_with_validation_rejects_fallback_list_over_cap(isolated_config):
     # include the config's existing default model ("qwen3-coder:30b") in the
     # mock's available list since the merged/effective model is now

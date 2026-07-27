@@ -401,6 +401,7 @@ def _configure_impl(
     fallback_models: list[str] | None = None,
     max_fallback_models: int | None = None,
     stall_timeout_seconds: float | None = None,
+    first_output_timeout_seconds: float | None = None,
     target_repo_path: str | None = None,
     branch_prefix: str | None = None,
     open_pr: bool | None = None,
@@ -414,6 +415,7 @@ def _configure_impl(
         "fallback_models": fallback_models,
         "max_fallback_models": max_fallback_models,
         "stall_timeout_seconds": stall_timeout_seconds,
+        "first_output_timeout_seconds": first_output_timeout_seconds,
         "target_repo_path": target_repo_path,
         "branch_prefix": branch_prefix,
         "open_pr": open_pr,
@@ -460,6 +462,7 @@ def configure(
     fallback_models: list[str] | None = None,
     max_fallback_models: int | None = None,
     stall_timeout_seconds: float | None = None,
+    first_output_timeout_seconds: float | None = None,
     target_repo_path: str | None = None,
     branch_prefix: str | None = None,
     open_pr: bool | None = None,
@@ -469,7 +472,8 @@ def configure(
 ) -> dict:
     return _configure_impl(
         backend, model, fallback_models, max_fallback_models,
-        stall_timeout_seconds, target_repo_path, branch_prefix,
+        stall_timeout_seconds, first_output_timeout_seconds,
+        target_repo_path, branch_prefix,
         open_pr, pr_base_branch, idle_notify_interval_seconds,
         extra_backend_args,
     )

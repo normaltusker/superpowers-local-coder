@@ -197,6 +197,9 @@ def _configure_with_validation_locked(overrides: dict) -> dict:
     idle_notify_interval_seconds = overrides.get(
         "idle_notify_interval_seconds", current.get("idle_notify_interval_seconds")
     )
+    first_output_timeout_seconds = overrides.get(
+        "first_output_timeout_seconds", current.get("first_output_timeout_seconds")
+    )
 
     # A zero or negative stall_timeout_seconds would kill every backend
     # attempt near-instantly; a zero or negative idle_notify_interval_seconds
@@ -211,6 +214,16 @@ def _configure_with_validation_locked(overrides: dict) -> dict:
         raise ConfigValidationError(
             "idle_notify_interval_seconds must be strictly positive, got "
             f"{idle_notify_interval_seconds!r}"
+        )
+    # first_output_timeout_seconds governs the pre-first-output (cold-load)
+    # grace window; a zero or negative value would kill every backend attempt
+    # before it could emit anything. Same strictly-positive rule as the
+    # sibling timeouts; no cross-field constraint, because an absent key
+    # falls back to stall_timeout_seconds at read time in the backend.
+    if first_output_timeout_seconds is not None and first_output_timeout_seconds <= 0:
+        raise ConfigValidationError(
+            "first_output_timeout_seconds must be strictly positive, got "
+            f"{first_output_timeout_seconds!r}"
         )
 
     # Reject an unrecognized backend name immediately at config-write time
