@@ -683,6 +683,25 @@ def test_run_monitored_subprocess_short_first_output_window_honored_for_silent_p
     assert elapsed < 0.45
 
 
+def test_run_monitored_subprocess_short_budget_not_delayed_by_poll_interval():
+    # The poll wait must be bounded by the nearest deadline, not the full
+    # idle_notify_interval_seconds. With a short floor (0.2s) and a large
+    # notify interval (2s), a naive `select(timeout=min(interval, 0.5))` sits
+    # in the poll for up to 0.5s and fires the kill ~0.3s late. The bounded
+    # poll must fire the kill close to the 0.2s floor.
+    start = time.monotonic()
+    with pytest.raises(common.StallError) as ei:
+        common.run_monitored_subprocess(
+            ["sleep", "5"], cwd=".",
+            stall_timeout_seconds=0.5, idle_notify_interval_seconds=2.0,
+            first_output_timeout_seconds=0.2,
+        )
+    elapsed = time.monotonic() - start
+    assert ei.value.phase == "first-output"
+    # Close to the 0.2s floor, well under the 0.5s poll ceiling the old code hit.
+    assert elapsed < 0.35
+
+
 def test_run_monitored_subprocess_omitted_first_output_matches_old_behavior():
     # With first_output_timeout_seconds omitted (None), first_budget ==
     # stall_timeout_seconds — floor and inactivity window coincide, so a

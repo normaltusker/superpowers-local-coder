@@ -377,7 +377,25 @@ def run_monitored_subprocess(
             # Poll for output without blocking indefinitely, so the loop
             # keeps evaluating tick/stall timing even when the subprocess
             # produces no output at all (e.g. `sleep`).
-            poll_timeout = min(idle_notify_interval_seconds, 0.5)
+            #
+            # Bound the wait by the nearest upcoming deadline so a short
+            # first_budget (or a short stall_timeout_seconds) is honored to
+            # within a small slop rather than being overshot by a longer
+            # idle_notify_interval_seconds. The deadlines: the next tick, and
+            # the stall check — the floor while nothing has been emitted, or
+            # the later of the floor and the inactivity window once output has
+            # flowed. Clamp to a small floor so we never busy-spin.
+            now = time.monotonic()
+            next_tick = last_tick + idle_notify_interval_seconds
+            if last_activity == start_time:
+                next_stall = start_time + first_budget
+            else:
+                next_stall = max(
+                    start_time + first_budget,
+                    last_activity + stall_timeout_seconds,
+                )
+            poll_timeout = min(next_tick, next_stall) - now
+            poll_timeout = max(0.01, min(poll_timeout, idle_notify_interval_seconds, 0.5))
             ready = selector.select(timeout=poll_timeout)
 
             data = b""

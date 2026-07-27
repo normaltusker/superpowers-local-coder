@@ -74,12 +74,14 @@ these are a best-effort mitigation, not a guarantee against this timeout.
 
 ## Cold-load latency and the stall timeout
 
-A backend that produces no output for `stall_timeout_seconds` (default
-`300`) is treated as stalled and killed. But the FIRST call to a large local
-model after it has gone idle can be slow purely from **cold-load** — the
-weights are read into memory before a single token is generated, and that
-phase emits no output. Counting cold-load time against the stall window can
-kill a model that is loading normally.
+Once a backend has been running past its cold-load floor (below), a gap of
+more than `stall_timeout_seconds` (default `300`) with no output is treated
+as a stall and killed. But the FIRST call to a large local model after it has
+gone idle can be slow purely from **cold-load** — the weights are read into
+memory before a single token is generated, and that phase emits no output.
+Counting cold-load time against the stall window would kill a model that is
+loading normally, so the floor below suspends stall detection until the
+cold-load window has elapsed.
 
 `first_output_timeout_seconds` (default `600`) governs this. It is a hard
 minimum-runtime **floor**: no stall is declared until the backend has run for

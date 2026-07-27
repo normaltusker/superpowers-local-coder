@@ -159,9 +159,12 @@ From the MAIN REPO ROOT (where the plugin is enabled at project scope):
     than `stall_timeout_seconds` was not honored — the kill condition ANDed
     both budgets, so a fully-silent backend lingered until `max(floor, stall)`.
     Fixed by splitting the check on `never_emitted`: a silent process is killed
-    at the floor exactly (short OR long), an emitted one at `stall_timeout`
-    inactivity after the floor. Reproduced empirically (0.2s floor / 0.5s stall
-    → killed at 0.2s). README first-byte prose corrected to the floor model.
+    once the floor elapses (short OR long), an emitted one at `stall_timeout`
+    inactivity after the floor. A follow-up (same round) also bounded the poll
+    wait by the nearest deadline, so a short floor is honored to within a small
+    slop instead of being overshot by a longer `idle_notify_interval_seconds`.
+    Reproduced empirically (0.2s floor / 0.5s stall / 20s notify → was killed
+    at ~0.5s, now ~0.2s). README first-byte prose corrected to the floor model.
 - **Item 7 (NEW, from Codex review of the cold-start work) — three real
   server.py error-handling bugs on the macOS/Linux path.** All ours, all
   pre-date the cold-start work; carved out as their own PR (one problem =
