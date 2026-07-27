@@ -58,10 +58,15 @@ tool fails loudly. Docs: https://code.claude.com/docs/en/mcp.md#plugin-provided-
    `local-coder-output-*.log` mtime to find which one a session used before
    editing config.
 
-4. **The MCP server + its `config.yaml` live in the WORKTREE**
+4. **The MCP server code lives in the WORKTREE**
    (`.worktrees/local-coder-impl/`), because that's where the plugin's
    marketplace `source` points — regardless of the chat session's shell cwd.
-   Always check the worktree copy for live config, not the repo-root copy.
+   But the **live runtime config** an installed session reads/writes is
+   `${CLAUDE_PLUGIN_DATA}/local-coder/config.yaml` (PR #4 moved it there),
+   NOT the worktree copy (which is only the bundled default) and NOT the
+   repo-root copy. Change it via the `configure` MCP tool rather than
+   hand-editing, and if you must inspect on disk, look under
+   `${CLAUDE_PLUGIN_DATA}` (see gotcha 3 for finding the right data dir).
 
 5. **When a delegation fails, read
    `${CLAUDE_PLUGIN_DATA}/local-coder/local-coder-output-*.log` FIRST** —
@@ -96,12 +101,21 @@ From the MAIN REPO ROOT (where the plugin is enabled at project scope):
 2. `claude plugin disable superpowers@superpowers-dev --scope project`
 3. `claude plugin uninstall superpowers@superpowers-dev --scope project`
 4. `claude plugin install superpowers@superpowers-dev --scope project`
-5. Verify the fix landed in cache:
-   `grep -o "CLAUDE_PLUGIN_DATA" ~/.claude/plugins/cache/superpowers-dev/superpowers/*/.mcp.json`
+5. Verify the fix landed in cache — check BOTH the `.mcp.json` env var AND
+   that the cached agent file declares the plugin-namespaced tool name (a
+   connected server does NOT prove the installed agent has the new name —
+   that mismatch is the exact silent no-op this PR fixes):
+   - `grep -o "CLAUDE_PLUGIN_DATA" ~/.claude/plugins/cache/superpowers-dev/superpowers/*/.mcp.json`
+   - `grep -o "mcp__plugin_superpowers_local-coder__delegate_implementation" ~/.claude/plugins/cache/superpowers-dev/superpowers/*/agents/local-coder-implementer.md`
 6. Fresh session from the main repo root; `claude mcp list`; confirm
    `plugin:superpowers:local-coder` is **Connected**. (Remove any stray
    project `.mcp.json` reg first: `claude mcp remove local-coder -s project`.)
-7. Run a real `delegate_implementation` end-to-end.
+7. Run the smoke test through the ACTUAL fixed path — dispatch the
+   `local-coder-implementer` subagent (via `subagent-driven-development`,
+   or directly) and confirm THAT SUBAGENT invokes `delegate_implementation`
+   end-to-end. A bare direct `delegate_implementation` call does NOT
+   exercise the subagent tool-name resolution this PR repairs, so it can
+   pass while the real bug survives.
 
 ## Phase 2 backlog (remaining, unstarted)
 
