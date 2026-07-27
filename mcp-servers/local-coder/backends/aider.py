@@ -36,6 +36,7 @@ class AiderBackend(BackendAdapter):
                 cwd=repo_path,
                 stall_timeout_seconds=config["stall_timeout_seconds"],
                 idle_notify_interval_seconds=config["idle_notify_interval_seconds"],
+                first_output_timeout_seconds=config.get("first_output_timeout_seconds"),
                 on_tick=on_tick,
                 on_output=on_output,
             )
