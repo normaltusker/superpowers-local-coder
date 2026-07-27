@@ -131,12 +131,43 @@ From the MAIN REPO ROOT (where the plugin is enabled at project scope):
   the backend owns TDD discipline. Documented as an accepted trade-off in
   `implementer-prompt.md`. Revisit only if it causes a real problem — do
   NOT preemptively redesign.
-- **Item 6 — `stall_timeout_seconds` 300s default may be too tight** for a
-  cold-loading large local model (an 18GB/30B model stalled the full 300s
-  cold — cold-load produced zero output before the stall detector's window).
-  The mechanism worked correctly; this is a config-default/README-guidance
-  gap. Consider: document the cold-load risk, recommend `fallback_models`
-  for large primaries, and/or raise the default. Don't fix speculatively.
+- **Item 6 — cold-load vs stall timeout — DONE (on `local-coder/phase2-next`,
+  not yet PR'd).** A large local model's cold-load produces no output, so its
+  load time counted against `stall_timeout_seconds` (300s) and killed it (an
+  18GB/30B model hit this). Fixed with a two-phase timer: new
+  `first_output_timeout_seconds` (shipped 600s, falls back to the stall value
+  when absent) governs the pre-first-byte phase; `stall_timeout_seconds`
+  governs inactivity after first output. Spec
+  `2026-07-27-cold-start-grace-window-design.md`, plan
+  `2026-07-27-cold-start-grace-window.md`, commits `e054f8d`/`6730563`/
+  `468cecf`/`b680148`/`fd2f2de`, 144 tests green. Codex review found one
+  in-scope gap (the knob wasn't in the `configure` tool) — fixed in
+  `fd2f2de`.
+- **Item 7 (NEW, from Codex review of the cold-start work) — three real
+  server.py error-handling bugs on the macOS/Linux path.** All ours, all
+  pre-date the cold-start work; carved out as their own PR (one problem =
+  "delegate_implementation error-handling robustness") rather than bundled.
+  - **P1 progress-report can kill aider + leak partial edits** — in
+    `server.py`'s periodic `make_on_tick`, if `ctx.report_progress` raises
+    (progress token/transport gone) the exception escapes on_tick →
+    `run_monitored_subprocess` kills aider → but it's not a `StallError`, so
+    `AiderBackend`'s working-tree restore doesn't run, and the server's broad
+    except immediately starts the fallback model on top of partial edits. The
+    initial log-announce path already guards its `report_progress` with
+    try/except; the periodic one doesn't. Introduced `16c292c3`/`64b8346b`
+    (PR #3). Fix: catch+warn in the tick callback like the announce path does.
+  - **P2 `gh` missing during PR setup** — with `open_pr` enabled but `gh`
+    absent, `_has_open_pr` (and `gh pr create`) raise
+    `FileNotFoundError`/`OSError`, uncaught, AFTER the implementation was
+    committed and pushed — reporting failure for work that landed. Introduced
+    `90ed4ad` (PR #2). Fix: handle process-launch errors on both `gh pr view`
+    and `gh pr create`, return success with a PR-related note.
+  - **P2 per-call log announced before it exists** — the unique log path is
+    created only when the backend emits its first chunk, but it's announced
+    beforehand with `tail -f` instructions; during a cold load (exactly when
+    early observation matters) `tail -f` exits because the file doesn't exist.
+    Introduced `6c14cef` (PR #3). Fix: create the empty per-call log before
+    announcing it.
 
 **Deferred (tracked, do NOT resolve without doing the work):**
 - Stall-tail retention — a stalled attempt returns `output_tail=""`;
@@ -146,7 +177,18 @@ From the MAIN REPO ROOT (where the plugin is enabled at project scope):
   size/age/count policy is a design question, not a one-line fix (cubic
   thread `3636207385`).
 - Windows verification on real hardware (POSIX/Windows lock + venv path
-  handling is written but unverified on Windows).
+  handling is written but unverified on Windows). Codex flagged two concrete
+  Windows blockers here (both ours, both need a real Windows box to fix+test,
+  which is why they stay deferred rather than fixed blind): (1) `.mcp.json`'s
+  `command` points at the extensionless bash `launch-local-coder`, which
+  Windows won't run via shebang — needs a directly-executable cross-platform
+  wrapper or a Windows-specific command (introduced `ba297aa`); (2)
+  `common.py`'s `run_monitored_subprocess` uses `selectors.DefaultSelector`,
+  which on Windows is `select()` and does NOT support anonymous stdout pipes
+  — every backend run would fail registering the pipe; needs a thread-based
+  or overlapped-I/O reader on Windows (introduced `062c1e9`). Do NOT fix
+  either without Windows hardware to verify — untested Windows code is worse
+  than an honest gap.
 - Concurrency-safe provisioning/config seeding as a designed change with a
   real OS locking primitive — the hand-rolled lock was stripped from PR #4
   (see below).
