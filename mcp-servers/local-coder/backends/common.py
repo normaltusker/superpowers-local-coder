@@ -20,9 +20,19 @@ KNOWN_BACKENDS = ("aider", "codex", "gemini", "openrouter")
 
 
 class StallError(Exception):
-    def __init__(self, stall_timeout_seconds: float):
-        self.stall_timeout_seconds = stall_timeout_seconds
-        super().__init__(f"stalled: no output for {stall_timeout_seconds}s")
+    def __init__(self, timeout_seconds: float, phase: str = "stall"):
+        # phase is "first-output" (killed before the first byte of output,
+        # i.e. a cold-load that never produced anything within its grace
+        # window) or "stall" (went silent after producing output). The
+        # stall_timeout_seconds attribute name is preserved for existing
+        # callers/tests and holds whichever budget actually fired.
+        self.stall_timeout_seconds = timeout_seconds
+        self.phase = phase
+        if phase == "first-output":
+            msg = f"stalled: no first output within {timeout_seconds}s (cold-load grace)"
+        else:
+            msg = f"stalled: no output for {timeout_seconds}s"
+        super().__init__(msg)
 
 
 def validate_branch_name(branch: str) -> None:
@@ -297,6 +307,7 @@ def run_monitored_subprocess(
     idle_notify_interval_seconds: float,
     on_tick: Callable[[], None] | None = None,
     on_output: Callable[[str], None] | None = None,
+    first_output_timeout_seconds: float | None = None,
 ) -> subprocess.CompletedProcess:
     # Run with an unbuffered binary pipe (not text=True) so we can read
     # whatever bytes are actually available via a non-blocking os.read()
@@ -330,6 +341,21 @@ def run_monitored_subprocess(
     last_activity = time.monotonic()
     last_tick = time.monotonic()
 
+    # Two-phase stall detection. Before the subprocess emits its first byte
+    # (e.g. a large local model cold-loading into memory), elapsed time is
+    # measured against first_budget; after the first byte, the normal
+    # inactivity check against stall_timeout_seconds takes over. When
+    # first_output_timeout_seconds is None, first_budget falls back to
+    # stall_timeout_seconds — so an omitted value preserves the original
+    # single-phase behavior exactly.
+    start_time = last_activity
+    seen_output = False
+    first_budget = (
+        first_output_timeout_seconds
+        if first_output_timeout_seconds is not None
+        else stall_timeout_seconds
+    )
+
     # Incremental UTF-8 decoder so multi-byte characters split across two
     # reads aren't corrupted — partial bytes are buffered internally by the
     # decoder until a full character is available.
@@ -359,6 +385,7 @@ def run_monitored_subprocess(
                     if len(output_tail) > _MAX_OUTPUT_CHARS:
                         output_tail = output_tail[-_MAX_OUTPUT_CHARS:]
                     last_activity = time.monotonic()
+                    seen_output = True
                     if on_output is not None and decoded:
                         on_output(decoded)
 
@@ -390,10 +417,16 @@ def run_monitored_subprocess(
                     on_tick()
                 last_tick = now
 
-            if now - last_activity > stall_timeout_seconds:
-                process.kill()
-                process.wait()
-                raise StallError(stall_timeout_seconds)
+            if not seen_output:
+                if now - start_time > first_budget:
+                    process.kill()
+                    process.wait()
+                    raise StallError(first_budget, phase="first-output")
+            else:
+                if now - last_activity > stall_timeout_seconds:
+                    process.kill()
+                    process.wait()
+                    raise StallError(stall_timeout_seconds, phase="stall")
     finally:
         selector.close()
         if process.poll() is None:
