@@ -131,18 +131,25 @@ From the MAIN REPO ROOT (where the plugin is enabled at project scope):
   the backend owns TDD discipline. Documented as an accepted trade-off in
   `implementer-prompt.md`. Revisit only if it causes a real problem — do
   NOT preemptively redesign.
-- **Item 6 — cold-load vs stall timeout — DONE (on `local-coder/phase2-next`,
-  not yet PR'd).** A large local model's cold-load produces no output, so its
-  load time counted against `stall_timeout_seconds` (300s) and killed it (an
-  18GB/30B model hit this). Fixed with a two-phase timer: new
+- **Item 6 — cold-load vs stall timeout — DONE, OPEN AS PR #6**
+  (`local-coder/phase2-next` → `dev`). A large local model's cold-load
+  produces no output, so its load time counted against `stall_timeout_seconds`
+  (300s) and killed it (an 18GB/30B model hit this). New
   `first_output_timeout_seconds` (shipped 600s, falls back to the stall value
-  when absent) governs the pre-first-byte phase; `stall_timeout_seconds`
-  governs inactivity after first output. Spec
-  `2026-07-27-cold-start-grace-window-design.md`, plan
-  `2026-07-27-cold-start-grace-window.md`, commits `e054f8d`/`6730563`/
-  `468cecf`/`b680148`/`fd2f2de`, 144 tests green. Codex review found one
-  in-scope gap (the knob wasn't in the `configure` tool) — fixed in
-  `fd2f2de`.
+  when absent). Spec `2026-07-27-cold-start-grace-window-design.md`, plan
+  `2026-07-27-cold-start-grace-window.md`.
+  - **DESIGN CORRECTED during cubic review (P1, verified empirically).** The
+    first implementation ended the grace on the first byte of output — but
+    aider prints a ~14-line startup banner at ~1.08s, BEFORE the model loads,
+    so grace ended on the banner and the still-loading model was killed on the
+    short stall clock. The mechanism is now a **hard minimum-runtime floor**:
+    no stall is declared until the process has run `first_output_timeout_seconds`;
+    after the floor, normal `stall_timeout_seconds` inactivity governs.
+    Self-bounding (a never-emitting cold-load still dies just past the floor).
+    A steady-state stall that begins within the floor waits out the floor — by
+    design. Empirical proof of the banner timing is in the PR #6 thread reply.
+  - Codex review earlier found the knob wasn't wired into the `configure`
+    tool — fixed in `fd2f2de`.
 - **Item 7 (NEW, from Codex review of the cold-start work) — three real
   server.py error-handling bugs on the macOS/Linux path.** All ours, all
   pre-date the cold-start work; carved out as their own PR (one problem =

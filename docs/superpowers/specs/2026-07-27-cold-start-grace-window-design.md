@@ -26,23 +26,41 @@ built to do — the gap is that it cannot distinguish "still loading" from
 
 ## Fix
 
-Split the single output-inactivity timer into two phases, keyed on whether
-the subprocess has emitted its first byte of output yet:
+Make `first_output_timeout_seconds` a hard **minimum-runtime floor** on stall
+detection, rather than a phase that ends on the first byte of output.
 
-- **Phase 1 — before first output byte.** Measure elapsed time since process
-  start against a new `first_output_timeout_seconds`. This is the cold-load
-  grace window.
-- **Phase 2 — after first output byte.** Switch permanently to the existing
-  behavior: measure inactivity (`now - last_activity`) against
-  `stall_timeout_seconds`. Unchanged from today.
+> **Why not "first byte of output"?** The obvious design — grace ends the
+> moment the subprocess emits anything — is defeated by real backends. aider
+> prints a ~14-line startup banner (warnings, version, model, repo-map line)
+> within ~1s of launch, **before it ever contacts the model**. Empirically
+> confirmed: aider's first stdout arrives at ~1.08s, long before an 18GB/30B
+> Ollama model finishes cold-loading. Ending grace on that banner would drop
+> the run onto the short `stall_timeout_seconds` clock while the model is
+> still loading — exactly the failure this feature exists to prevent.
 
-The transition is one-way: the first decoded chunk flips the timer from
-phase 1 to phase 2 for the rest of the run.
+The floor design:
 
-The grace window is **self-bounding** — no separate cap is needed. A model
-that never emits a byte still fails when `first_output_timeout_seconds`
-elapses; it just fails on the longer grace clock instead of the steady-state
-clock. So a genuinely wedged cold load is still caught.
+- **No stall is declared until the process has run for at least
+  `first_output_timeout_seconds`.** During this floor, neither banner output
+  nor silence ends the grace or triggers a kill.
+- **After the floor**, the normal inactivity check governs: a stall is a gap
+  of more than `stall_timeout_seconds` since the last real output.
+
+This is **self-bounding** — no separate cap is needed. A model that never
+emits real output still fails once the floor elapses: at that point
+`last_activity` is still the process start time, so `now - last_activity`
+already exceeds `first_output_timeout_seconds` (≥ `stall_timeout_seconds`)
+and the kill fires on the first check past the floor.
+
+When `first_output_timeout_seconds` is None, `first_budget ==
+stall_timeout_seconds`, so the floor and the inactivity window coincide and
+behavior is exactly the original single-window stall detection.
+
+**Behavior note:** a genuine steady-state stall that begins *within* the
+floor window is not caught until the floor elapses. This is intended — the
+floor is a deliberate "do not kill yet" minimum for the cold-load period.
+Only real output resets the inactivity clock; a read that decodes to `""`
+(an incomplete multi-byte UTF-8 sequence) is not treated as activity.
 
 ## Config knob
 

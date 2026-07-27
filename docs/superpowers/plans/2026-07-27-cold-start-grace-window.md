@@ -4,7 +4,26 @@
 
 **Goal:** Stop the stall detector from killing a large local model while it cold-loads (produces no output during load), by adding a separate first-output timeout that governs the pre-first-byte phase.
 
-**Architecture:** `run_monitored_subprocess` splits its single output-inactivity timer into two phases keyed on whether the subprocess has emitted its first byte. Before first output: elapsed-since-start is measured against a new `first_output_timeout_seconds`. After first output: the existing `stall_timeout_seconds` inactivity check applies unchanged. A new config field carries the value; when absent it falls back to `stall_timeout_seconds` so existing configs are unaffected.
+> **CORRECTION (post-review, authoritative):** the "keyed on the first byte
+> of output" mechanism this plan originally described was found broken during
+> cubic review — aider prints a startup banner before the model loads, so
+> grace ended on the banner. The shipped design is a hard **minimum-runtime
+> floor** instead: no stall is declared until the process has run
+> `first_output_timeout_seconds`, then normal `stall_timeout_seconds`
+> inactivity governs. See the design spec's "Fix" section (updated) for the
+> authoritative mechanism; the code blocks below reflect the original,
+> superseded approach and are kept only as a record of how the work was
+> structured. Additionally, `first_output_timeout_seconds` IS wired into the
+> `configure` MCP tool (added after Codex review); the plan's original Task
+> list omitted that and it was added as a follow-up.
+
+**Architecture:** `run_monitored_subprocess` applies a minimum-runtime floor
+(`first_output_timeout_seconds`) before any stall is declared; after the
+floor, the existing `stall_timeout_seconds` inactivity check governs. A new
+config field carries the value; when absent it falls back to
+`stall_timeout_seconds` so existing configs are unaffected. Only real decoded
+output resets the inactivity clock (a `""` decode from a partial multi-byte
+sequence does not count).
 
 **Tech Stack:** Python 3.10+, pytest, FastMCP (unchanged), aider backend. Flat imports (`import config`, `from backends.aider import AiderBackend`).
 
@@ -16,8 +35,9 @@
 - Absent-key fallback (exact): the effective `stall_timeout_seconds` value — NOT a hardcoded 600. Existing configs without the key must show ZERO behavior change.
 - `run_monitored_subprocess`'s new parameter defaults to `None`; `None` means "use `stall_timeout_seconds` for the phase-1 budget."
 - Validation: strictly positive, identical to `stall_timeout_seconds` / `idle_notify_interval_seconds`. NO cross-field constraint.
-- The one-way phase transition flips on the first NON-EMPTY decoded chunk (same point `last_activity` is currently first updated).
-- Grace window is self-bounding — do NOT add a separate hard cap.
+- Only a non-empty decoded chunk counts as activity (resets `last_activity`); a `""` decode from a partial multi-byte UTF-8 sequence must NOT reset it.
+- The floor is self-bounding — do NOT add a separate hard cap.
+- The final gate requires zero failures AND no reduction in test count vs the pre-change baseline (record the baseline count before implementing).
 - Do NOT touch: `stdin=DEVNULL`, `output_tail` logic, `idle_notify_interval_seconds`, the tick/progress path, or `stall_timeout_seconds`'s default (300).
 - Flat imports only. Do NOT create `tests/__init__.py`.
 - Tests use sub-second fake timeouts — never sleep for real minutes.

@@ -599,12 +599,11 @@ def test_run_monitored_subprocess_kills_process_when_on_output_raises():
     assert proc.poll() is not None
 
 
-def test_run_monitored_subprocess_cold_load_survives_past_stall_within_first_output():
-    # A large local model cold-loading produces NO output while it loads.
-    # That pre-first-byte phase is governed by first_output_timeout_seconds,
-    # NOT stall_timeout_seconds — so a process that stays silent past the
-    # stall window but within the first-output window, then emits, must NOT
-    # be killed.
+def test_run_monitored_subprocess_cold_load_survives_past_stall_within_floor():
+    # A large local model cold-loading produces no real progress while it
+    # loads. Silence within the cold-load floor (first_output_timeout_seconds)
+    # must NOT be killed even though it exceeds stall_timeout_seconds — the
+    # floor is a hard minimum runtime before any stall is declared.
     script = "import time\ntime.sleep(0.3)\nprint('loaded', flush=True)"
     result = common.run_monitored_subprocess(
         [sys.executable, "-c", script], cwd=".",
@@ -615,38 +614,60 @@ def test_run_monitored_subprocess_cold_load_survives_past_stall_within_first_out
     assert "loaded" in result.stdout
 
 
-def test_run_monitored_subprocess_steady_state_stall_fires_after_first_output():
-    # Once the subprocess has emitted its first byte, the timer switches to
-    # the normal inactivity check against stall_timeout_seconds. A process
-    # that prints then goes silent past that window must be killed, and the
-    # error must be tagged as a steady-state stall.
-    script = "import time\nprint('go', flush=True)\ntime.sleep(2)"
+def test_run_monitored_subprocess_banner_then_silence_survives_floor():
+    # THE regression for the real aider case: aider prints a startup banner
+    # within a second, BEFORE the model loads. If the grace ended on the
+    # first byte of output, that banner would drop the run onto the short
+    # stall clock while the model is still cold-loading. The floor must
+    # ignore banner output: an early print followed by silence past
+    # stall_timeout but within the floor must NOT be killed.
+    script = (
+        "import time\n"
+        "print('Aider v0.86.2 startup banner', flush=True)\n"  # arrives immediately
+        "time.sleep(0.5)\n"                                     # silent > stall (0.1), < floor (1.0)
+        "print('model responded', flush=True)\n"
+    )
+    result = common.run_monitored_subprocess(
+        [sys.executable, "-c", script], cwd=".",
+        stall_timeout_seconds=0.1, idle_notify_interval_seconds=0.05,
+        first_output_timeout_seconds=1.0,
+    )
+    assert result.returncode == 0
+    assert "model responded" in result.stdout
+
+
+def test_run_monitored_subprocess_steady_state_stall_fires_after_floor():
+    # After the cold-load floor elapses, the normal inactivity window governs.
+    # A process that emits, then goes silent past stall_timeout_seconds with
+    # the floor already elapsed, must be killed and tagged as a steady stall.
+    # floor=0.2 elapses quickly; the process then stays silent ~1.5s.
+    script = "import time\nprint('go', flush=True)\ntime.sleep(1.5)"
     with pytest.raises(common.StallError) as ei:
         common.run_monitored_subprocess(
             [sys.executable, "-c", script], cwd=".",
             stall_timeout_seconds=0.2, idle_notify_interval_seconds=0.05,
-            first_output_timeout_seconds=5.0,
+            first_output_timeout_seconds=0.3,
         )
     assert ei.value.phase == "stall"
 
 
-def test_run_monitored_subprocess_wedged_cold_load_fires_on_first_output_budget():
-    # A model that never emits a byte must still eventually be killed — the
-    # first-output window is self-bounding. The error must be tagged as a
-    # first-output (cold-load) timeout, distinct from a steady-state stall.
+def test_run_monitored_subprocess_wedged_cold_load_fires_after_floor():
+    # A process that never emits a byte must still be killed once the floor
+    # elapses — the floor is self-bounding. Tagged as a first-output
+    # (cold-load) timeout, distinct from a steady-state stall.
     with pytest.raises(common.StallError) as ei:
         common.run_monitored_subprocess(
             ["sleep", "5"], cwd=".",
-            stall_timeout_seconds=5.0, idle_notify_interval_seconds=0.05,
-            first_output_timeout_seconds=0.2,
+            stall_timeout_seconds=0.1, idle_notify_interval_seconds=0.05,
+            first_output_timeout_seconds=0.3,
         )
     assert ei.value.phase == "first-output"
 
 
 def test_run_monitored_subprocess_omitted_first_output_matches_old_behavior():
-    # With first_output_timeout_seconds omitted (None), the pre-first-output
-    # budget falls back to stall_timeout_seconds — so a no-output process
-    # dies at stall_timeout_seconds, exactly as it did before this feature.
+    # With first_output_timeout_seconds omitted (None), first_budget ==
+    # stall_timeout_seconds — floor and inactivity window coincide, so a
+    # no-output process dies at stall_timeout_seconds, exactly as before.
     with pytest.raises(common.StallError) as ei:
         common.run_monitored_subprocess(
             ["sleep", "5"], cwd=".",
