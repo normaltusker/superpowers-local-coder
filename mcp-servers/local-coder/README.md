@@ -72,6 +72,29 @@ starting Claude Code. `local-coder` sends periodic progress
 notifications and stderr log lines while a backend subprocess runs, but
 these are a best-effort mitigation, not a guarantee against this timeout.
 
+## Cold-load latency and the stall timeout
+
+A backend that produces no output for `stall_timeout_seconds` (default
+`300`) is treated as stalled and killed. But the FIRST call to a large local
+model after it has gone idle can be slow purely from **cold-load** — the
+weights are read into memory before a single token is generated, and that
+phase emits no output. Counting cold-load time against the stall window can
+kill a model that is loading normally.
+
+`first_output_timeout_seconds` (default `600`) governs this. It is the
+maximum a backend may run producing NO output at all — the cold-load grace
+window. It applies only until the first byte of output arrives; after that,
+`stall_timeout_seconds` governs inactivity as usual. Both are set from chat
+via `configure`, never by hand-editing `config.yaml`.
+
+When `first_output_timeout_seconds` is omitted from a config, it falls back
+to `stall_timeout_seconds`, so a config predating this setting behaves
+exactly as before.
+
+For large primary models, also configure `fallback_models`: if a genuine
+cold-load failure does occur, the call fails over to the next model instead
+of aborting outright.
+
 ## Watching a delegation run
 
 While `delegate_implementation` runs, its progress appears live in the
