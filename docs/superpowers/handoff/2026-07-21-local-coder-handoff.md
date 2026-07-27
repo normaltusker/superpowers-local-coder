@@ -151,11 +151,13 @@ Docs: https://code.claude.com/docs/en/mcp.md#plugin-provided-mcp-servers
 
 1. **Agent/skill edits need a plugin REINSTALL, not just a restart.** The
    install is a plain COPY (not a symlink) at
-   `~/.claude/plugins/cache/superpowers-dev/superpowers/6.1.1/`. The
-   marketplace source IS the worktree, so
-   `claude plugin marketplace update superpowers-dev` +
-   `claude plugin install superpowers@superpowers-dev --scope project`
-   picks up committed changes. Worktree `.claude/settings.json` (plugin
+   `~/.claude/plugins/cache/superpowers-dev/superpowers/6.1.1/`. Because
+   the version is PINNED, a bare `marketplace update` + `install` can
+   leave that cache unchanged — `install` sees the pinned version already
+   present and no-ops. Use the full disable → uninstall → reinstall
+   sequence in the "Exact steps for that fresh session" block below (it
+   force-refreshes the cache and re-verifies the fix landed); do NOT rely
+   on the two-command shortcut. Worktree `.claude/settings.json` (plugin
    enablement) is UNTRACKED and does not survive; enablement is registered
    against the MAIN checkout path.
 
@@ -188,18 +190,21 @@ intended). **Diagnostic tip: when a delegation fails, read
 `${CLAUDE_PLUGIN_DATA}/local-coder/local-coder-output-*.log` FIRST — the
 per-call logs make this kind of question answerable in one step.**
 
-**GOTCHA — call delegation DIRECTLY rather than via the
-`superpowers:local-coder-implementer` subagent.** Dispatching the
-implementer agent failed in ~17s with the target file untouched, and
-produced NO server-side log at all — so the tool call almost certainly
-never reached the server and no aider process was spawned. The exact
-mechanism is UNCONFIRMED (an earlier version of this doc asserted
-"subagents don't inherit MCP connections" — that was stated with more
-confidence than the evidence supports; do not treat it as established).
-One thing worth checking if this is picked up: the agent declares
-`mcp__local-coder__delegate_implementation`, while the connected server
-registers under the plugin namespace `plugin:superpowers:local-coder`.
-This does NOT gate this PR; direct calls work.
+**RESOLVED (2026-07-24) — the subagent path now works; use it.** This
+GOTCHA formerly said to call delegation DIRECTLY and avoid the
+`superpowers:local-coder-implementer` subagent, because dispatching the
+agent failed in ~17s with the target file untouched and NO server-side
+log. That symptom is now fully explained and fixed (see "SUBAGENT
+DELEGATION NOW WORKS END-TO-END" above): the agent declared
+`mcp__local-coder__delegate_implementation`, but a plugin-bundled MCP
+server's tools are namespaced `mcp__plugin_<plugin>_<server>__<tool>`, so
+under a plugin install the declared name matched NOTHING — the subagent
+had no delegation tool and silently did nothing, which is why there was
+no tool call and therefore no log. Fixed in `c0d7092` (both names now
+declared; BLOCKED reported if neither is present). The "subagents don't
+inherit MCP connections" guess in an even earlier version was wrong —
+they DO inherit; the tool name was the whole problem. Prefer the subagent
+path now; direct calls remain valid too.
 **When this failure happens, do not let it be misdiagnosed as a stale
 `.mcp.json` worktree path** — that wrong diagnosis has now surfaced twice
 in different sessions (see the "Note" above: the worktree exists, is
