@@ -81,15 +81,19 @@ weights are read into memory before a single token is generated, and that
 phase emits no output. Counting cold-load time against the stall window can
 kill a model that is loading normally.
 
-`first_output_timeout_seconds` (default `600`) governs this. It is the
-maximum a backend may run producing NO output at all — the cold-load grace
-window. It applies only until the first byte of output arrives; after that,
-`stall_timeout_seconds` governs inactivity as usual. Both are set from chat
-via `configure`, never by hand-editing `config.yaml`.
+`first_output_timeout_seconds` (default `600`) governs this. It is a hard
+minimum-runtime **floor**: no stall is declared until the backend has run for
+at least this long — the cold-load grace window. Startup banner output during
+the floor does not end the grace, and silence during the floor does not kill,
+so a model that prints a banner and then loads quietly for minutes is not
+mistaken for a stall. Once the floor elapses, `stall_timeout_seconds` governs
+inactivity as usual (a gap of more than that since the last real output). A
+backend that never emits anything is killed the moment the floor passes. Both
+are set from chat via `configure`, never by hand-editing `config.yaml`.
 
 When `first_output_timeout_seconds` is omitted from a config, it falls back
-to `stall_timeout_seconds`, so a config predating this setting behaves
-exactly as before.
+to `stall_timeout_seconds`, so the floor and the inactivity window coincide
+and a config predating this setting behaves exactly as before.
 
 For large primary models, also configure `fallback_models`: if a genuine
 cold-load failure does occur, the call fails over to the next model instead

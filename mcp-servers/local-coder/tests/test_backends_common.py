@@ -664,6 +664,25 @@ def test_run_monitored_subprocess_wedged_cold_load_fires_after_floor():
     assert ei.value.phase == "first-output"
 
 
+def test_run_monitored_subprocess_short_first_output_window_honored_for_silent_process():
+    # A cold-load window SHORTER than stall_timeout_seconds must bound the
+    # silent wait to first_output_timeout_seconds exactly — not to the longer
+    # stall window. An operator who sets a short cold-load budget expects a
+    # fully-silent backend to be killed at that budget, so a genuinely wedged
+    # cold-load fails fast instead of lingering until the (longer) stall clock.
+    start = time.monotonic()
+    with pytest.raises(common.StallError) as ei:
+        common.run_monitored_subprocess(
+            ["sleep", "5"], cwd=".",
+            stall_timeout_seconds=0.5, idle_notify_interval_seconds=0.05,
+            first_output_timeout_seconds=0.2,
+        )
+    elapsed = time.monotonic() - start
+    assert ei.value.phase == "first-output"
+    # Fired on the short floor (0.2s), well before the longer stall clock (0.5s).
+    assert elapsed < 0.45
+
+
 def test_run_monitored_subprocess_omitted_first_output_matches_old_behavior():
     # With first_output_timeout_seconds omitted (None), first_budget ==
     # stall_timeout_seconds — floor and inactivity window coincide, so a

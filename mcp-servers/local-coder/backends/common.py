@@ -428,28 +428,35 @@ def run_monitored_subprocess(
                     on_tick()
                 last_tick = now
 
-            # Cold-load floor: never declare a stall until the process has run
-            # for at least first_budget seconds. During that floor the process
-            # may still be loading the model, emitting only its startup banner
-            # (which arrives within a second or two) and no real progress — so
-            # output during the floor does NOT end the grace, and silence
-            # during the floor does NOT kill.
+            # Two distinct kill conditions, keyed on whether the process has
+            # ever produced real (decoded, non-empty) output.
             #
-            # After the floor, the normal inactivity window governs: a stall
-            # is a gap of more than stall_timeout_seconds since the last real
-            # output. This is also self-bounding for a wedged cold-load that
-            # never emits anything: once past the floor, last_activity is
-            # still start_time, so now - last_activity already exceeds
-            # first_budget (>= stall_timeout_seconds) and the kill fires on
-            # the first check past the floor.
-            if now - start_time > first_budget and now - last_activity > stall_timeout_seconds:
+            # Cold-load floor (never_emitted): a process that has emitted
+            # nothing is still loading. It is killed only once it has run for
+            # first_budget seconds — the cold-load grace window. This bounds
+            # the silent wait to first_budget EXACTLY, whether first_budget is
+            # longer OR shorter than stall_timeout_seconds; a deliberately
+            # short cold-load window is honored, not overridden by the stall
+            # window. During the floor, banner output does not apply here
+            # (that flips the process to the emitted branch) and silence does
+            # not kill.
+            #
+            # Steady-state stall (has emitted): once real output has flowed,
+            # the normal inactivity window governs — a gap of more than
+            # stall_timeout_seconds since the last real output — but never
+            # before the floor elapses, so a banner printed at startup can't
+            # drop a still-cold-loading model onto the short stall clock.
+            never_emitted = last_activity == start_time
+            if never_emitted:
+                stalled = now - start_time > first_budget
+            else:
+                stalled = (
+                    now - start_time > first_budget
+                    and now - last_activity > stall_timeout_seconds
+                )
+            if stalled:
                 process.kill()
                 process.wait()
-                # Distinguish the two failure modes for the error message: a
-                # cold-load that never produced real output (last_activity is
-                # still start_time, so the whole run has been silent) vs. a
-                # steady-state stall after output had been flowing.
-                never_emitted = last_activity == start_time
                 if never_emitted:
                     raise StallError(first_budget, phase="first-output")
                 raise StallError(stall_timeout_seconds, phase="stall")
