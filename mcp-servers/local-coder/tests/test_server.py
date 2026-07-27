@@ -971,6 +971,152 @@ async def test_delegate_implementation_all_failed_includes_last_output_tail(isol
     assert result["output_tail"].startswith("transcript from ")
 
 
+async def test_on_tick_progress_failure_does_not_propagate(isolated_config, git_repo_no_remote):
+    # The periodic on_tick pulse bridges to ctx.report_progress via
+    # anyio.from_thread.run. If that raises (a dropped progress token, a
+    # transport hiccup, a client without progress support), the exception
+    # must NOT escape on_tick: run_monitored_subprocess kills the backend on
+    # any on_tick exception, and because that kill is not a StallError,
+    # AiderBackend.run_backend's working-tree restore never runs — so the
+    # server's broad except would start the fallback model on top of partial,
+    # uncleaned edits. The announce path already guards its report_progress;
+    # the periodic tick must too. on_tick must swallow-and-warn instead.
+    captured_on_tick = {}
+
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+        captured_on_tick["on_tick"] = on_tick
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    mock_ctx = MagicMock()
+    mock_ctx.report_progress = AsyncMock()
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        # Make the thread-bridge raise, simulating report_progress failing.
+        with patch("anyio.from_thread.run", side_effect=RuntimeError("progress token gone")):
+            result = await server._delegate_implementation_impl(
+                task="add a.py", branch="feature-branch",
+                target_repo_path=str(git_repo_no_remote),
+                ctx=mock_ctx,
+            )
+
+            assert result["success"] is True
+            on_tick = captured_on_tick["on_tick"]
+            # Invoking on_tick as run_monitored_subprocess would must NOT raise.
+            on_tick()  # would raise RuntimeError today — the bug this guards
+
+
+async def test_pr_setup_survives_missing_gh_binary(isolated_config, git_repo_with_remote):
+    # With open_pr enabled but the `gh` binary absent, subprocess.run(["gh",
+    # ...]) raises FileNotFoundError BEFORE any process starts. _has_open_pr
+    # (and the gh pr create call) only catch GhPrStatusUnknown/TimeoutExpired,
+    # so the FileNotFoundError escapes uncaught — AFTER the implementation was
+    # committed and pushed. That reports total failure for work that actually
+    # landed. The call must stay success:true with a note that PR setup
+    # couldn't run because gh is missing.
+    config_module.merge_config({"open_pr": True, "pr_base_branch": "main"})
+    subprocess.run(
+        ["git", "-C", str(git_repo_with_remote), "checkout", "-b", "local-coder/feature-branch"],
+        check=True, capture_output=True,
+    )
+    fake_result = CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    real_run = subprocess.run
+
+    def run_but_gh_missing(cmd, *args, **kwargs):
+        # Simulate `gh` not being installed: only gh invocations raise
+        # FileNotFoundError; git push etc. run for real.
+        if cmd and cmd[0] == "gh":
+            raise FileNotFoundError(2, "No such file or directory: 'gh'")
+        return real_run(cmd, *args, **kwargs)
+
+    with patch("backends.aider.AiderBackend.run_backend", return_value=fake_result):
+        with patch("subprocess.run", side_effect=run_but_gh_missing):
+            result = await server._delegate_implementation_impl(
+                task="add a.py", branch="local-coder/feature-branch",
+                target_repo_path=str(git_repo_with_remote),
+            )
+
+    assert result["success"] is True, result
+    assert result["files_changed"] == ["a.py"]
+    assert result["pr_url"] is None  # PR creation was skipped, not attempted
+    assert "note" in result
+    assert "gh" in result["note"].lower()
+
+
+async def test_pr_create_survives_gh_launch_error(isolated_config, git_repo_with_remote):
+    # Defense-in-depth for the OTHER gh call site: `gh pr view` reports no PR
+    # (returncode 1, "no pull requests found"), so the code proceeds to
+    # `gh pr create` — and THAT launch fails (gh removed mid-call, or a PATH
+    # race). The create-time OSError must be caught too: the implementation
+    # was already committed and pushed, so the call stays success:true with a
+    # note rather than raising for landed work.
+    config_module.merge_config({"open_pr": True, "pr_base_branch": "main"})
+    subprocess.run(
+        ["git", "-C", str(git_repo_with_remote), "checkout", "-b", "local-coder/feature-branch"],
+        check=True, capture_output=True,
+    )
+    fake_result = CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    real_run = subprocess.run
+
+    def run_gh_view_ok_create_missing(cmd, *args, **kwargs):
+        if cmd[:3] == ["gh", "pr", "view"]:
+            # "no PR" — a completed process, not an exception.
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="", stderr="no pull requests found for branch",
+            )
+        if cmd[:3] == ["gh", "pr", "create"]:
+            raise FileNotFoundError(2, "No such file or directory: 'gh'")
+        return real_run(cmd, *args, **kwargs)
+
+    with patch("backends.aider.AiderBackend.run_backend", return_value=fake_result):
+        with patch("subprocess.run", side_effect=run_gh_view_ok_create_missing):
+            result = await server._delegate_implementation_impl(
+                task="add a.py", branch="local-coder/feature-branch",
+                target_repo_path=str(git_repo_with_remote),
+            )
+
+    assert result["success"] is True, result
+    assert result["pr_url"] is None
+    assert "note" in result
+    assert "gh" in result["note"].lower()
+
+
+async def test_per_call_log_exists_after_announce_before_output(
+    isolated_config, git_repo_no_remote, tmp_path, monkeypatch
+):
+    # The per-call log path is announced up front (with `tail -f` guidance)
+    # so a human can follow a cold-loading backend live — exactly when early
+    # observation matters most and no output has arrived yet. But the file is
+    # only created on the first on_output write, so during a cold load
+    # `tail -f` exits immediately (the file doesn't exist). The empty file
+    # must be created at announce time, before the backend produces anything.
+    log_path = tmp_path / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", log_path)
+
+    saw_file_at_backend_start = {}
+
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+        # At this point the announce has already happened but no on_output
+        # (backend output) has been emitted — a cold load. The per-call log
+        # must already exist so `tail -f` works.
+        per_call = list(tmp_path.glob("local-coder-output-*.log"))
+        saw_file_at_backend_start["exists"] = len(per_call) == 1 and per_call[0].exists()
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        result = await server._delegate_implementation_impl(
+            task="add a.py", branch="feature-branch",
+            target_repo_path=str(git_repo_no_remote), ctx=None,
+        )
+
+    assert result["success"] is True
+    assert saw_file_at_backend_start.get("exists") is True, (
+        "per-call log file must exist after announce and before any backend "
+        "output, so a cold-load `tail -f` doesn't exit on a missing file"
+    )
+
+
 def test_output_log_path_lives_under_plugin_data_dir(tmp_path, monkeypatch):
     # The per-call log base must live in the persistent plugin-data dir
     # (survives plugin updates), not the ephemeral plugin root. server.py

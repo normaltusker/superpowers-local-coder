@@ -144,6 +144,24 @@ async def _delegate_implementation_impl(
         return {"success": False, "error": f"unknown backend: {backend_name}"}
     backend = backend_cls()
 
+    # Create the empty per-call log NOW, before announcing it. The path is
+    # otherwise only materialized on the backend's first on_output write —
+    # but during a cold load (exactly when live observation matters most) the
+    # backend produces no output for a long time, so a human who runs the
+    # announced `tail -f` would hit "no such file" and the tail would exit
+    # immediately. Touch it first so `tail -f` attaches and waits. Best-effort:
+    # a failure here must not abort the workflow — on_output still creates the
+    # file lazily, and it guards its own write failures. The parent dir is
+    # already ensured by plugin_data_dir(), so only the file is touched here.
+    try:
+        output_log_path.touch(exist_ok=True)
+    except OSError as e:
+        print(
+            f"[local-coder] warning: could not pre-create output log "
+            f"{output_log_path}: {e}",
+            file=sys.stderr, flush=True,
+        )
+
     # Announce the per-call log path up front — before run_backend — so a
     # human can start `tail -f`-ing it while the backend is still running.
     # (The same path is also returned in the final result dict, but that
@@ -200,9 +218,24 @@ async def _delegate_implementation_impl(
             pulse = f"{model_name}: {line}" if line else f"Running {model_name}..."
             print(f"[local-coder] {pulse}", file=sys.stderr, flush=True)
             if ctx is not None:
-                anyio.from_thread.run(
-                    ctx.report_progress, 0, None, pulse
-                )
+                # Best-effort progress: a failure here (dropped progress
+                # token, transport hiccup, client without progress support)
+                # must NOT propagate. run_monitored_subprocess kills the
+                # backend on ANY on_tick exception, and that kill is not a
+                # StallError — so AiderBackend.run_backend's working-tree
+                # restore would be skipped and the server's broad except
+                # would start the fallback model on top of partial, uncleaned
+                # edits. Warn and continue, exactly like the announce path.
+                try:
+                    anyio.from_thread.run(
+                        ctx.report_progress, 0, None, pulse
+                    )
+                except Exception as e:
+                    print(
+                        f"[local-coder] warning: failed to report progress "
+                        f"pulse: {e}",
+                        file=sys.stderr, flush=True,
+                    )
         return on_tick
 
     def make_on_output(model_name: str):
@@ -342,6 +375,13 @@ async def _delegate_implementation_impl(
                             "skipped PR creation"
                         )
                         has_open_pr = True  # skip the create-PR branch below
+                    except OSError as e:
+                        # `gh` not installed (FileNotFoundError) or otherwise
+                        # not launchable — the implementation was already
+                        # committed and pushed, so don't report failure for
+                        # landed work. Skip PR creation and note it.
+                        note = f"could not run `gh` to check PR status, skipped PR creation: {e}"
+                        has_open_pr = True  # skip the create-PR branch below
                     if not has_open_pr:
                         try:
                             pr = await anyio.to_thread.run_sync(
@@ -357,6 +397,12 @@ async def _delegate_implementation_impl(
                                 f"PR creation was attempted and timed out after "
                                 f"{NETWORK_SUBPROCESS_TIMEOUT_SECONDS}s"
                             )
+                        except OSError as e:
+                            # `gh` not installed or not launchable at create
+                            # time — same as the view case: the work is already
+                            # committed and pushed, so keep success:true and
+                            # note that PR creation couldn't run.
+                            note = f"could not run `gh` to create PR: {e}"
                         else:
                             if pr.returncode == 0:
                                 pr_url = pr.stdout.strip()
