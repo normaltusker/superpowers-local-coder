@@ -1005,6 +1005,41 @@ async def test_on_tick_progress_failure_does_not_propagate(isolated_config, git_
             on_tick()  # would raise RuntimeError today — the bug this guards
 
 
+async def test_on_tick_progress_failure_warns_only_once(isolated_config, git_repo_no_remote, capsys):
+    # A permanently dead progress channel (client gone, token invalidated)
+    # must warn ONCE and then stop reporting for the rest of the call —
+    # otherwise a long run floods MCP stderr with a warning every tick and
+    # buries the live pulse the stderr print is meant to surface. Mirrors the
+    # on_output log-write warn-once guard.
+    captured_on_tick = {}
+
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+        captured_on_tick["on_tick"] = on_tick
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    mock_ctx = MagicMock()
+    mock_ctx.report_progress = AsyncMock()
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        with patch("anyio.from_thread.run", side_effect=RuntimeError("progress token gone")):
+            await server._delegate_implementation_impl(
+                task="add a.py", branch="feature-branch",
+                target_repo_path=str(git_repo_no_remote), ctx=mock_ctx,
+            )
+            on_tick = captured_on_tick["on_tick"]
+            capsys.readouterr()  # drain output from the call itself
+            # Fire the tick several times as run_monitored_subprocess would
+            # over a long run. None may raise, and only the FIRST emits the
+            # disable-warning.
+            for _ in range(5):
+                on_tick()
+
+    err = capsys.readouterr().err
+    assert err.count("disabling further progress reports") == 1
+    # The live pulse still reaches stderr on every tick regardless.
+    assert err.count("Running") == 5
+
+
 async def test_pr_setup_survives_missing_gh_binary(isolated_config, git_repo_with_remote):
     # With open_pr enabled but the `gh` binary absent, subprocess.run(["gh",
     # ...]) raises FileNotFoundError BEFORE any process starts. _has_open_pr

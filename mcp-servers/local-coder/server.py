@@ -110,9 +110,10 @@ async def _delegate_implementation_impl(
 ) -> dict:
     # Unique per-call log file so two overlapping calls never share (and
     # corrupt) one file. Because it's fresh per call, there is no stale
-    # prior-call content to truncate — the file simply gets created on
-    # first write. The path is surfaced in the result dict below so a
-    # human knows which file to tail.
+    # prior-call content to truncate. The empty file is created below, before
+    # the path is announced, so a cold-load `tail -f` attaches immediately
+    # (see the touch call); on_output then appends to it. The path is also
+    # surfaced in the result dict so a human knows which file to tail.
     output_log_path = _make_output_log_path()
 
     try:
@@ -205,19 +206,25 @@ async def _delegate_implementation_impl(
     #                   warn once and stop retrying (a persistent failure
     #                   must not flood stderr every chunk and bury the live
     #                   output it's meant to surface).
+    #   progress_ok   — same idea for the progress pulse: flips False after
+    #                   the first report_progress failure so a permanently
+    #                   dead channel (client gone, token invalidated) is
+    #                   warned once and then skipped for the rest of the run,
+    #                   instead of warning on every tick.
     # latest_line + partial_line are RESET at the top of each failover
     # attempt (see the loop below) so a fallback model's opening pulse
     # can't relabel the previous model's last line as its own.
     latest_line = [""]
     partial_line = [""]
     log_write_ok = [True]
+    progress_ok = [True]
 
     def make_on_tick(model_name: str):
         def on_tick():
             line = latest_line[0]
             pulse = f"{model_name}: {line}" if line else f"Running {model_name}..."
             print(f"[local-coder] {pulse}", file=sys.stderr, flush=True)
-            if ctx is not None:
+            if ctx is not None and progress_ok[0]:
                 # Best-effort progress: a failure here (dropped progress
                 # token, transport hiccup, client without progress support)
                 # must NOT propagate. run_monitored_subprocess kills the
@@ -226,14 +233,20 @@ async def _delegate_implementation_impl(
                 # restore would be skipped and the server's broad except
                 # would start the fallback model on top of partial, uncleaned
                 # edits. Warn and continue, exactly like the announce path.
+                # After the first failure, stop reporting (and stop warning):
+                # a permanently dead channel must not flood stderr with a
+                # warning on every tick for the rest of a long run. The stderr
+                # print above still carries the pulse regardless.
                 try:
                     anyio.from_thread.run(
                         ctx.report_progress, 0, None, pulse
                     )
                 except Exception as e:
+                    progress_ok[0] = False
                     print(
                         f"[local-coder] warning: failed to report progress "
-                        f"pulse: {e}",
+                        f"pulse (disabling further progress reports for this "
+                        f"call): {e}",
                         file=sys.stderr, flush=True,
                     )
         return on_tick
