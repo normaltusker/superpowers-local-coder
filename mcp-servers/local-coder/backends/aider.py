@@ -47,7 +47,7 @@ class AiderBackend(BackendAdapter):
             # Clean those up now so the next failover attempt starts from
             # the same state this attempt did.
             common.restore_working_tree(repo_path, pre_head, pre_porcelain)
-            return CompletionResult(success=False, error=str(e))
+            return CompletionResult(success=False, error=str(e), output_tail=e.output_tail)
 
         if result.returncode != 0:
             common.restore_working_tree(repo_path, pre_head, pre_porcelain)
