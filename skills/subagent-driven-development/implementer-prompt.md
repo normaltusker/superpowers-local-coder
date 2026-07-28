@@ -52,9 +52,18 @@ Subagent (local-coder-implementer):
          backend can act on, including any TDD requirement from the brief)
        - `branch`: [current working branch — filled in by the controller]
        - `target_repo_path`: [directory — filled in by the controller]
-    2. Wait for the result. If `success: false`, do not attempt to fix it
-       yourself — report BLOCKED with the full error (see "When You're in
-       Over Your Head" below).
+    2. Wait for the result.
+       - If `success: false` **and** the response carries a `commit_sha`
+         (with `files_changed`), the implementation itself succeeded and was
+         committed locally — only a later step (typically the push) failed.
+         Do NOT report BLOCKED and do NOT re-delegate: that would duplicate
+         already-committed work. Verify the commit as in step 3, then report
+         DONE_WITH_CONCERNS naming the push/remote blocker from the error and
+         quoting it verbatim, so the controller can retry the push (or check
+         the remote) without redoing the implementation.
+       - Otherwise (`success: false` with no commit), do not attempt to fix
+         it yourself — report BLOCKED with the full error (see "When You're in
+         Over Your Head" below).
     3. If `success: true`, use Read/Grep/Glob and read-only Bash (see your own
        agent definition for what's permitted) to verify the changed files
        (`files_changed` in the response) actually satisfy the task brief. If

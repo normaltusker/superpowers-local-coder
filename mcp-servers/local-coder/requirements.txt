@@ -1,3 +1,13 @@
+# Pinned <3.0.0: fastmcp 3.0 removed constructor kwargs and made ctx state
+# async / changed decorator return values — API changes this server is not
+# written against yet. fastmcp 2.x carries known CVEs (SSRF/path-traversal
+# CVE-2026-32871 in OpenAPIProvider; confused-deputy CVE-2026-27124 in
+# OAuthProxy), fixed only in 3.2.0+. Those surfaces are NOT reachable here:
+# this is a local stdio MCP server (mcp.run() default transport) with no
+# OAuth, no OpenAPI provider, and no HTTP/network listener — it exposes one
+# tool over stdin/stdout to a local Claude Code process. A migration to
+# fastmcp >=3.2.0 is tracked as separate follow-up work, not a release
+# blocker for this PR.
 fastmcp>=2.0.0,<3.0.0
 anyio>=4.0
 PyYAML>=6.0

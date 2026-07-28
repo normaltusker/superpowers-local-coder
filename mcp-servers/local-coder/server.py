@@ -479,8 +479,10 @@ async def _delegate_implementation_impl(
                             "success": False,
                             "error": (
                                 f"git push timed out after {NETWORK_SUBPROCESS_TIMEOUT_SECONDS}s "
-                                "— the commit still exists locally on branch "
-                                f"{branch!r}, but was not pushed"
+                                f"— the commit exists locally on branch {branch!r}, but the "
+                                "push's remote state is UNKNOWN (it may have partially or fully "
+                                "completed). Verify the remote before retrying, and do not "
+                                "re-run the delegation blindly — the local commit is already there"
                             ),
                             "files_changed": result.files_changed,
                             "commit_sha": result.commit_sha,

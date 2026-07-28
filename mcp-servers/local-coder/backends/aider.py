@@ -25,6 +25,29 @@ class AiderBackend(BackendAdapter):
         common.ensure_branch(repo_path, branch)
         pre_head, pre_porcelain = common.snapshot_working_tree(repo_path)
 
+        # Refuse to run when the tree has pre-existing STAGED changes. aider
+        # auto-commits whatever is already in the index into its own commit,
+        # and this adapter treats any HEAD movement as task success — so
+        # pre-existing staged work would be committed and (with open_pr)
+        # pushed as if it were the delegated task. Untracked/unstaged changes
+        # are fine: aider does not auto-commit those, and restore_working_tree
+        # discards only the paths THIS attempt creates, leaving pre-existing
+        # dirty state intact (see restore_working_tree). Only the staged case
+        # is the false-success hole, so only that is rejected here.
+        staged = common.staged_paths(repo_path)
+        if staged:
+            return CompletionResult(
+                success=False,
+                error=(
+                    "target repo has staged (indexed) changes before "
+                    "delegation: " + ", ".join(sorted(staged)[:10])
+                    + (" …" if len(staged) > 10 else "")
+                    + ". aider would auto-commit them into its own commit and "
+                    "report them as the delegated work. Commit or unstage them "
+                    "first."
+                ),
+            )
+
         cmd = [
             "aider", "--model", model, "--yes", "--message", task,
             *config.get("extra_backend_args", []),
@@ -48,6 +71,14 @@ class AiderBackend(BackendAdapter):
             # the same state this attempt did.
             common.restore_working_tree(repo_path, pre_head, pre_porcelain)
             return CompletionResult(success=False, error=str(e), output_tail=e.output_tail)
+        except Exception:
+            # Any other monitor/subprocess failure (OSError, etc.) can also
+            # leave partial on-disk edits from aider. Restore before letting
+            # the exception propagate, so a fallback attempt doesn't start on
+            # a contaminated worktree. Re-raise: the caller's failover loop
+            # decides whether to try the next model.
+            common.restore_working_tree(repo_path, pre_head, pre_porcelain)
+            raise
 
         if result.returncode != 0:
             common.restore_working_tree(repo_path, pre_head, pre_porcelain)

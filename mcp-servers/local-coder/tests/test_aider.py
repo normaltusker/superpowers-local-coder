@@ -257,6 +257,78 @@ def test_run_backend_cleanup_preserves_pre_existing_dirty_state(git_repo):
     assert not (git_repo / "partial_write.py").exists()
 
 
+def test_run_backend_rejects_pre_existing_staged_changes(git_repo):
+    # aider auto-commits whatever is already in the index, and this adapter
+    # treats any HEAD movement as success — so a pre-existing STAGED file would
+    # be committed and reported as the delegated work. Reject before launching.
+    (git_repo / "unrelated.py").write_text("# staged before delegation\n")
+    subprocess.run(["git", "add", "unrelated.py"], cwd=git_repo, check=True)
+
+    ran = {"called": False}
+
+    def fake_run(cmd, cwd, stall_timeout_seconds, idle_notify_interval_seconds, on_tick=None, on_output=None, first_output_timeout_seconds=None):
+        ran["called"] = True
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    backend = AiderBackend()
+    with patch.object(common, "run_monitored_subprocess", side_effect=fake_run):
+        result = backend.run_backend(
+            task="do the task", repo_path=str(git_repo), branch="test-branch",
+            config=BASE_CONFIG, model="ollama/qwen3-coder:30b",
+        )
+
+    assert result.success is False
+    assert "staged" in result.error.lower()
+    assert ran["called"] is False  # rejected before the backend ran
+    # The staged file is left exactly as the caller had it — not committed.
+    assert (git_repo / "unrelated.py").exists()
+
+
+def test_run_backend_allows_pre_existing_untracked_changes(git_repo):
+    # Untracked (unstaged) pre-existing files are NOT the false-success hole —
+    # aider doesn't auto-commit them — so the delegation proceeds normally.
+    (git_repo / "scratch.txt").write_text("untracked, not staged\n")
+
+    def fake_run(cmd, cwd, stall_timeout_seconds, idle_notify_interval_seconds, on_tick=None, on_output=None, first_output_timeout_seconds=None):
+        (git_repo / "new_file.py").write_text("# new\n")
+        subprocess.run(["git", "add", "new_file.py"], cwd=git_repo, check=True)
+        subprocess.run(["git", "commit", "-m", "aider commit"], cwd=git_repo, check=True, capture_output=True)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    backend = AiderBackend()
+    with patch.object(common, "run_monitored_subprocess", side_effect=fake_run):
+        result = backend.run_backend(
+            task="add a file", repo_path=str(git_repo), branch="test-branch",
+            config=BASE_CONFIG, model="ollama/qwen3-coder:30b",
+        )
+
+    assert result.success is True
+    assert (git_repo / "scratch.txt").exists()  # pre-existing untracked survives
+
+
+def test_run_backend_restores_working_tree_on_non_stall_exception(git_repo):
+    # A non-StallError exception (e.g. OSError) from the monitor must still
+    # restore the tree before propagating, so a fallback attempt doesn't start
+    # on a worktree polluted by this attempt's partial writes.
+    def fake_run(cmd, cwd, stall_timeout_seconds, idle_notify_interval_seconds, on_tick=None, on_output=None, first_output_timeout_seconds=None):
+        (git_repo / "partial_write.py").write_text("# half-written before the crash\n")
+        raise OSError("boom from the monitor")
+
+    backend = AiderBackend()
+    with patch.object(common, "run_monitored_subprocess", side_effect=fake_run):
+        raised = False
+        try:
+            backend.run_backend(
+                task="crash mid-run", repo_path=str(git_repo), branch="test-branch",
+                config=BASE_CONFIG, model="ollama/qwen3-coder:30b",
+            )
+        except OSError:
+            raised = True
+
+    assert raised is True  # non-stall exception re-propagates
+    assert not (git_repo / "partial_write.py").exists()  # but tree was restored first
+
+
 def test_run_backend_creates_branch_if_missing(git_repo):
     def fake_run(cmd, cwd, stall_timeout_seconds, idle_notify_interval_seconds, on_tick=None, on_output=None, first_output_timeout_seconds=None):
         subprocess.run(["git", "commit", "--allow-empty", "-m", "aider commit"], cwd=git_repo, check=True, capture_output=True)

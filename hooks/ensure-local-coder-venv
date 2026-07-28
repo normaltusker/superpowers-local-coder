@@ -47,8 +47,14 @@ venv_python() {
     elif [ -x "$VENV/Scripts/python.exe" ]; then
         candidate="$VENV/Scripts/python.exe"
     fi
+    # Probe BOTH the interpreter version AND pip usability. An interrupted
+    # `venv` creation can leave a runnable python whose pip is missing or
+    # broken; version alone would classify that as usable, so the fast path
+    # would skip creation and then fail on every later `pip install`. Import
+    # pip (cheap, no network) so a pip-less tree is treated as broken and
+    # rebuilt below.
     if [ -n "$candidate" ] && \
-       "$candidate" -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" >/dev/null 2>&1; then
+       "$candidate" -c "import sys, pip; sys.exit(0 if sys.version_info >= (3,10) else 1)" >/dev/null 2>&1; then
         printf '%s' "$candidate"
     fi
 }

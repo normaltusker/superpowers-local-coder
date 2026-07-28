@@ -168,6 +168,20 @@ def snapshot_working_tree(repo_path: str) -> tuple[str, set[str]]:
     return pre_head, porcelain
 
 
+def staged_paths(repo_path: str) -> set[str]:
+    """Paths with STAGED (index) changes — i.e. content git would include in
+    the next commit. Derived from `git status --porcelain -z`, whose two-char
+    XY code puts the index status in the FIRST char: a path is staged when
+    that char is neither ' ' (unmodified in index) nor '?' (untracked, '??').
+
+    Used to refuse a delegation when the tree is already staged, because a
+    self-committing backend (aider) would fold that pre-existing index content
+    into its own commit and report it as the delegated work.
+    """
+    entries = _parse_porcelain_z(_git_status_z(repo_path))
+    return {p for p, code in entries.items() if code[:1] not in (" ", "?")}
+
+
 def restore_working_tree(repo_path: str, pre_head: str, pre_porcelain: set[str]) -> None:
     """Reset a working tree to its pre-attempt state after a FAILED backend
     attempt, so the next failover attempt doesn't inherit partial,
@@ -212,7 +226,7 @@ def restore_working_tree(repo_path: str, pre_head: str, pre_porcelain: set[str])
     (gitignore-matched) paths from status entirely otherwise, so an
     attempt's newly generated ignored files (build output, .pyc, etc.)
     would be invisible to the pre/post diff and survive into the next
-    failover attempt. Ignored paths are cleaned via `git clean -fdx`
+    failover attempt. Ignored paths are cleaned via `git clean -ffdx`
     (the `-x` is what makes clean remove ignored, not just untracked,
     paths) rather than `git restore`, since they were never tracked and
     have no `pre_head` content to restore from.
@@ -301,7 +315,13 @@ def restore_working_tree(repo_path: str, pre_head: str, pre_porcelain: set[str])
             )
     if untracked_or_ignored:
         cleaned = subprocess.run(
-            ["git", "-C", repo_path, "clean", "-fdx", "--", *untracked_or_ignored],
+            # -ff (double force), not just -f: a single -f leaves nested git
+            # repositories (a dir containing its own .git — e.g. a clone a
+            # failed backend created) in place while still returning success,
+            # so they would survive cleanup and pollute the next attempt.
+            # Safe here because only paths absent from pre_porcelain — created
+            # by THIS attempt — are ever passed in.
+            ["git", "-C", repo_path, "clean", "-ffdx", "--", *untracked_or_ignored],
             cwd=repo_path, capture_output=True,
             env={**os.environ, **_LITERAL_PATHSPECS_ENV},
         )
