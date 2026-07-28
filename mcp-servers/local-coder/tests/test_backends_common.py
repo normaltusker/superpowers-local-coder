@@ -651,6 +651,36 @@ def test_run_monitored_subprocess_steady_state_stall_fires_after_floor():
     assert ei.value.phase == "stall"
 
 
+def test_run_monitored_subprocess_stall_error_carries_output_tail():
+    # When a stall kills the subprocess, whatever output it HAD produced
+    # before going silent is the single most useful diagnostic ("what was it
+    # doing when it wedged?"). That tail is captured in the monitor loop but
+    # is lost today because StallError is raised without it. StallError must
+    # carry the accumulated output_tail so the backend can surface it.
+    script = "import time\nprint('LAST LINE BEFORE WEDGE', flush=True)\ntime.sleep(1.5)"
+    with pytest.raises(common.StallError) as ei:
+        common.run_monitored_subprocess(
+            [sys.executable, "-c", script], cwd=".",
+            stall_timeout_seconds=0.2, idle_notify_interval_seconds=0.05,
+            first_output_timeout_seconds=0.3,
+        )
+    assert ei.value.phase == "stall"
+    assert "LAST LINE BEFORE WEDGE" in ei.value.output_tail
+
+
+def test_run_monitored_subprocess_first_output_stall_carries_empty_tail():
+    # A cold-load that never emitted anything has no tail — the attribute must
+    # still exist (empty), so callers can read it unconditionally.
+    with pytest.raises(common.StallError) as ei:
+        common.run_monitored_subprocess(
+            ["sleep", "5"], cwd=".",
+            stall_timeout_seconds=0.1, idle_notify_interval_seconds=0.05,
+            first_output_timeout_seconds=0.3,
+        )
+    assert ei.value.phase == "first-output"
+    assert ei.value.output_tail == ""
+
+
 def test_run_monitored_subprocess_wedged_cold_load_fires_after_floor():
     # A process that never emits a byte must still be killed once the floor
     # elapses — the floor is self-bounding. Tagged as a first-output

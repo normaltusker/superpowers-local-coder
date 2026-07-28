@@ -193,6 +193,26 @@ def test_run_backend_cleans_up_partial_writes_after_stall(git_repo):
     assert not (git_repo / "partial_write.py").exists()
 
 
+def test_run_backend_stall_carries_output_tail(git_repo):
+    # A stall-killed attempt currently returns output_tail="" — the diagnostic
+    # tail (what the backend printed right before wedging) is lost exactly when
+    # it's most needed. The StallError carries that tail; run_backend must
+    # surface it on the failure result, like the non-zero-exit path does.
+    def fake_run(cmd, cwd, stall_timeout_seconds, idle_notify_interval_seconds, on_tick=None, on_output=None, first_output_timeout_seconds=None):
+        raise common.StallError(300, output_tail="Applying edit to foo.py\nStill working...")
+
+    backend = AiderBackend()
+    with patch.object(common, "run_monitored_subprocess", side_effect=fake_run):
+        result = backend.run_backend(
+            task="hang forever", repo_path=str(git_repo), branch="test-branch",
+            config=BASE_CONFIG, model="ollama/qwen3-coder:30b",
+        )
+
+    assert result.success is False
+    assert "stalled" in result.error
+    assert result.output_tail == "Applying edit to foo.py\nStill working..."
+
+
 def test_run_backend_cleans_up_partial_writes_after_nonzero_exit(git_repo):
     # Same scenario but for a plain non-zero exit rather than a stall kill.
     def fake_run(cmd, cwd, stall_timeout_seconds, idle_notify_interval_seconds, on_tick=None, on_output=None, first_output_timeout_seconds=None):

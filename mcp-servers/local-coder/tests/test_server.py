@@ -164,6 +164,25 @@ async def test_delegate_implementation_all_models_fail(isolated_config, git_repo
     assert "ollama/qwen2.5-coder:14b" in result["error"]
 
 
+async def test_delegate_implementation_stall_surfaces_output_tail(isolated_config, git_repo_no_remote):
+    # End-to-end: a stall-failed backend now carries its pre-kill tail on the
+    # CompletionResult, and the server must surface it in the failure result
+    # dict — otherwise "why did it stall?" is unanswerable from the MCP reply.
+    stall_fail = CompletionResult(
+        success=False,
+        error="stalled: no output for 300s",
+        output_tail="Applying edit to calc.py\nawaiting model...",
+    )
+    with patch("backends.aider.AiderBackend.run_backend", return_value=stall_fail):
+        result = await server._delegate_implementation_impl(
+            task="add a.py", branch="feature-branch",
+            target_repo_path=str(git_repo_no_remote),
+        )
+
+    assert result["success"] is False
+    assert result["output_tail"] == "Applying edit to calc.py\nawaiting model..."
+
+
 async def test_delegate_implementation_unimplemented_backend_returns_clean_error(isolated_config, git_repo_no_remote):
     config_module.merge_config({"backend": "codex"})
     result = await server._delegate_implementation_impl(

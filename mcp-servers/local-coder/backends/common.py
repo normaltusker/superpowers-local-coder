@@ -20,14 +20,19 @@ KNOWN_BACKENDS = ("aider", "codex", "gemini", "openrouter")
 
 
 class StallError(Exception):
-    def __init__(self, timeout_seconds: float, phase: str = "stall"):
+    def __init__(self, timeout_seconds: float, phase: str = "stall", output_tail: str = ""):
         # phase is "first-output" (killed before the first byte of output,
         # i.e. a cold-load that never produced anything within its grace
         # window) or "stall" (went silent after producing output). The
         # stall_timeout_seconds attribute name is preserved for existing
         # callers/tests and holds whichever budget actually fired.
+        # output_tail carries whatever the subprocess had printed before the
+        # kill — the primary diagnostic for "what was it doing when it
+        # wedged?" — so the backend can surface it instead of losing it. Empty
+        # for a first-output (never-emitted) stall.
         self.stall_timeout_seconds = timeout_seconds
         self.phase = phase
+        self.output_tail = output_tail
         if phase == "first-output":
             msg = f"stalled: no first output within {timeout_seconds}s (cold-load grace)"
         else:
@@ -476,8 +481,10 @@ def run_monitored_subprocess(
                 process.kill()
                 process.wait()
                 if never_emitted:
-                    raise StallError(first_budget, phase="first-output")
-                raise StallError(stall_timeout_seconds, phase="stall")
+                    # No output was ever produced, so there is no tail to
+                    # carry (output_tail is still "").
+                    raise StallError(first_budget, phase="first-output", output_tail=output_tail)
+                raise StallError(stall_timeout_seconds, phase="stall", output_tail=output_tail)
     finally:
         selector.close()
         if process.poll() is None:
