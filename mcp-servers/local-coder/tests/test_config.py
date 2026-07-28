@@ -195,6 +195,25 @@ def test_configure_with_validation_leaves_first_output_timeout_unchanged_when_ab
     assert result.get("first_output_timeout_seconds") == before
 
 
+def test_shipped_config_has_log_retention_default():
+    import yaml
+    default_path = Path(__file__).parent.parent / "config.yaml"
+    data = yaml.safe_load(default_path.read_text())
+    assert data["log_retention_count"] == 50
+
+
+def test_configure_with_validation_rejects_non_positive_log_retention(isolated_config):
+    with pytest.raises(config_module.ConfigValidationError, match="log_retention_count"):
+        config_module.configure_with_validation({"log_retention_count": 0})
+    with pytest.raises(config_module.ConfigValidationError, match="log_retention_count"):
+        config_module.configure_with_validation({"log_retention_count": -5})
+
+
+def test_configure_with_validation_accepts_positive_log_retention(isolated_config):
+    result = config_module.configure_with_validation({"log_retention_count": 10})
+    assert result["log_retention_count"] == 10
+
+
 def test_configure_with_validation_rejects_fallback_list_over_cap(isolated_config):
     # include the config's existing default model ("qwen3-coder:30b") in the
     # mock's available list since the merged/effective model is now

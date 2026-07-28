@@ -1,3 +1,4 @@
+import os
 import subprocess
 import shutil
 from pathlib import Path
@@ -905,6 +906,13 @@ def test_configure_persists_first_output_timeout_seconds(isolated_config):
     assert result["first_output_timeout_seconds"] == 900
 
 
+def test_configure_persists_log_retention_count(isolated_config):
+    # Log retention must be settable through the configure MCP tool (users are
+    # told never to hand-edit config.yaml), not just present in config.py.
+    result = server._configure_impl(log_retention_count=25)
+    assert result["log_retention_count"] == 25
+
+
 def test_configure_rejects_invalid_model_with_clean_error(isolated_config):
     with patch("ollama.list_ollama_models", return_value=[]):
         result = server._configure_impl(model="ollama/nonexistent:1b")
@@ -1150,6 +1158,78 @@ async def test_per_call_log_exists_after_announce_before_output(
         "per-call log file must exist after announce and before any backend "
         "output, so a cold-load `tail -f` doesn't exit on a missing file"
     )
+
+
+def test_prune_old_logs_keeps_only_newest_n(tmp_path, monkeypatch):
+    # Per-call log files otherwise accumulate forever. _prune_old_logs keeps
+    # the N most recently modified per-call logs and deletes the rest, so the
+    # log dir stays bounded. Only files matching the per-call naming pattern
+    # are touched — unrelated files in the dir must survive.
+    base = tmp_path / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", base)
+
+    # Create 6 per-call logs with staggered mtimes (oldest first).
+    import time as _time
+    made = []
+    for i in range(6):
+        p = tmp_path / f"local-coder-output-{i:03d}.log"
+        p.write_text(f"log {i}\n")
+        os.utime(p, (1000 + i, 1000 + i))  # ascending mtime; i=5 is newest
+        made.append(p)
+    # An unrelated file that must NOT be pruned.
+    unrelated = tmp_path / "config.yaml"
+    unrelated.write_text("keep me\n")
+
+    server._prune_old_logs(count=3)
+
+    survivors = sorted(p.name for p in tmp_path.glob("local-coder-output-*.log"))
+    # Newest 3 (indices 3,4,5) kept; oldest 3 (0,1,2) deleted.
+    assert survivors == ["local-coder-output-003.log",
+                         "local-coder-output-004.log",
+                         "local-coder-output-005.log"]
+    assert unrelated.exists()
+
+
+def test_prune_old_logs_is_best_effort(tmp_path, monkeypatch):
+    # A prune failure (permission error, race with another call deleting the
+    # same file) must never abort the delegation — pruning is housekeeping,
+    # not part of the real workflow.
+    base = tmp_path / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", base)
+    for i in range(4):
+        (tmp_path / f"local-coder-output-{i:03d}.log").write_text("x\n")
+
+    # Make unlink raise; _prune_old_logs must swallow it and not propagate.
+    with patch.object(Path, "unlink", side_effect=OSError("boom")):
+        server._prune_old_logs(count=1)  # must not raise
+
+
+async def test_delegate_prunes_logs_on_each_call(isolated_config, git_repo_no_remote, tmp_path, monkeypatch):
+    # A real delegation prunes old per-call logs down to the configured
+    # retention count (keeping room for the call's own fresh log).
+    base = tmp_path / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", base)
+    config_module.merge_config({"log_retention_count": 2})
+    # Seed 5 stale per-call logs.
+    for i in range(5):
+        p = tmp_path / f"local-coder-output-stale{i}.log"
+        p.write_text("old\n")
+        os.utime(p, (1000 + i, 1000 + i))
+
+    def fake_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_backend):
+        result = await server._delegate_implementation_impl(
+            task="add a.py", branch="feature-branch",
+            target_repo_path=str(git_repo_no_remote), ctx=None,
+        )
+    assert result["success"] is True
+    # After pruning to 2 + this call's own fresh log, the dir holds at most 3.
+    remaining = list(tmp_path.glob("local-coder-output-*.log"))
+    assert len(remaining) <= 3, [p.name for p in remaining]
+    # This call's own log must be among the survivors.
+    assert Path(result["output_log"]).exists()
 
 
 def test_output_log_path_lives_under_plugin_data_dir(tmp_path, monkeypatch):

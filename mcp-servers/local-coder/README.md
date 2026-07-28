@@ -121,6 +121,13 @@ you can start `tail -f`-ing it while the run is still in progress if you
 want the raw stream. Tailing it is a power-user convenience, not the
 normal way to follow a run.
 
+These per-call logs would otherwise accumulate one-per-call forever. On each
+delegation the server prunes the directory down to the `log_retention_count`
+most recent logs (default `50`) before writing the new one, so the log dir
+stays bounded. Set it via the `configure` tool (never hand-edit `config.yaml`);
+it must be a strictly-positive integer. Pruning is best-effort — a failure to
+delete an old log never affects the delegation.
+
 ## Known issues
 
 ### Aider crashes importing scipy on macOS 26+ (repo-map)

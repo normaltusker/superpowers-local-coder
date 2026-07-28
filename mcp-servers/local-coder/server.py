@@ -53,6 +53,42 @@ def _make_output_log_path() -> Path:
     )
 
 
+def _prune_old_logs(count: int) -> None:
+    """Keep only the `count` most recently modified per-call log files in the
+    log directory, deleting older ones. Per-call logs otherwise accumulate
+    indefinitely (one per delegate_implementation call, forever).
+
+    Best-effort housekeeping: any failure — a permission error, a race with a
+    concurrent call deleting the same file, an unreadable mtime — is swallowed
+    so it can never abort a real delegation. Only files matching the per-call
+    naming pattern (`<stem>-*<suffix>`) are considered; the shared base log and
+    unrelated files (config.yaml, the venv, etc.) are never touched.
+    """
+    try:
+        pattern = f"{OUTPUT_LOG_PATH.stem}-*{OUTPUT_LOG_PATH.suffix}"
+        candidates = list(OUTPUT_LOG_PATH.parent.glob(pattern))
+    except OSError:
+        return
+    if len(candidates) <= count:
+        return
+
+    def _mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0  # unreadable → treat as oldest, prune first
+
+    # Newest first; everything past the keep-count is deleted.
+    candidates.sort(key=_mtime, reverse=True)
+    for stale in candidates[count:]:
+        try:
+            stale.unlink()
+        except OSError:
+            # Another call may have already removed it, or perms deny it —
+            # either way, not our problem to escalate.
+            pass
+
+
 # Cap on the in-memory buffer that holds an incomplete (not-yet-delimited)
 # output line for the progress pulse. A backend emitting a very long
 # delimiter-free stream (e.g. a huge single line, or carriage-return
@@ -122,6 +158,14 @@ async def _delegate_implementation_impl(
         return {"success": False, "error": str(e)}
 
     cfg = config_module.load_config()
+
+    # Prune accumulated per-call logs from earlier calls down to the retention
+    # count, BEFORE this call's own log is touched below — so the fresh log is
+    # never a prune candidate. Absent/invalid config falls back to the shipped
+    # default (50). Best-effort; never aborts the call.
+    retention = cfg.get("log_retention_count") or 50
+    _prune_old_logs(retention)
+
     repo_path = target_repo_path or cfg.get("target_repo_path")
     if not repo_path:
         return {"success": False, "error": "target_repo_path not provided and not set in config"}
@@ -467,6 +511,7 @@ def _configure_impl(
     pr_base_branch: str | None = None,
     idle_notify_interval_seconds: float | None = None,
     extra_backend_args: list[str] | None = None,
+    log_retention_count: int | None = None,
 ) -> dict:
     all_overrides = {
         "backend": backend,
@@ -481,6 +526,7 @@ def _configure_impl(
         "pr_base_branch": pr_base_branch,
         "idle_notify_interval_seconds": idle_notify_interval_seconds,
         "extra_backend_args": extra_backend_args,
+        "log_retention_count": log_retention_count,
     }
     all_overrides = {k: v for k, v in all_overrides.items() if v is not None}
 
@@ -528,13 +574,14 @@ def configure(
     pr_base_branch: str | None = None,
     idle_notify_interval_seconds: float | None = None,
     extra_backend_args: list[str] | None = None,
+    log_retention_count: int | None = None,
 ) -> dict:
     return _configure_impl(
         backend, model, fallback_models, max_fallback_models,
         stall_timeout_seconds, first_output_timeout_seconds,
         target_repo_path, branch_prefix,
         open_pr, pr_base_branch, idle_notify_interval_seconds,
-        extra_backend_args,
+        extra_backend_args, log_retention_count,
     )
 
 
