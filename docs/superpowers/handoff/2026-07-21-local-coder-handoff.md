@@ -13,20 +13,19 @@ by reading the repo (not trusting the tool's report).
 Merged to `dev`:
 - **PR #2** (`70f8ba3`) — Phase 1: the whole `mcp-servers/local-coder/`
   FastMCP server + SDD rewiring.
-- **PR #3** (`ea3288c`) — item 7: made `delegate_implementation` observable
+- **PR #3** (`ea3288c`) — made `delegate_implementation` observable
   (live output pulse, `output_tail`) and non-hanging (`stdin=DEVNULL`).
 - **PR #4** (`90199a0`) — launch/bootstrap: `SessionStart` +
   at-launch venv auto-provisioning into `${CLAUDE_PLUGIN_DATA}`.
+- **PR #5** (`fe5aa27`) — fixed the subagent tool-name gap (see root cause
+  below).
+- **PR #6** (`a175e1f`) — cold-load grace window
+  (`first_output_timeout_seconds`, minimum-runtime floor). See Item 6.
+- **PR #7** (`5c8720c`) — delegate_implementation error-handling
+  robustness (three server.py bugs). See Item 7.
 
 **Open now:**
-- **PR #6** (`local-coder/phase2-next` → `dev`) — cold-load grace window
-  (`first_output_timeout_seconds`, floor design). See Item 6. Merge is the
-  human's call.
-
-**Merged (this session):**
-- **PR #5** (`local-coder/subagent-tool-name` → `dev`) — fixed the subagent
-  tool-name gap (see root cause below). Review round 1 handled (2 handoff
-  doc stale-guidance fixes, `2690f65`).
+- Nothing in flight. Next up: Item 4 (skill-eval evidence).
 
 `main` is untouched — everything lands on `dev`; `dev`→`main` is later and
 the human's call.
@@ -124,20 +123,48 @@ From the MAIN REPO ROOT (where the plugin is enabled at project scope):
 
 ## Phase 2 backlog (remaining, unstarted)
 
-- **Item 4 — skill-eval evidence** for the Phase 1 SKILL.md/implementer-prompt.md
-  rewrite. Repo CLAUDE.md requires eval-harness evidence
-  (`superpowers:writing-skills`, adversarial pressure testing) for
-  behavior-shaping skill changes; Phase 1 shipped without it. Now viable
-  since the delegation path works. Eval harness:
-  https://github.com/prime-radiant-inc/superpowers-evals/ (into `evals/`,
-  gitignored, not cloned locally).
+- **Item 4 — skill-eval evidence — DEFERRED** (insurance for a future
+  UPSTREAM PR, not a live fix; this fork lands on `dev`, where the
+  eval-evidence bar is optional). Covers the Phase 1 change to
+  `skills/subagent-driven-development/SKILL.md` (an UPSTREAM tuned file that
+  `bf6d731` modified to delegate implementation to the local-coder MCP
+  server) plus `implementer-prompt.md`. Do this the day before any upstream
+  PR, not sooner.
+  - **Eval harness:** https://github.com/prime-radiant-inc/superpowers-evals
+    (public). Quorum drives real coding-agent CLIs through a Gauntlet QA
+    agent and grades workflow compliance. Clones into `evals/` (gitignored).
+  - **Run recipe (non-container):**
+    1. `bun` is already installed (`~/.bun/bin/bun`, v1.3.14, on PATH via
+       `~/.zshrc`).
+    2. Clone superpowers-evals into `evals/`; `cd evals && bun install`.
+    3. Needs a **Gauntlet checkout** (the QA driver) discovered via
+       `GAUNTLET_ROOT` or a `bun link` — URL not in the public README;
+       confirm whether it's public/private before starting.
+    4. `export SUPERPOWERS_ROOT=<this worktree>` and
+       `export ANTHROPIC_API_KEY=...` (or `CLAUDE_CODE_OAUTH_TOKEN` from
+       `claude setup-token` — subscription caps make the API key better for
+       batches). **Real API spend; human provides creds.**
+    5. Relevant scenarios (exercise our SDD change):
+       `scenarios/sdd-*` (25+ of them — e.g. `sdd-svelte-todo`,
+       `sdd-quality-reviewer-catches-planted-defect`,
+       `sdd-rejects-extra-features`, `sdd-final-review-single-wave`),
+       plus `subagent-dispatch-no-overtrigger`.
+    6. `bun run quorum run scenarios/<name> --coding-agent claude` then
+       `bun run quorum show <run-dir>`. Live evals launch Claude with
+       `--dangerously-skip-permissions` in a throwaway HOME — trusted-local
+       only. Container path (`scripts/evals-container`) needs Docker, which
+       is NOT installed on this host.
+  - **Why deferred:** heaviest backlog item, weakest immediate payoff. Needs
+    Docker/Gauntlet/creds + real spend; nothing is currently broken by the
+    Phase 1 edit. Shipped PRs #5/#6/#7 already carry strong evidence (TDD,
+    152 tests, live smoke). Revisit only for an upstream submission.
 - **Item 5 — TDD-under-delegation is structurally weaker.** The implementer
   subagent can't independently verify RED-before-GREEN (no Edit/Write), so
   the backend owns TDD discipline. Documented as an accepted trade-off in
   `implementer-prompt.md`. Revisit only if it causes a real problem — do
   NOT preemptively redesign.
-- **Item 6 — cold-load vs stall timeout — DONE, OPEN AS PR #6**
-  (`local-coder/phase2-next` → `dev`). A large local model's cold-load
+- **Item 6 — cold-load vs stall timeout — DONE, MERGED AS PR #6** (`a175e1f`).
+  A large local model's cold-load
   produces no output, so its load time counted against `stall_timeout_seconds`
   (300s) and killed it (an 18GB/30B model hit this). New
   `first_output_timeout_seconds` (shipped 600s, falls back to the stall value
@@ -165,10 +192,12 @@ From the MAIN REPO ROOT (where the plugin is enabled at project scope):
     slop instead of being overshot by a longer `idle_notify_interval_seconds`.
     Reproduced empirically (0.2s floor / 0.5s stall / 20s notify → was killed
     at ~0.5s, now ~0.2s). README first-byte prose corrected to the floor model.
-- **Item 7 (NEW, from Codex review of the cold-start work) — three real
-  server.py error-handling bugs on the macOS/Linux path.** All ours, all
-  pre-date the cold-start work; carved out as their own PR (one problem =
-  "delegate_implementation error-handling robustness") rather than bundled.
+- **Item 7 — DONE, MERGED AS PR #7** (`5c8720c`). Three real server.py
+  error-handling bugs on the macOS/Linux path, found by the Codex review of
+  the cold-start work. All ours, all pre-dated it; shipped as their own PR
+  (one problem = "delegate_implementation error-handling robustness"). Fixed
+  via TDD (152 tests) + a 10/10 live smoke run forcing all three fault edges;
+  cubic round-1 P3s (progress-warn throttle, stale comment) also fixed.
   - **P1 progress-report can kill aider + leak partial edits** — in
     `server.py`'s periodic `make_on_tick`, if `ctx.report_progress` raises
     (progress token/transport gone) the exception escapes on_tick →
