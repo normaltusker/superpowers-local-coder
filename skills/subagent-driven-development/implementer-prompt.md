@@ -64,12 +64,14 @@ Subagent (local-coder-implementer):
        - Otherwise (`success: false` with no commit), do not attempt to fix
          it yourself — report BLOCKED with the full error (see "When You're in
          Over Your Head" below).
-    3. If `success: true`, use Read/Grep/Glob and read-only Bash (see your own
-       agent definition for what's permitted) to verify the changed files
-       (`files_changed` in the response) actually satisfy the task brief. If
-       the brief calls for tests, run them via Bash to confirm they pass —
-       you do not write new tests yourself, but you must confirm existing
-       or delegated-in tests actually run and pass.
+    3. Whenever a local commit exists — `success: true`, OR `success: false`
+       with a `commit_sha` (the push-failed case from step 2) — use
+       Read/Grep/Glob and read-only Bash (see your own agent definition for
+       what's permitted) to verify the changed files (`files_changed` in the
+       response) actually satisfy the task brief. A push failure must not let
+       unverified work through. If the brief calls for tests, run them via Bash
+       to confirm they pass — you do not write new tests yourself, but you must
+       confirm existing or delegated-in tests actually run and pass.
     4. If verification in step 3 finds the delegated work does NOT satisfy
        the brief (missing requirement, tests fail, wrong approach), you
        cannot fix it yourself — you have no Edit/Write tools. Do not call
