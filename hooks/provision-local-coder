@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# SessionStart hook: PRE-WARM the local-coder MCP server's Python venv into
+# the persistent plugin-data dir, so it's ready before the first delegation.
+#
+# This is a thin wrapper around hooks/ensure-local-coder-venv (the shared
+# provisioning logic). The launcher (hooks/launch-local-coder) also calls
+# that same script at launch time, so provisioning does NOT depend on this
+# SessionStart hook having finished first — this just warms it early.
+#
+# Best-effort — NEVER fails the session (always exit 0). Extensionless (see
+# docs/windows/polyglot-hooks.md); dispatched by hooks/run-hook.cmd. Emits
+# NO stdout (unlike hooks/session-start, which has a JSON stdout contract).
+set -uo pipefail
+
+# Only meaningful in an installed plugin, where CLAUDE_PLUGIN_DATA is set.
+if [ -z "${CLAUDE_PLUGIN_DATA:-}" ]; then
+    exit 0
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Call the shared provisioner; swallow its exit code — a provisioning
+# failure here must never break the session (the launcher will report a
+# real failure later if the venv still isn't usable at launch time).
+bash "${SCRIPT_DIR}/ensure-local-coder-venv" "$PLUGIN_ROOT" "$CLAUDE_PLUGIN_DATA" || true
+
+exit 0

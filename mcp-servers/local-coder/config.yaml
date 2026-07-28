@@ -1,0 +1,13 @@
+backend: "aider"
+model: "ollama/qwen3-coder:30b"
+fallback_models: []
+max_fallback_models: 3
+stall_timeout_seconds: 300
+first_output_timeout_seconds: 600
+target_repo_path: null
+branch_prefix: "local-coder/"
+open_pr: false
+pr_base_branch: "main"
+idle_notify_interval_seconds: 20
+log_retention_count: 50
+extra_backend_args: []

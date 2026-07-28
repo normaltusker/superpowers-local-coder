@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "local-coder": {
+      "type": "stdio",
+      "command": "${CLAUDE_PLUGIN_ROOT}/hooks/launch-local-coder",
+      "args": [
+        "${CLAUDE_PLUGIN_DATA}",
+        "${CLAUDE_PLUGIN_ROOT}/mcp-servers/local-coder/server.py"
+      ]
+    }
+  }
+}

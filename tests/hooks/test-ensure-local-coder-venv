@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+ENSURE="$REPO_ROOT/hooks/ensure-local-coder-venv"
+
+FAILURES=0
+TEST_ROOT="$(mktemp -d)"
+trap 'rm -rf "$TEST_ROOT"' EXIT
+pass() { echo "  [PASS] $1"; }
+fail() { echo "  [FAIL] $1"; FAILURES=$((FAILURES + 1)); }
+
+# Resolve the venv interpreter for either layout: POSIX (bin/python) or
+# Windows/Git Bash (Scripts/python.exe). Prints the path, or nothing if
+# neither exists (callers treat empty as "no interpreter" and fail).
+venv_py() {
+    if [ -x "$1/bin/python" ]; then printf '%s' "$1/bin/python"
+    elif [ -x "$1/Scripts/python.exe" ]; then printf '%s' "$1/Scripts/python.exe"
+    fi
+}
+
+# ensure-local-coder-venv <plugin_root> <plugin_data>
+# Returns 0 when the venv is present+usable, 1 when it couldn't be made.
+
+# --- Test 1: real provision — builds the venv + stamp, returns 0 ---
+DATA1="$TEST_ROOT/data1"; mkdir -p "$DATA1"
+if bash "$ENSURE" "$REPO_ROOT" "$DATA1" >/dev/null 2>&1; then
+    pass "returns 0 after building the venv"
+else
+    fail "returns 0 after building the venv"
+fi
+if [ -x "$DATA1/local-coder/.venv/bin/python" ] || [ -x "$DATA1/local-coder/.venv/Scripts/python.exe" ]; then
+    pass "creates the venv"
+else
+    fail "creates the venv"
+fi
+if [ -f "$DATA1/local-coder/requirements.installed.txt" ]; then
+    pass "writes the stamp on success"
+else
+    fail "writes the stamp on success"
+fi
+
+# --- Test 2: idempotent + fast — a second call makes no changes, returns 0 ---
+STAMP="$DATA1/local-coder/requirements.installed.txt"
+BEFORE="$(cat "$STAMP")"
+if bash "$ENSURE" "$REPO_ROOT" "$DATA1" >/dev/null 2>&1; then
+    pass "second call returns 0 (idempotent)"
+else
+    fail "second call returns 0 (idempotent)"
+fi
+AFTER="$(cat "$STAMP")"
+if [ "$BEFORE" = "$AFTER" ]; then pass "second call leaves the stamp unchanged"; else fail "second call leaves the stamp unchanged"; fi
+
+# --- Test 3: missing args → returns 1 ---
+if bash "$ENSURE" "" "$DATA1" >/dev/null 2>&1; then fail "missing plugin-root returns nonzero"; else pass "missing plugin-root returns nonzero"; fi
+if bash "$ENSURE" "$REPO_ROOT" "" >/dev/null 2>&1; then fail "missing plugin-data returns nonzero"; else pass "missing plugin-data returns nonzero"; fi
+
+# --- Test 4: no usable python → returns 1, no stamp ---
+# Use a PATH with the shell/coreutils the script needs but NO python, so
+# this reaches the actual Python-discovery branch. An empty PATH would
+# break the script on its own helpers first and prove nothing about
+# Python discovery.
+BASH_BIN="$(command -v bash)"
+NOPY_BIN="$TEST_ROOT/nopy-bin"; mkdir -p "$NOPY_BIN"
+for tool in bash dirname cat cmp mkdir rm cp seq sleep kill; do
+    src="$(command -v "$tool" 2>/dev/null)" && ln -sf "$src" "$NOPY_BIN/$tool"
+done
+DATA4="$TEST_ROOT/data4"; mkdir -p "$DATA4"
+if env -i PATH="$NOPY_BIN" "$BASH_BIN" "$ENSURE" "$REPO_ROOT" "$DATA4" >/dev/null 2>&1; then
+    fail "returns nonzero when no python is available"
+else
+    pass "returns nonzero when no python is available"
+fi
+if [ ! -f "$DATA4/local-coder/requirements.installed.txt" ]; then
+    pass "writes no stamp when no python is available"
+else
+    fail "writes no stamp when no python is available"
+fi
+
+# --- Test 5: a BROKEN venv is rebuilt, not skipped forever ---
+# Regression: the fast path only tested that the interpreter file was
+# executable. An interrupted `venv` creation leaves an executable-but-
+# broken python behind, which was then treated as usable — so creation was
+# skipped on every later run and provisioning could never self-repair.
+DATA5="$TEST_ROOT/data5"; mkdir -p "$DATA5/local-coder/.venv/bin"
+cat > "$DATA5/local-coder/.venv/bin/python" <<'BROKEN'
+#!/usr/bin/env bash
+exit 1
+BROKEN
+chmod +x "$DATA5/local-coder/.venv/bin/python"
+cp "$REPO_ROOT/mcp-servers/local-coder/requirements.txt" \
+   "$DATA5/local-coder/requirements.installed.txt"   # stamp says "current"
+if bash "$ENSURE" "$REPO_ROOT" "$DATA5" >/dev/null 2>&1; then
+    pass "rebuilds a broken venv instead of trusting the stamp"
+else
+    fail "rebuilds a broken venv instead of trusting the stamp"
+fi
+PY5="$(venv_py "$DATA5/local-coder/.venv")"
+if [ -n "$PY5" ] && "$PY5" -c "import sys" >/dev/null 2>&1; then
+    pass "the rebuilt venv python actually runs"
+else
+    fail "the rebuilt venv python actually runs"
+fi
+
+# --- Test 6: concurrent runs don't corrupt each other ---
+# Two provisioners racing on one fresh data dir must both end up reporting
+# success against a single, working venv.
+DATA6="$TEST_ROOT/data6"; mkdir -p "$DATA6"
+bash "$ENSURE" "$REPO_ROOT" "$DATA6" >/dev/null 2>&1 &
+P1=$!
+bash "$ENSURE" "$REPO_ROOT" "$DATA6" >/dev/null 2>&1 &
+P2=$!
+wait $P1; RC1=$?
+wait $P2; RC2=$?
+if [ "$RC1" -eq 0 ] && [ "$RC2" -eq 0 ]; then
+    pass "concurrent provisioning runs both succeed"
+else
+    fail "concurrent provisioning runs both succeed (rc1=$RC1 rc2=$RC2)"
+fi
+PY6="$(venv_py "$DATA6/local-coder/.venv")"
+if [ -n "$PY6" ] && "$PY6" -c "import fastmcp" >/dev/null 2>&1; then
+    pass "concurrent provisioning leaves a working venv"
+else
+    fail "concurrent provisioning leaves a working venv"
+fi
+if [ "$FAILURES" -gt 0 ]; then echo "STATUS: FAILED ($FAILURES)"; exit 1; fi
+echo "STATUS: PASSED"

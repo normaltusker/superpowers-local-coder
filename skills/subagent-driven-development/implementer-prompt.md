@@ -1,9 +1,17 @@
+<!--
+FORK DIVERGENCE from upstream obra/superpowers:
+This file was modified to delegate implementation to the local-coder MCP
+server instead of using Edit/Write directly. See
+docs/superpowers/specs/2026-07-21-local-coder-delegation-design.md.
+Reconcile carefully on upstream merges.
+-->
+
 # Implementer Subagent Prompt Template
 
 Use this template when dispatching an implementer subagent.
 
 ```
-Subagent (general-purpose):
+Subagent (local-coder-implementer):
   description: "Implement Task N: [task name]"
   model: [MODEL — REQUIRED: choose per SKILL.md Model Selection; an omitted
          model silently inherits the session's most expensive one]
@@ -32,20 +40,53 @@ Subagent (general-purpose):
     ## Your Job
 
     Once you're clear on requirements:
-    1. Implement exactly what the task specifies
-    2. Write tests (following TDD if task says to)
-    3. Verify implementation works
-    4. Commit your work
-    5. Self-review (see below)
-    6. Report back
+    1. Call local-coder's `delegate_implementation` tool with:
+       (its full name depends on the install — it is
+       `mcp__plugin_superpowers_local-coder__delegate_implementation` under a
+       plugin install, or `mcp__local-coder__delegate_implementation` under a
+       project-scoped `.mcp.json`. Use whichever is in your toolset; if
+       neither is, report BLOCKED rather than editing files yourself.)
+       - `task`: the task brief's requirements, written as a clear
+         implementation instruction (not just pasted verbatim — synthesize the
+         brief's acceptance criteria into a task description local-coder's
+         backend can act on, including any TDD requirement from the brief)
+       - `branch`: [current working branch — filled in by the controller]
+       - `target_repo_path`: [directory — filled in by the controller]
+    2. Wait for the result.
+       - If `success: false` **and** the response carries a `commit_sha`
+         (with `files_changed`), the implementation itself succeeded and was
+         committed locally — only a later step (typically the push) failed.
+         Do NOT report BLOCKED and do NOT re-delegate: that would duplicate
+         already-committed work. Verify the commit as in step 3, then report
+         DONE_WITH_CONCERNS naming the push/remote blocker from the error and
+         quoting it verbatim, so the controller can retry the push (or check
+         the remote) without redoing the implementation.
+       - Otherwise (`success: false` with no commit), do not attempt to fix
+         it yourself — report BLOCKED with the full error (see "When You're in
+         Over Your Head" below).
+    3. Whenever a local commit exists — `success: true`, OR `success: false`
+       with a `commit_sha` (the push-failed case from step 2) — use
+       Read/Grep/Glob and read-only Bash (see your own agent definition for
+       what's permitted) to verify the changed files (`files_changed` in the
+       response) actually satisfy the task brief. A push failure must not let
+       unverified work through. If the brief calls for tests, run them via Bash
+       to confirm they pass — you do not write new tests yourself, but you must
+       confirm existing or delegated-in tests actually run and pass.
+    4. If verification in step 3 finds the delegated work does NOT satisfy
+       the brief (missing requirement, tests fail, wrong approach), you
+       cannot fix it yourself — you have no Edit/Write tools. Do not call
+       `delegate_implementation` again on your own initiative with a
+       corrective prompt; report DONE_WITH_CONCERNS with the specific gap
+       you found, so the controller can decide whether to re-dispatch a
+       fresh corrective delegation with full context, or escalate.
+    5. Report back (see Report Format below).
 
     Work from: [directory]
 
-    **While you work:** If you encounter something unexpected or unclear, **ask questions**.
-    It's always OK to pause and clarify. Don't guess or make assumptions.
-
-    While iterating, run the focused test for what you're changing; run the
-    full suite once before committing, not after every edit.
+    **While you work:** If you encounter something unexpected or unclear before
+    calling `delegate_implementation`, **ask questions**. It's always OK to
+    pause and clarify. Don't guess or make assumptions about what the task
+    means before delegating it.
 
     ## Code Organization
 
@@ -118,9 +159,22 @@ Subagent (general-purpose):
     Write your full report to [REPORT_FILE]:
     - What you implemented (or what you attempted, if blocked)
     - What you tested and test results
-    - **TDD Evidence** (if TDD was required for this task):
-      - RED: command run, relevant failing output before implementation, and why the failure was expected
-      - GREEN: command run and relevant passing output after implementation
+    - **TDD Evidence** (if the task brief required TDD): you delegate the
+      entire implementation to `delegate_implementation` in one atomic
+      call, so you don't personally run a failing test before the
+      implementation exists — you have no independent RED step to show.
+      Report whatever evidence you *can* observe instead:
+      - Confirm the task brief's TDD requirement was included in what you
+        sent to `delegate_implementation` (quote the relevant instruction).
+      - After the call, run the test suite yourself via Bash and report
+        that GREEN output — this you can verify directly.
+      - Check `git log`/`git show` on the delegated commit for signs the
+        backend followed TDD (e.g. a test file added/modified alongside
+        the implementation), and note what you found either way.
+      - Don't fabricate or hand-wave a RED step you didn't witness — state
+        plainly that RED/GREEN discipline during implementation was the
+        delegated backend's responsibility and isn't independently
+        re-verifiable by this subagent.
     - Files changed
     - Self-review findings (if any)
     - Any issues or concerns

@@ -3,6 +3,17 @@ name: subagent-driven-development
 description: Use when executing implementation plans with independent tasks in the current session
 ---
 
+<!--
+FORK DIVERGENCE from upstream obra/superpowers:
+This file was modified to delegate implementation to the local-coder MCP
+server instead of using Edit/Write directly. The implementer subagent runs
+the delegation contract in ./implementer-prompt.md (via the
+local-coder-implementer agent). See
+docs/superpowers/specs/2026-07-21-local-coder-delegation-design.md.
+Reconcile carefully on upstream merges — the delegation lives in
+implementer-prompt.md; here only the flowchart labels reflect it.
+-->
+
 # Subagent-Driven Development
 
 Execute plan by dispatching a fresh implementer subagent per task, a task review (spec compliance + code quality) after each, and a broad whole-branch review at the end.
@@ -53,7 +64,7 @@ digraph process {
         "Dispatch implementer subagent (./implementer-prompt.md)" [shape=box];
         "Implementer asks questions?" [shape=diamond];
         "Answer questions, provide context" [shape=box];
-        "Implementer implements, tests, commits, self-reviews" [shape=box];
+        "Implementer delegates to local-coder, verifies, commits" [shape=box];
         "Generate review package, dispatch task reviewer (./task-reviewer-prompt.md)" [shape=box];
         "Spec ✅ and quality approved?" [shape=diamond];
         "Finding conflicts with plan text?" [shape=diamond];
@@ -79,9 +90,9 @@ digraph process {
     "Setup: worktree, ledger check, read plan, pre-flight review" -> "Dispatch implementer subagent (./implementer-prompt.md)";
     "Dispatch implementer subagent (./implementer-prompt.md)" -> "Implementer asks questions?";
     "Implementer asks questions?" -> "Answer questions, provide context" [label="yes"];
-    "Answer questions, provide context" -> "Implementer implements, tests, commits, self-reviews";
-    "Implementer asks questions?" -> "Implementer implements, tests, commits, self-reviews" [label="no"];
-    "Implementer implements, tests, commits, self-reviews" -> "Generate review package, dispatch task reviewer (./task-reviewer-prompt.md)";
+    "Answer questions, provide context" -> "Implementer delegates to local-coder, verifies, commits";
+    "Implementer asks questions?" -> "Implementer delegates to local-coder, verifies, commits" [label="no"];
+    "Implementer delegates to local-coder, verifies, commits" -> "Generate review package, dispatch task reviewer (./task-reviewer-prompt.md)";
     "Generate review package, dispatch task reviewer (./task-reviewer-prompt.md)" -> "Spec ✅ and quality approved?";
     "Spec ✅ and quality approved?" -> "Append completion to ledger, mark todo complete" [label="yes"];
     "Spec ✅ and quality approved?" -> "Finding conflicts with plan text?" [label="no"];

@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# Shared provisioning logic for the local-coder MCP server's Python venv.
+# Called by BOTH hooks/provision-local-coder (SessionStart pre-warm) and
+# hooks/launch-local-coder (at-launch, so a fresh install connects on the
+# first session without depending on SessionStart ordering).
+#
+# Extensionless (see docs/windows/polyglot-hooks.md). All diagnostics to
+# stderr; NEVER writes stdout (callers may have stdout contracts).
+#
+# Args:
+#   $1 = plugin root (dir containing mcp-servers/local-coder/requirements.txt)
+#   $2 = the plugin-data dir (${CLAUDE_PLUGIN_DATA}); the venv goes in
+#        $2/local-coder/.venv
+#
+# Idempotent: if the venv already exists AND matches requirements.txt, it
+# does nothing and returns 0 fast. Otherwise it creates/updates the venv.
+#
+# Exit code:
+#   0 = the venv is present and usable (either already, or freshly built)
+#   1 = the venv could not be made usable (no Python, venv/pip failure)
+# Callers decide how to treat a nonzero return (the SessionStart wrapper
+# swallows it and exits 0; the launcher treats it as fatal).
+set -uo pipefail
+
+PLUGIN_ROOT="${1:-}"
+PLUGIN_DATA="${2:-}"
+if [ -z "$PLUGIN_ROOT" ] || [ -z "$PLUGIN_DATA" ]; then
+    echo "[local-coder] ensure-venv: missing plugin-root (arg 1) or plugin-data (arg 2)" >&2
+    exit 1
+fi
+
+REQ="${PLUGIN_ROOT}/mcp-servers/local-coder/requirements.txt"
+DATA_DIR="${PLUGIN_DATA}/local-coder"
+VENV="${DATA_DIR}/.venv"
+STAMP="${DATA_DIR}/requirements.installed.txt"
+
+# Returns the venv's python path on stdout of a command-substitution, or
+# empty if not found. (Used only internally; not the script's own stdout.)
+# Only reports an interpreter that ACTUALLY RUNS and is >=3.10 — an
+# interrupted `venv` creation can leave an executable-but-broken python
+# behind, and treating that as usable made the fast path unrecoverable
+# (every later run skipped creation and then failed on pip).
+venv_python() {
+    local candidate=""
+    if [ -x "$VENV/bin/python" ]; then
+        candidate="$VENV/bin/python"
+    elif [ -x "$VENV/Scripts/python.exe" ]; then
+        candidate="$VENV/Scripts/python.exe"
+    fi
+    # Probe BOTH the interpreter version AND pip usability. An interrupted
+    # `venv` creation can leave a runnable python whose pip is missing or
+    # broken; version alone would classify that as usable, so the fast path
+    # would skip creation and then fail on every later `pip install`. Import
+    # pip (cheap, no network) so a pip-less tree is treated as broken and
+    # rebuilt below.
+    if [ -n "$candidate" ] && \
+       "$candidate" -c "import sys, pip; sys.exit(0 if sys.version_info >= (3,10) else 1)" >/dev/null 2>&1; then
+        printf '%s' "$candidate"
+    fi
+}
+
+# Fast path: venv present, usable, and up to date with requirements.txt.
+# Lock-free on purpose — the overwhelmingly common case is "already
+# provisioned", and it only reads.
+if [ -n "$(venv_python)" ] && [ -f "$STAMP" ] && cmp -s "$REQ" "$STAMP"; then
+    exit 0
+fi
+
+mkdir -p "$DATA_DIR"
+
+# NOTE: concurrent provisioning is deliberately NOT serialized here.
+#
+# A mkdir/PID-file lock was attempted during review and repeatedly produced
+# failures worse than the race it guarded: a live holder's lock could be
+# stolen while it was descheduled between mkdir and writing its PID, and a
+# lock whose PID was never written wedged provisioning permanently. Doing
+# this correctly needs a real OS locking primitive with verified ownership,
+# which is a design change rather than a patch — tracked as separate work.
+#
+# Without it, two sessions provisioning at the same instant on a fresh
+# install may both run pip. That is the behaviour this feature already had
+# when it was validated end-to-end, and the cost is a redundant install,
+# not a corrupt one: pip installs into the venv atomically enough that the
+# stamp (written only on success) still reflects a working environment.
+
+echo "[local-coder] provisioning venv (first run or requirements changed)..." >&2
+
+# If the venv already has a working interpreter, we only need to (re)install
+# dependencies — and we can do that with the venv's OWN python. Checking
+# this BEFORE searching PATH means a requirements change still succeeds on a
+# machine where python has since left PATH (e.g. a pyenv shim that only
+# resolves in an interactive shell).
+VENV_PY="$(venv_python)"
+
+if [ -z "$VENV_PY" ]; then
+    # Need to build (or rebuild) the venv, which requires a base interpreter.
+    # Find a Python >=3.10 that actually runs (skips the Windows Store stub,
+    # which exits nonzero on `-c ""`). No cygpath (per repo convention).
+    PYTHON=""
+    for candidate in "python3" "python" "py -3"; do
+        if $candidate -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" >/dev/null 2>&1; then
+            PYTHON="$candidate"
+            break
+        fi
+    done
+    if [ -z "$PYTHON" ]; then
+        echo "[local-coder] provisioning failed: no Python >=3.10 found on PATH" >&2
+        exit 1
+    fi
+
+    # A pre-existing $VENV here means it's present but BROKEN (venv_python
+    # validated it and found no working interpreter) — e.g. an interrupted
+    # creation, or a base python that was upgraded/removed underneath it.
+    # `python -m venv` cannot always repair such a tree in place, so remove
+    # it and rebuild; otherwise it stays broken forever.
+    if [ -e "$VENV" ]; then
+        echo "[local-coder] existing venv is unusable; rebuilding it" >&2
+        rm -rf "$VENV"
+    fi
+
+    if ! $PYTHON -m venv "$VENV" >&2; then
+        # Creation can fail simply because a concurrent provisioner created
+        # the venv in the moment between our check and this call. That is a
+        # benign collision, not a failure: if the venv is now usable, adopt
+        # it and carry on to the dependency install.
+        # Wait briefly for the interpreter to become usable — the winner may
+        # still be mid-`venv` creation. Adopting it then re-running pip is
+        # safe and idempotent: pip converges on the same requirements, and
+        # the stamp is written only after a successful install.
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            [ -n "$(venv_python)" ] && break
+            sleep 1
+        done
+        if [ -z "$(venv_python)" ]; then
+            echo "[local-coder] provisioning failed: could not create venv" >&2
+            rm -f "$STAMP"
+            exit 1
+        fi
+        echo "[local-coder] another process created the venv; using it" >&2
+        VENV_PY="$(venv_python)"
+    fi
+
+    VENV_PY="$(venv_python)"
+    if [ -z "$VENV_PY" ]; then
+        echo "[local-coder] provisioning failed: venv python not usable after venv creation" >&2
+        rm -f "$STAMP"
+        exit 1
+    fi
+fi
+
+# Install deps. Stamp only on success (so a failure retries next time).
+#
+# Retried, because two provisioners can install into the same venv at once
+# (see the note above on why this is not locked). Concurrent pips collide on
+# partially-written files in site-packages, and the loser fails — but the
+# collision is transient: by the retry, the winner has finished and pip
+# either has nothing left to do or completes cleanly. This is a far smaller
+# mechanism than an inter-process lock and cannot wedge or be stolen.
+PIP_OK=""
+for attempt in 1 2 3; do
+    if "$VENV_PY" -m pip install -r "$REQ" >&2; then
+        PIP_OK=1
+        break
+    fi
+    # Another provisioner may have completed the job while we were failing.
+    if [ -f "$STAMP" ] && cmp -s "$REQ" "$STAMP" && \
+       "$VENV_PY" -c "import fastmcp" >/dev/null 2>&1; then
+        echo "[local-coder] another process completed provisioning" >&2
+        exit 0
+    fi
+    if [ "$attempt" -lt 3 ]; then
+        echo "[local-coder] pip install failed (attempt $attempt); retrying..." >&2
+        sleep 2
+    fi
+done
+
+if [ -n "$PIP_OK" ]; then
+    # A failed stamp write must NOT report success: the venv would be
+    # correct but every later run would redo the whole install.
+    if ! cp "$REQ" "$STAMP"; then
+        echo "[local-coder] provisioning failed: could not write the requirements stamp" \
+             "to $STAMP (dependencies installed, but this would reinstall every launch)" >&2
+        rm -f "$STAMP"
+        exit 1
+    fi
+    echo "[local-coder] provisioning complete" >&2
+    exit 0
+fi
+
+echo "[local-coder] provisioning failed: pip install error" >&2
+rm -f "$STAMP"
+exit 1

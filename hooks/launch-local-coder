@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# MCP launch hook: ensure the local-coder venv exists, then exec the server
+# with the venv interpreter.
+#
+# It calls hooks/ensure-local-coder-venv FIRST (the same shared provisioner
+# the SessionStart hook uses), so a fresh install connects on the very first
+# session WITHOUT depending on the SessionStart provisioning hook having
+# finished — removing any startup-ordering race. If the venv already exists
+# and is current, ensure-local-coder-venv is a fast no-op.
+#
+# Extensionless (see docs/windows/polyglot-hooks.md); dispatched by
+# hooks/run-hook.cmd.
+#
+# Args:
+#   $1 = the plugin-data dir (${CLAUDE_PLUGIN_DATA}). Passed EXPLICITLY via
+#        .mcp.json's args (which Claude Code reliably substitutes) rather than
+#        read from the environment: Claude Code substitutes ${CLAUDE_PLUGIN_DATA}
+#        into the MCP server command's argv, but does NOT reliably export it as
+#        an env var to the server subprocess (confirmed in a real smoke test —
+#        the env-based approach failed to connect). If the arg is empty, fall
+#        back to the CLAUDE_PLUGIN_DATA env var (covers hook-test/dev callers).
+#   $2 = the absolute path to server.py.
+#
+# Unlike the provisioning hook, this does NOT silent-exit-0 on failure: an
+# MCP server that can't find its interpreter genuinely cannot run, so we
+# exit nonzero and let Claude Code surface it as a failed server rather than
+# a connected-but-dead one.
+set -uo pipefail
+
+DATA_DIR="${1:-}"
+if [ -z "$DATA_DIR" ]; then
+    DATA_DIR="${CLAUDE_PLUGIN_DATA:-}"
+fi
+if [ -z "$DATA_DIR" ]; then
+    echo "[local-coder] launch failed: no plugin-data dir (arg 1 was empty and" \
+         "CLAUDE_PLUGIN_DATA is unset)." >&2
+    exit 1
+fi
+
+# server.py resolves its persistent state (config.yaml, per-call logs) via
+# paths.plugin_data_dir(), which reads CLAUDE_PLUGIN_DATA from the
+# ENVIRONMENT. We were handed the data dir as argv precisely because that
+# var is not reliably present in an MCP subprocess — so export it here.
+# Without this, the server silently falls back to the in-tree directory
+# under ${CLAUDE_PLUGIN_ROOT}, which plugin updates wipe: exactly the
+# failure this feature exists to prevent.
+export CLAUDE_PLUGIN_DATA="$DATA_DIR"
+
+SERVER_PY="${2:-}"
+if [ -z "$SERVER_PY" ]; then
+    echo "[local-coder] launch failed: no server.py path argument (arg 2)" >&2
+    exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Ensure the venv is present + current before launching. This is what makes
+# a fresh install work on the first session regardless of SessionStart
+# ordering. A fast no-op when the venv is already up to date.
+#
+# A provisioning failure is FATAL. Previously this was `|| true`, which
+# meant that when requirements.txt changed and the pip install failed, the
+# stale interpreter still existed and got exec'd below — starting the
+# server against dependencies that no longer match requirements.txt. A
+# clear launch failure beats a server running on the wrong deps.
+if ! bash "${SCRIPT_DIR}/ensure-local-coder-venv" "$PLUGIN_ROOT" "$DATA_DIR" >&2; then
+    echo "[local-coder] launch failed: could not provision a current venv" \
+         "(see the provisioning output above)." >&2
+    exit 1
+fi
+
+VENV="$DATA_DIR/local-coder/.venv"
+if [ -x "$VENV/bin/python" ]; then
+    exec "$VENV/bin/python" "$SERVER_PY"
+elif [ -x "$VENV/Scripts/python.exe" ]; then
+    exec "$VENV/Scripts/python.exe" "$SERVER_PY"
+fi
+
+echo "[local-coder] launch failed: venv interpreter not found at $VENV even" \
+     "after attempting to provision it (check the provisioning output above)." >&2
+exit 1
