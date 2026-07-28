@@ -1205,8 +1205,10 @@ def test_prune_old_logs_is_best_effort(tmp_path, monkeypatch):
 
 
 async def test_delegate_prunes_logs_on_each_call(isolated_config, git_repo_no_remote, tmp_path, monkeypatch):
-    # A real delegation prunes old per-call logs down to the configured
-    # retention count (keeping room for the call's own fresh log).
+    # A real delegation prunes old per-call logs so the TOTAL after this call's
+    # own fresh log is written stays at the configured cap — not one over it.
+    # log_retention_count is the total-file cap: keep (count - 1) old logs and
+    # let the new one fill the last slot.
     base = tmp_path / "local-coder-output.log"
     monkeypatch.setattr(server, "OUTPUT_LOG_PATH", base)
     config_module.merge_config({"log_retention_count": 2})
@@ -1225,11 +1227,36 @@ async def test_delegate_prunes_logs_on_each_call(isolated_config, git_repo_no_re
             target_repo_path=str(git_repo_no_remote), ctx=None,
         )
     assert result["success"] is True
-    # After pruning to 2 + this call's own fresh log, the dir holds at most 3.
+    # Cap of 2 = 1 retained old log + this call's own fresh log. Exactly 2.
     remaining = list(tmp_path.glob("local-coder-output-*.log"))
-    assert len(remaining) <= 3, [p.name for p in remaining]
+    assert len(remaining) == 2, [p.name for p in remaining]
     # This call's own log must be among the survivors.
     assert Path(result["output_log"]).exists()
+
+
+async def test_delegate_survives_non_int_retention_in_config(
+    isolated_config, git_repo_no_remote, tmp_path, monkeypatch
+):
+    # configure() validates log_retention_count, but config.yaml can be
+    # hand-edited to a non-int (or non-positive) that would otherwise crash
+    # _prune_old_logs (a `<=`/slice against a str) and abort the delegation
+    # before the backend runs. The call site must coerce a bad value back to
+    # the default instead of raising.
+    base = tmp_path / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", base)
+    # Write a corrupt value straight to disk, bypassing configure()'s validation.
+    config_module.save_config({**config_module.load_config(), "log_retention_count": "fifty"})
+
+    def fake_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_backend):
+        result = await server._delegate_implementation_impl(
+            task="add a.py", branch="feature-branch",
+            target_repo_path=str(git_repo_no_remote), ctx=None,
+        )
+    # The delegation completes rather than crashing on the bad retention value.
+    assert result["success"] is True
 
 
 def test_output_log_path_lives_under_plugin_data_dir(tmp_path, monkeypatch):

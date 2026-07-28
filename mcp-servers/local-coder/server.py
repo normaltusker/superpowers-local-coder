@@ -159,12 +159,23 @@ async def _delegate_implementation_impl(
 
     cfg = config_module.load_config()
 
-    # Prune accumulated per-call logs from earlier calls down to the retention
-    # count, BEFORE this call's own log is touched below — so the fresh log is
-    # never a prune candidate. Absent/invalid config falls back to the shipped
-    # default (50). Best-effort; never aborts the call.
-    retention = cfg.get("log_retention_count") or 50
-    _prune_old_logs(retention)
+    # Prune accumulated per-call logs from earlier calls, BEFORE this call's
+    # own log is touched below — so the fresh log is never a prune candidate.
+    #
+    # `log_retention_count` is the total-file cap the user configured, so keep
+    # (retention - 1) OLD logs and let this call's about-to-be-created log fill
+    # the last slot: N old + 1 new == N total, matching the documented cap.
+    #
+    # configure() validates the value, but config.yaml can be hand-edited to a
+    # non-int (or non-positive) that would crash _prune_old_logs (a `<=`/slice
+    # against a str) and abort the delegation before the backend even runs.
+    # Coerce defensively here — anything that isn't a strictly-positive int
+    # falls back to the shipped default (50), matching the "invalid falls back
+    # to default" intent. Best-effort; never aborts the call.
+    raw_retention = cfg.get("log_retention_count")
+    if not isinstance(raw_retention, int) or isinstance(raw_retention, bool) or raw_retention <= 0:
+        raw_retention = 50
+    _prune_old_logs(max(raw_retention - 1, 0))
 
     repo_path = target_repo_path or cfg.get("target_repo_path")
     if not repo_path:

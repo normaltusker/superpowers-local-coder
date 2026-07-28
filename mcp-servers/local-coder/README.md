@@ -122,11 +122,15 @@ want the raw stream. Tailing it is a power-user convenience, not the
 normal way to follow a run.
 
 These per-call logs would otherwise accumulate one-per-call forever. On each
-delegation the server prunes the directory down to the `log_retention_count`
-most recent logs (default `50`) before writing the new one, so the log dir
-stays bounded. Set it via the `configure` tool (never hand-edit `config.yaml`);
-it must be a strictly-positive integer. Pruning is best-effort — a failure to
-delete an old log never affects the delegation.
+delegation the server prunes the directory so that this call's about-to-be-written
+log plus the retained older ones total no more than `log_retention_count`
+(default `50`) — i.e. it keeps the `log_retention_count - 1` most recent
+existing logs and lets the new one fill the last slot, so the directory stays
+bounded at the configured cap rather than one over it. Set it via the `configure`
+tool (never hand-edit `config.yaml`); it must be a strictly-positive integer. If
+`config.yaml` is nonetheless hand-edited to a non-integer or non-positive value,
+the server falls back to the default rather than failing the delegation. Pruning
+is best-effort — a failure to delete an old log never affects the delegation.
 
 ## Known issues
 
