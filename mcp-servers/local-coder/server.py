@@ -53,6 +53,22 @@ def _make_output_log_path() -> Path:
     )
 
 
+# Per-call logs whose delegation is still in flight IN THIS PROCESS. _prune_old_logs
+# never deletes a path in this set, so a call that is cold-loading quietly (its
+# log has a stale mtime because the backend hasn't emitted yet) is not pruned by
+# newer calls and then lazily recreated by its own on_output OUTSIDE the lock —
+# which would drift the on-disk count above the cap. Keyed by resolved str path;
+# entries are added under _config_lock (in _prune_and_create_output_log) and
+# removed in _delegate_implementation_impl's finally.
+#
+# Same-process scope only: this is the dominant case (the MCP server is one
+# long-lived process and concurrent delegations are concurrent async calls
+# within it). A log owned by a *different* process is still prunable — a rare
+# multi-instance-sharing-one-data-dir case that remains a transient bound, not
+# a leak (the owning call recreates its own log and the next prune re-levels).
+_ACTIVE_OUTPUT_LOGS: set[str] = set()
+
+
 def _coerce_retention(raw: object) -> int:
     """Return `raw` if it is a strictly-positive int (not a bool), else the
     shipped default (50). configure() validates the value, but config.yaml can
@@ -86,6 +102,10 @@ def _prune_and_create_output_log(path: Path, retention: int) -> None:
     """
     try:
         with config_module._config_lock():
+            # Mark this call's log active BEFORE pruning, so the prune in THIS
+            # critical section already treats it as non-prunable and a
+            # concurrent call entering the lock next sees it as live too.
+            _ACTIVE_OUTPUT_LOGS.add(str(path))
             _prune_old_logs(max(retention - 1, 0))
             # Create the empty per-call log NOW (still under the lock), before
             # it is announced. The path is otherwise only materialized on the
@@ -116,6 +136,12 @@ def _prune_old_logs(count: int) -> None:
     so it can never abort a real delegation. Only files matching the per-call
     naming pattern (`<stem>-*<suffix>`) are considered; the shared base log and
     unrelated files (config.yaml, the venv, etc.) are never touched.
+
+    Logs owned by a still-running delegation in this process (`_ACTIVE_OUTPUT_LOGS`)
+    are NEVER deleted, even if their mtime is old because the backend is
+    cold-loading quietly. Deleting one would let that call's on_output lazily
+    recreate it OUTSIDE the lock and drift the on-disk count above the cap. They
+    are also counted toward the keep budget so the total still respects `count`.
     """
     try:
         pattern = f"{OUTPUT_LOG_PATH.stem}-*{OUTPUT_LOG_PATH.suffix}"
@@ -131,9 +157,17 @@ def _prune_old_logs(count: int) -> None:
         except OSError:
             return 0.0  # unreadable → treat as oldest, prune first
 
-    # Newest first; everything past the keep-count is deleted.
-    candidates.sort(key=_mtime, reverse=True)
-    for stale in candidates[count:]:
+    # Never delete an in-flight call's log; it occupies a retained slot.
+    active = _ACTIVE_OUTPUT_LOGS
+    prunable = [p for p in candidates if str(p) not in active]
+    n_active = len(candidates) - len(prunable)
+
+    # Keep the newest prunable logs up to whatever budget remains after the
+    # active (always-kept) ones. If active alone already meets/exceeds `count`,
+    # delete every prunable log.
+    keep_prunable = max(count - n_active, 0)
+    prunable.sort(key=_mtime, reverse=True)  # newest first
+    for stale in prunable[keep_prunable:]:
         try:
             stale.unlink()
         except OSError:
@@ -243,297 +277,312 @@ async def _delegate_implementation_impl(
     # strict even when delegations overlap. Done here, after the early returns,
     # so a call that bails out early does no log housekeeping at all. The parent
     # dir is already ensured by plugin_data_dir().
-    _prune_and_create_output_log(output_log_path, retention)
+    #
+    # Offloaded to a worker thread: the helper takes a blocking cross-process
+    # file lock (fcntl.flock / msvcrt.locking) and does synchronous disk IO, so
+    # running it inline would stall the event loop under lock contention and
+    # delay unrelated tool work and progress notifications. Every other blocking
+    # op in this coroutine (backend run, git checks, push, PR) is offloaded the
+    # same way.
+    try:
+        await anyio.to_thread.run_sync(
+            _prune_and_create_output_log, output_log_path, retention
+        )
 
-    # Announce the per-call log path up front — before run_backend — so a
-    # human can start `tail -f`-ing it while the backend is still running.
-    # (The same path is also returned in the final result dict, but that
-    # only arrives after the whole call, including push/PR, has finished,
-    # which is too late for live tailing.) Best-effort: to stderr always,
-    # and via the progress channel when a Context is available. We're in
-    # the async body here (not a worker thread), so await report_progress
-    # directly rather than bridging through anyio.from_thread.
-    print(
-        f"[local-coder] streaming backend output to {output_log_path} "
-        "(tail -f it to follow live)",
-        file=sys.stderr, flush=True,
-    )
-    if ctx is not None:
-        # Best-effort: a progress-notification failure (dropped token,
-        # transport hiccup, client without progress support) must NOT abort
-        # the real implementation workflow before the backend even runs.
-        # Warn and continue.
-        try:
-            await ctx.report_progress(0, None, f"Output log: {output_log_path}")
-        except Exception as e:
-            print(
-                f"[local-coder] warning: failed to announce output log path: {e}",
-                file=sys.stderr, flush=True,
-            )
-
-    attempt_models = [cfg["model"], *cfg.get("fallback_models", [])]
-    attempt_errors = []
-    last_output_tail = ""
-
-    # Shared holders (one-element mutable cells both closures can see):
-    #   latest_line   — the most recent COMPLETE output line; on_tick reads
-    #                   it so the periodic progress pulse carries real
-    #                   backend output instead of a static heartbeat.
-    #   partial_line  — buffer for a chunk that ended mid-line (no line
-    #                   delimiter yet); carried across on_output calls so
-    #                   the pulse never shows an arbitrary partial suffix.
-    #                   Bounded to _PARTIAL_LINE_MAX_CHARS so a long
-    #                   delimiter-free stream can't grow it without bound.
-    #   log_write_ok  — flips False after the first log-write failure so we
-    #                   warn once and stop retrying (a persistent failure
-    #                   must not flood stderr every chunk and bury the live
-    #                   output it's meant to surface).
-    #   progress_ok   — same idea for the progress pulse: flips False after
-    #                   the first report_progress failure so a permanently
-    #                   dead channel (client gone, token invalidated) is
-    #                   warned once and then skipped for the rest of the run,
-    #                   instead of warning on every tick.
-    # latest_line + partial_line are RESET at the top of each failover
-    # attempt (see the loop below) so a fallback model's opening pulse
-    # can't relabel the previous model's last line as its own.
-    latest_line = [""]
-    partial_line = [""]
-    log_write_ok = [True]
-    progress_ok = [True]
-
-    def make_on_tick(model_name: str):
-        def on_tick():
-            line = latest_line[0]
-            pulse = f"{model_name}: {line}" if line else f"Running {model_name}..."
-            print(f"[local-coder] {pulse}", file=sys.stderr, flush=True)
-            if ctx is not None and progress_ok[0]:
-                # Best-effort progress: a failure here (dropped progress
-                # token, transport hiccup, client without progress support)
-                # must NOT propagate. run_monitored_subprocess kills the
-                # backend on ANY on_tick exception, and that kill is not a
-                # StallError — so AiderBackend.run_backend's working-tree
-                # restore would be skipped and the server's broad except
-                # would start the fallback model on top of partial, uncleaned
-                # edits. Warn and continue, exactly like the announce path.
-                # After the first failure, stop reporting (and stop warning):
-                # a permanently dead channel must not flood stderr with a
-                # warning on every tick for the rest of a long run. The stderr
-                # print above still carries the pulse regardless.
-                try:
-                    anyio.from_thread.run(
-                        ctx.report_progress, 0, None, pulse
-                    )
-                except Exception as e:
-                    progress_ok[0] = False
-                    print(
-                        f"[local-coder] warning: failed to report progress "
-                        f"pulse (disabling further progress reports for this "
-                        f"call): {e}",
-                        file=sys.stderr, flush=True,
-                    )
-        return on_tick
-
-    def make_on_output(model_name: str):
-        # Streams the backend subprocess's actual output as it arrives, to
-        # BOTH stderr and the per-call output_log_path, and records the
-        # latest complete line so the on_tick pulse above can surface it
-        # in-chat. Kept throttled to the tick cadence — the tick is what
-        # emits to report_progress; this callback only records.
-        def on_output(chunk: str) -> None:
-            line = f"[local-coder:{model_name}] {chunk}"
-            print(line, end="", file=sys.stderr, flush=True)
-            # The log file is a best-effort debugging convenience, not the
-            # primary channel (stderr above + the on_tick pulse are). A
-            # write failure here must NEVER propagate: run_monitored_subprocess
-            # kills the subprocess on any on_output exception, but only the
-            # StallError path in AiderBackend.run_backend runs the
-            # working-tree cleanup — so an unhandled exception would bypass
-            # cleanup and leave partial backend writes to pollute the next
-            # fallback attempt. So: write with explicit UTF-8 (the stream is
-            # already UTF-8-decoded upstream; the default encoding on a
-            # non-UTF-8 locale could otherwise raise UnicodeEncodeError,
-            # which is NOT an OSError), and catch broadly. After the first
-            # failure, stop retrying and warn only once — a persistent
-            # failure must not flood stderr on every chunk and bury the live
-            # output this is meant to surface.
-            if log_write_ok[0]:
-                try:
-                    with open(output_log_path, "a", encoding="utf-8", errors="replace") as f:
-                        f.write(chunk)
-                except Exception as e:
-                    log_write_ok[0] = False
-                    print(
-                        f"[local-coder] warning: failed to write output log "
-                        f"(disabling further log writes for this call): {e}",
-                        file=sys.stderr, flush=True,
-                    )
-            # on_output receives RAW read chunks, which can split mid-line.
-            # Prepend any buffered partial from the previous chunk, then
-            # promote only COMPLETE lines to latest_line; whatever follows
-            # the last delimiter is an incomplete line — buffer it (bounded)
-            # until a later chunk finishes it, so the pulse never shows an
-            # arbitrary chunk suffix. "\r" is treated as a delimiter too, so
-            # carriage-return progress output (aider/pip-style bars, which
-            # never send "\n") still updates the pulse and can't grow the
-            # buffer forever.
-            buffered = partial_line[0] + chunk
-            normalized = buffered.replace("\r\n", "\n").replace("\r", "\n")
-            if "\n" in normalized:
-                complete, _, remainder = normalized.rpartition("\n")
-                complete_lines = [ln for ln in complete.splitlines() if ln.strip()]
-                if complete_lines:
-                    latest_line[0] = complete_lines[-1].strip()
-            else:
-                remainder = normalized
-            # Bound the carried-over partial: keep only its tail, so a long
-            # delimiter-free stream can't exhaust memory.
-            partial_line[0] = remainder[-_PARTIAL_LINE_MAX_CHARS:]
-        return on_output
-
-    for model in attempt_models:
-        # Reset the per-attempt holders so this attempt starts clean:
-        #  - pulse holders, so this model's first tick (before it emits
-        #    anything) can't surface the PREVIOUS model's last line as its
-        #    own;
-        #  - log_write_ok, so a log-write failure during one model's attempt
-        #    doesn't permanently disable logging for the next fallback.
-        latest_line[0] = ""
-        partial_line[0] = ""
-        log_write_ok[0] = True
-        try:
-            result = await anyio.to_thread.run_sync(
-                lambda model=model: backend.run_backend(
-                    task, repo_path, branch, cfg, model=model,
-                    on_tick=make_on_tick(model), on_output=make_on_output(model),
+        # Announce the per-call log path up front — before run_backend — so a
+        # human can start `tail -f`-ing it while the backend is still running.
+        # (The same path is also returned in the final result dict, but that
+        # only arrives after the whole call, including push/PR, has finished,
+        # which is too late for live tailing.) Best-effort: to stderr always,
+        # and via the progress channel when a Context is available. We're in
+        # the async body here (not a worker thread), so await report_progress
+        # directly rather than bridging through anyio.from_thread.
+        print(
+            f"[local-coder] streaming backend output to {output_log_path} "
+            "(tail -f it to follow live)",
+            file=sys.stderr, flush=True,
+        )
+        if ctx is not None:
+            # Best-effort: a progress-notification failure (dropped token,
+            # transport hiccup, client without progress support) must NOT abort
+            # the real implementation workflow before the backend even runs.
+            # Warn and continue.
+            try:
+                await ctx.report_progress(0, None, f"Output log: {output_log_path}")
+            except Exception as e:
+                print(
+                    f"[local-coder] warning: failed to announce output log path: {e}",
+                    file=sys.stderr, flush=True,
                 )
-            )
-        except NotImplementedError as e:
-            return {"success": False, "error": str(e)}
-        except Exception as e:
-            # Any other unexpected exception from a backend attempt (e.g. an
-            # uncaught CalledProcessError from a backend's own git calls)
-            # shouldn't crash the whole tool call — treat it like a failed
-            # attempt and continue the failover loop to the next model.
-            attempt_errors.append(f"{model}: {e}")
-            continue
 
-        if result.success:
-            note = None
-            pr_url = None
-            has_remote = await anyio.to_thread.run_sync(_has_origin_remote, repo_path)
-            if has_remote:
-                try:
-                    push = await anyio.to_thread.run_sync(
-                        lambda: subprocess.run(
-                            ["git", "-C", repo_path, "push", "-u", "origin", branch],
-                            capture_output=True, text=True,
-                            timeout=NETWORK_SUBPROCESS_TIMEOUT_SECONDS,
-                        )
-                    )
-                except subprocess.TimeoutExpired:
-                    return {
-                        "success": False,
-                        "error": (
-                            f"git push timed out after {NETWORK_SUBPROCESS_TIMEOUT_SECONDS}s "
-                            "— the commit still exists locally on branch "
-                            f"{branch!r}, but was not pushed"
-                        ),
-                        "files_changed": result.files_changed,
-                        "commit_sha": result.commit_sha,
-                        "model_used": model,
-                        "output_tail": result.output_tail,
-                        "output_log": str(output_log_path),
-                    }
-                if push.returncode != 0:
-                    return {
-                        "success": False,
-                        "error": f"git push failed: {push.stderr.strip()}",
-                        "files_changed": result.files_changed,
-                        "commit_sha": result.commit_sha,
-                        "model_used": model,
-                        "output_tail": result.output_tail,
-                        "output_log": str(output_log_path),
-                    }
+        attempt_models = [cfg["model"], *cfg.get("fallback_models", [])]
+        attempt_errors = []
+        last_output_tail = ""
 
-                if cfg.get("open_pr"):
+        # Shared holders (one-element mutable cells both closures can see):
+        #   latest_line   — the most recent COMPLETE output line; on_tick reads
+        #                   it so the periodic progress pulse carries real
+        #                   backend output instead of a static heartbeat.
+        #   partial_line  — buffer for a chunk that ended mid-line (no line
+        #                   delimiter yet); carried across on_output calls so
+        #                   the pulse never shows an arbitrary partial suffix.
+        #                   Bounded to _PARTIAL_LINE_MAX_CHARS so a long
+        #                   delimiter-free stream can't grow it without bound.
+        #   log_write_ok  — flips False after the first log-write failure so we
+        #                   warn once and stop retrying (a persistent failure
+        #                   must not flood stderr every chunk and bury the live
+        #                   output it's meant to surface).
+        #   progress_ok   — same idea for the progress pulse: flips False after
+        #                   the first report_progress failure so a permanently
+        #                   dead channel (client gone, token invalidated) is
+        #                   warned once and then skipped for the rest of the run,
+        #                   instead of warning on every tick.
+        # latest_line + partial_line are RESET at the top of each failover
+        # attempt (see the loop below) so a fallback model's opening pulse
+        # can't relabel the previous model's last line as its own.
+        latest_line = [""]
+        partial_line = [""]
+        log_write_ok = [True]
+        progress_ok = [True]
+
+        def make_on_tick(model_name: str):
+            def on_tick():
+                line = latest_line[0]
+                pulse = f"{model_name}: {line}" if line else f"Running {model_name}..."
+                print(f"[local-coder] {pulse}", file=sys.stderr, flush=True)
+                if ctx is not None and progress_ok[0]:
+                    # Best-effort progress: a failure here (dropped progress
+                    # token, transport hiccup, client without progress support)
+                    # must NOT propagate. run_monitored_subprocess kills the
+                    # backend on ANY on_tick exception, and that kill is not a
+                    # StallError — so AiderBackend.run_backend's working-tree
+                    # restore would be skipped and the server's broad except
+                    # would start the fallback model on top of partial, uncleaned
+                    # edits. Warn and continue, exactly like the announce path.
+                    # After the first failure, stop reporting (and stop warning):
+                    # a permanently dead channel must not flood stderr with a
+                    # warning on every tick for the rest of a long run. The stderr
+                    # print above still carries the pulse regardless.
                     try:
-                        has_open_pr = await anyio.to_thread.run_sync(_has_open_pr, repo_path, branch)
-                    except GhPrStatusUnknown as e:
-                        # gh pr view failed for a reason other than "no PR" —
-                        # don't guess; skip PR creation rather than risk a
-                        # duplicate PR or mask a real `gh` problem.
-                        note = f"could not verify PR status, skipped PR creation: {e}"
-                        has_open_pr = True  # skip the create-PR branch below
-                    except subprocess.TimeoutExpired:
-                        note = (
-                            f"gh pr view timed out after {NETWORK_SUBPROCESS_TIMEOUT_SECONDS}s, "
-                            "skipped PR creation"
+                        anyio.from_thread.run(
+                            ctx.report_progress, 0, None, pulse
                         )
-                        has_open_pr = True  # skip the create-PR branch below
-                    except OSError as e:
-                        # `gh` not installed (FileNotFoundError) or otherwise
-                        # not launchable — the implementation was already
-                        # committed and pushed, so don't report failure for
-                        # landed work. Skip PR creation and note it.
-                        note = f"could not run `gh` to check PR status, skipped PR creation: {e}"
-                        has_open_pr = True  # skip the create-PR branch below
-                    if not has_open_pr:
-                        try:
-                            pr = await anyio.to_thread.run_sync(
-                                lambda: subprocess.run(
-                                    ["gh", "pr", "create", "--fill", "--head", branch,
-                                     "--base", cfg["pr_base_branch"]],
-                                    cwd=repo_path, capture_output=True, text=True,
-                                    timeout=NETWORK_SUBPROCESS_TIMEOUT_SECONDS,
-                                )
+                    except Exception as e:
+                        progress_ok[0] = False
+                        print(
+                            f"[local-coder] warning: failed to report progress "
+                            f"pulse (disabling further progress reports for this "
+                            f"call): {e}",
+                            file=sys.stderr, flush=True,
+                        )
+            return on_tick
+
+        def make_on_output(model_name: str):
+            # Streams the backend subprocess's actual output as it arrives, to
+            # BOTH stderr and the per-call output_log_path, and records the
+            # latest complete line so the on_tick pulse above can surface it
+            # in-chat. Kept throttled to the tick cadence — the tick is what
+            # emits to report_progress; this callback only records.
+            def on_output(chunk: str) -> None:
+                line = f"[local-coder:{model_name}] {chunk}"
+                print(line, end="", file=sys.stderr, flush=True)
+                # The log file is a best-effort debugging convenience, not the
+                # primary channel (stderr above + the on_tick pulse are). A
+                # write failure here must NEVER propagate: run_monitored_subprocess
+                # kills the subprocess on any on_output exception, but only the
+                # StallError path in AiderBackend.run_backend runs the
+                # working-tree cleanup — so an unhandled exception would bypass
+                # cleanup and leave partial backend writes to pollute the next
+                # fallback attempt. So: write with explicit UTF-8 (the stream is
+                # already UTF-8-decoded upstream; the default encoding on a
+                # non-UTF-8 locale could otherwise raise UnicodeEncodeError,
+                # which is NOT an OSError), and catch broadly. After the first
+                # failure, stop retrying and warn only once — a persistent
+                # failure must not flood stderr on every chunk and bury the live
+                # output this is meant to surface.
+                if log_write_ok[0]:
+                    try:
+                        with open(output_log_path, "a", encoding="utf-8", errors="replace") as f:
+                            f.write(chunk)
+                    except Exception as e:
+                        log_write_ok[0] = False
+                        print(
+                            f"[local-coder] warning: failed to write output log "
+                            f"(disabling further log writes for this call): {e}",
+                            file=sys.stderr, flush=True,
+                        )
+                # on_output receives RAW read chunks, which can split mid-line.
+                # Prepend any buffered partial from the previous chunk, then
+                # promote only COMPLETE lines to latest_line; whatever follows
+                # the last delimiter is an incomplete line — buffer it (bounded)
+                # until a later chunk finishes it, so the pulse never shows an
+                # arbitrary chunk suffix. "\r" is treated as a delimiter too, so
+                # carriage-return progress output (aider/pip-style bars, which
+                # never send "\n") still updates the pulse and can't grow the
+                # buffer forever.
+                buffered = partial_line[0] + chunk
+                normalized = buffered.replace("\r\n", "\n").replace("\r", "\n")
+                if "\n" in normalized:
+                    complete, _, remainder = normalized.rpartition("\n")
+                    complete_lines = [ln for ln in complete.splitlines() if ln.strip()]
+                    if complete_lines:
+                        latest_line[0] = complete_lines[-1].strip()
+                else:
+                    remainder = normalized
+                # Bound the carried-over partial: keep only its tail, so a long
+                # delimiter-free stream can't exhaust memory.
+                partial_line[0] = remainder[-_PARTIAL_LINE_MAX_CHARS:]
+            return on_output
+
+        for model in attempt_models:
+            # Reset the per-attempt holders so this attempt starts clean:
+            #  - pulse holders, so this model's first tick (before it emits
+            #    anything) can't surface the PREVIOUS model's last line as its
+            #    own;
+            #  - log_write_ok, so a log-write failure during one model's attempt
+            #    doesn't permanently disable logging for the next fallback.
+            latest_line[0] = ""
+            partial_line[0] = ""
+            log_write_ok[0] = True
+            try:
+                result = await anyio.to_thread.run_sync(
+                    lambda model=model: backend.run_backend(
+                        task, repo_path, branch, cfg, model=model,
+                        on_tick=make_on_tick(model), on_output=make_on_output(model),
+                    )
+                )
+            except NotImplementedError as e:
+                return {"success": False, "error": str(e)}
+            except Exception as e:
+                # Any other unexpected exception from a backend attempt (e.g. an
+                # uncaught CalledProcessError from a backend's own git calls)
+                # shouldn't crash the whole tool call — treat it like a failed
+                # attempt and continue the failover loop to the next model.
+                attempt_errors.append(f"{model}: {e}")
+                continue
+
+            if result.success:
+                note = None
+                pr_url = None
+                has_remote = await anyio.to_thread.run_sync(_has_origin_remote, repo_path)
+                if has_remote:
+                    try:
+                        push = await anyio.to_thread.run_sync(
+                            lambda: subprocess.run(
+                                ["git", "-C", repo_path, "push", "-u", "origin", branch],
+                                capture_output=True, text=True,
+                                timeout=NETWORK_SUBPROCESS_TIMEOUT_SECONDS,
                             )
+                        )
+                    except subprocess.TimeoutExpired:
+                        return {
+                            "success": False,
+                            "error": (
+                                f"git push timed out after {NETWORK_SUBPROCESS_TIMEOUT_SECONDS}s "
+                                "— the commit still exists locally on branch "
+                                f"{branch!r}, but was not pushed"
+                            ),
+                            "files_changed": result.files_changed,
+                            "commit_sha": result.commit_sha,
+                            "model_used": model,
+                            "output_tail": result.output_tail,
+                            "output_log": str(output_log_path),
+                        }
+                    if push.returncode != 0:
+                        return {
+                            "success": False,
+                            "error": f"git push failed: {push.stderr.strip()}",
+                            "files_changed": result.files_changed,
+                            "commit_sha": result.commit_sha,
+                            "model_used": model,
+                            "output_tail": result.output_tail,
+                            "output_log": str(output_log_path),
+                        }
+
+                    if cfg.get("open_pr"):
+                        try:
+                            has_open_pr = await anyio.to_thread.run_sync(_has_open_pr, repo_path, branch)
+                        except GhPrStatusUnknown as e:
+                            # gh pr view failed for a reason other than "no PR" —
+                            # don't guess; skip PR creation rather than risk a
+                            # duplicate PR or mask a real `gh` problem.
+                            note = f"could not verify PR status, skipped PR creation: {e}"
+                            has_open_pr = True  # skip the create-PR branch below
                         except subprocess.TimeoutExpired:
                             note = (
-                                f"PR creation was attempted and timed out after "
-                                f"{NETWORK_SUBPROCESS_TIMEOUT_SECONDS}s"
+                                f"gh pr view timed out after {NETWORK_SUBPROCESS_TIMEOUT_SECONDS}s, "
+                                "skipped PR creation"
                             )
+                            has_open_pr = True  # skip the create-PR branch below
                         except OSError as e:
-                            # `gh` not installed or not launchable at create
-                            # time — same as the view case: the work is already
-                            # committed and pushed, so keep success:true and
-                            # note that PR creation couldn't run.
-                            note = f"could not run `gh` to create PR: {e}"
-                        else:
-                            if pr.returncode == 0:
-                                pr_url = pr.stdout.strip()
+                            # `gh` not installed (FileNotFoundError) or otherwise
+                            # not launchable — the implementation was already
+                            # committed and pushed, so don't report failure for
+                            # landed work. Skip PR creation and note it.
+                            note = f"could not run `gh` to check PR status, skipped PR creation: {e}"
+                            has_open_pr = True  # skip the create-PR branch below
+                        if not has_open_pr:
+                            try:
+                                pr = await anyio.to_thread.run_sync(
+                                    lambda: subprocess.run(
+                                        ["gh", "pr", "create", "--fill", "--head", branch,
+                                         "--base", cfg["pr_base_branch"]],
+                                        cwd=repo_path, capture_output=True, text=True,
+                                        timeout=NETWORK_SUBPROCESS_TIMEOUT_SECONDS,
+                                    )
+                                )
+                            except subprocess.TimeoutExpired:
+                                note = (
+                                    f"PR creation was attempted and timed out after "
+                                    f"{NETWORK_SUBPROCESS_TIMEOUT_SECONDS}s"
+                                )
+                            except OSError as e:
+                                # `gh` not installed or not launchable at create
+                                # time — same as the view case: the work is already
+                                # committed and pushed, so keep success:true and
+                                # note that PR creation couldn't run.
+                                note = f"could not run `gh` to create PR: {e}"
                             else:
-                                # Don't silently report success with
-                                # pr_url=None indistinguishable from "PR
-                                # creation wasn't requested" — the local
-                                # implementation still succeeded and was
-                                # pushed, so this stays success:true, but
-                                # flag that PR creation was attempted and
-                                # failed.
-                                note = f"PR creation was attempted and failed: {pr.stderr.strip()}"
-            else:
-                note = "no origin remote configured; commit created locally, nothing pushed"
+                                if pr.returncode == 0:
+                                    pr_url = pr.stdout.strip()
+                                else:
+                                    # Don't silently report success with
+                                    # pr_url=None indistinguishable from "PR
+                                    # creation wasn't requested" — the local
+                                    # implementation still succeeded and was
+                                    # pushed, so this stays success:true, but
+                                    # flag that PR creation was attempted and
+                                    # failed.
+                                    note = f"PR creation was attempted and failed: {pr.stderr.strip()}"
+                else:
+                    note = "no origin remote configured; commit created locally, nothing pushed"
 
-            return {
-                "success": True,
-                "pr_url": pr_url,
-                "branch": branch,
-                "files_changed": result.files_changed,
-                "model_used": model,
-                "summary": f"Implemented via {backend_name} ({model})",
-                "output_tail": result.output_tail,
-                "output_log": str(output_log_path),
-                **({"note": note} if note else {}),
-            }
+                return {
+                    "success": True,
+                    "pr_url": pr_url,
+                    "branch": branch,
+                    "files_changed": result.files_changed,
+                    "model_used": model,
+                    "summary": f"Implemented via {backend_name} ({model})",
+                    "output_tail": result.output_tail,
+                    "output_log": str(output_log_path),
+                    **({"note": note} if note else {}),
+                }
 
-        attempt_errors.append(f"{model}: {result.error}")
-        last_output_tail = result.output_tail
+            attempt_errors.append(f"{model}: {result.error}")
+            last_output_tail = result.output_tail
 
-    return {
-        "success": False,
-        "error": "all models failed — " + "; ".join(attempt_errors),
-        "output_tail": last_output_tail,
-        "output_log": str(output_log_path),
-    }
+        return {
+            "success": False,
+            "error": "all models failed — " + "; ".join(attempt_errors),
+            "output_tail": last_output_tail,
+            "output_log": str(output_log_path),
+        }
+    finally:
+        # This call's log is no longer in flight — allow future prunes to
+        # reclaim it. discard() is idempotent, so a helper that never
+        # registered the path (lock/touch failed before add) is harmless.
+        _ACTIVE_OUTPUT_LOGS.discard(str(output_log_path))
 
 
 def _configure_impl(
