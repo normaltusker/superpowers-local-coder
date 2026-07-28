@@ -52,10 +52,35 @@ tool fails loudly. Docs: https://code.claude.com/docs/en/mcp.md#plugin-provided-
 
 2. **A reinstall RESETS `config.yaml`** in the plugin data dir (back to
    `qwen3-coder:30b`, `extra_backend_args: []`) — losing the scipy
-   workaround. **OPEN QUESTION worth a cheap check:** does an ordinary
-   `claude plugin update` also wipe it? PR #4 moved config to
-   `${CLAUDE_PLUGIN_DATA}` to survive UPDATES; if update wipes it too, that
-   work is undermined.
+   workaround. **RESOLVED — `claude plugin update` does NOT wipe it.**
+   Verified from the on-disk layout + the load path:
+   - Live config: `${CLAUDE_PLUGIN_DATA}/local-coder/config.yaml`, on disk at
+     `~/.claude/plugins/data/<marketplace>/local-coder/config.yaml` — the
+     path carries the MARKETPLACE name but **no version number**.
+   - Bundled default: `~/.claude/plugins/cache/<mp>/superpowers/<VERSION>/
+     mcp-servers/local-coder/config.yaml` — version-keyed, separate tree.
+   - `update` replaces the `cache/<version>/` tree (a new version dir); the
+     `data/` tree is untouched, so the live config persists. PR #4's design
+     holds.
+   - `load_config()` seeds from the default ONLY when `CONFIG_PATH` doesn't
+     exist (`config.py:113`); an existing live config is never overwritten by
+     the default. So the reset only happens on a full reinstall that clears
+     the marketplace `data/` dir (or a genuinely fresh install), NOT on
+     update.
+   - **Known limitation (not a bug):** a NEW config key shipped in a future
+     default (e.g. `log_retention_count`) will NOT be added to a pre-existing
+     user's live `config.yaml` on update — the default only seeds when the
+     file is absent. New defaults reach existing users via a
+     `.get(key) or <default>` fallback at read time, not via config.yaml.
+     Caveat: readers are MIXED — day-one keys are read by bracket
+     (`cfg["backend"]`, `cfg["model"]`, `cfg["pr_base_branch"]`,
+     `config["stall_timeout_seconds"]`, `config["idle_notify_interval_seconds"]`),
+     which KeyErrors on a missing key. That is safe only because those keys
+     have shipped in config.yaml since day one, so every existing file has
+     them. Any NEW key must be read with `.get(key)` (or an equivalent
+     runtime default) at each read site, or a pre-existing config that
+     predates the key will crash. `log_retention_count` already follows
+     this: it is read as `cfg.get("log_retention_count") or 50`.
 
 3. **Different sessions can use DIFFERENT data dirs** (`superpowers-inline`
    vs `superpowers-superpowers-dev`). Check the newest
@@ -221,12 +246,17 @@ From the MAIN REPO ROOT (where the plugin is enabled at project scope):
     announcing it.
 
 **Deferred (tracked, do NOT resolve without doing the work):**
-- Stall-tail retention — a stalled attempt returns `output_tail=""`;
-  retaining the captured tail through StallError is a real feature change,
-  scoped out of PR #3 (cubic thread `3636019858`).
-- Log-retention policy — per-call log files accumulate indefinitely; a
-  size/age/count policy is a design question, not a one-line fix (cubic
-  thread `3636207385`).
+- ~~Stall-tail retention~~ — **DONE** (branch `local-coder/stall-tail-retention`,
+  commit `1db1f3d`). StallError now carries the pre-kill `output_tail`;
+  aider surfaces it; server threads it to the MCP reply. 156 tests.
+- ~~Log-retention policy~~ — **DONE** (branch `local-coder/log-retention`,
+  commit `8747eba`). Keep-last-N pruning (`_prune_old_logs`), new
+  `log_retention_count` config knob (default 50), wired through `configure`.
+  159 tests.
+- ~~config-persistence question~~ — **RESOLVED** (see gotcha 2 above): `claude
+  plugin update` does NOT wipe `config.yaml`; the live config lives in the
+  version-independent `data/` dir, and `load_config` only seeds the default
+  when the file is absent.
 - Windows verification on real hardware (POSIX/Windows lock + venv path
   handling is written but unverified on Windows). Codex flagged two concrete
   Windows blockers here (both ours, both need a real Windows box to fix+test,
