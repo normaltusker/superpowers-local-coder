@@ -3,6 +3,7 @@ import os
 import re
 import selectors
 import subprocess
+import sys
 import time
 from typing import Callable
 
@@ -276,8 +277,13 @@ def restore_working_tree(repo_path: str, pre_head: str, pre_porcelain: set[str])
     tracked_modified = [p for p, code in new_paths.items() if code not in ("??", "!!")]
     untracked_or_ignored = [p for p, code in new_paths.items() if code in ("??", "!!")]
 
+    # Both calls stay best-effort (no check=True): a cleanup failure must not
+    # raise into the failover path that invoked us. But a silent failure here
+    # leaves the polluted tree for the next attempt with zero signal — the
+    # exact no-op this function exists to prevent — so surface stderr on a
+    # non-zero exit instead of discarding it.
     if tracked_modified:
-        subprocess.run(
+        restored = subprocess.run(
             [
                 "git", "-C", repo_path, "restore",
                 f"--source={pre_head}", "--staged", "--worktree", "--",
@@ -286,12 +292,26 @@ def restore_working_tree(repo_path: str, pre_head: str, pre_porcelain: set[str])
             cwd=repo_path, capture_output=True,
             env={**os.environ, **_LITERAL_PATHSPECS_ENV},
         )
+        if restored.returncode != 0:
+            print(
+                f"[local-coder] cleanup: git restore failed "
+                f"(rc={restored.returncode}): "
+                f"{restored.stderr.decode(errors='replace').strip()}",
+                file=sys.stderr, flush=True,
+            )
     if untracked_or_ignored:
-        subprocess.run(
+        cleaned = subprocess.run(
             ["git", "-C", repo_path, "clean", "-fdx", "--", *untracked_or_ignored],
             cwd=repo_path, capture_output=True,
             env={**os.environ, **_LITERAL_PATHSPECS_ENV},
         )
+        if cleaned.returncode != 0:
+            print(
+                f"[local-coder] cleanup: git clean failed "
+                f"(rc={cleaned.returncode}): "
+                f"{cleaned.stderr.decode(errors='replace').strip()}",
+                file=sys.stderr, flush=True,
+            )
 
 
 _READ_CHUNK_SIZE = 4096

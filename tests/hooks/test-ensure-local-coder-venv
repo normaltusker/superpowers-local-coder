@@ -11,6 +11,15 @@ trap 'rm -rf "$TEST_ROOT"' EXIT
 pass() { echo "  [PASS] $1"; }
 fail() { echo "  [FAIL] $1"; FAILURES=$((FAILURES + 1)); }
 
+# Resolve the venv interpreter for either layout: POSIX (bin/python) or
+# Windows/Git Bash (Scripts/python.exe). Prints the path, or nothing if
+# neither exists (callers treat empty as "no interpreter" and fail).
+venv_py() {
+    if [ -x "$1/bin/python" ]; then printf '%s' "$1/bin/python"
+    elif [ -x "$1/Scripts/python.exe" ]; then printf '%s' "$1/Scripts/python.exe"
+    fi
+}
+
 # ensure-local-coder-venv <plugin_root> <plugin_data>
 # Returns 0 when the venv is present+usable, 1 when it couldn't be made.
 
@@ -87,7 +96,8 @@ if bash "$ENSURE" "$REPO_ROOT" "$DATA5" >/dev/null 2>&1; then
 else
     fail "rebuilds a broken venv instead of trusting the stamp"
 fi
-if "$DATA5/local-coder/.venv/bin/python" -c "import sys" >/dev/null 2>&1; then
+PY5="$(venv_py "$DATA5/local-coder/.venv")"
+if [ -n "$PY5" ] && "$PY5" -c "import sys" >/dev/null 2>&1; then
     pass "the rebuilt venv python actually runs"
 else
     fail "the rebuilt venv python actually runs"
@@ -108,7 +118,8 @@ if [ "$RC1" -eq 0 ] && [ "$RC2" -eq 0 ]; then
 else
     fail "concurrent provisioning runs both succeed (rc1=$RC1 rc2=$RC2)"
 fi
-if "$DATA6/local-coder/.venv/bin/python" -c "import fastmcp" >/dev/null 2>&1; then
+PY6="$(venv_py "$DATA6/local-coder/.venv")"
+if [ -n "$PY6" ] && "$PY6" -c "import fastmcp" >/dev/null 2>&1; then
     pass "concurrent provisioning leaves a working venv"
 else
     fail "concurrent provisioning leaves a working venv"

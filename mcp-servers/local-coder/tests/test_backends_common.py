@@ -1,4 +1,5 @@
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -425,11 +426,31 @@ def test_run_monitored_subprocess_isolates_child_stdin():
         # Parent: keep the write end open (no EOF ever sent) until the
         # child is done, then read back what happened.
         os.close(read_fd)
-        os.waitpid(child_pid, 0)
-        os.close(write_fd)
-        with open(OUTCOME_PATH) as f:
-            outcome = f.read()
-        os.unlink(OUTCOME_PATH)
+        try:
+            # Bounded wait: if the child regresses and hangs (the exact bug
+            # under test), a plain os.waitpid(pid, 0) would hang CI forever
+            # instead of failing. Poll with a deadline and SIGKILL past it so
+            # the assertion below runs and reports the failure.
+            deadline = time.monotonic() + 30
+            while True:
+                reaped, _ = os.waitpid(child_pid, os.WNOHANG)
+                if reaped:
+                    break
+                if time.monotonic() > deadline:
+                    os.kill(child_pid, signal.SIGKILL)
+                    os.waitpid(child_pid, 0)
+                    break
+                time.sleep(0.02)
+            os.close(write_fd)
+            with open(OUTCOME_PATH) as f:
+                outcome = f.read()
+        finally:
+            # Always remove the temp file, even if the read above raises,
+            # so a failing run doesn't leak it.
+            try:
+                os.unlink(OUTCOME_PATH)
+            except FileNotFoundError:
+                pass
 
     assert outcome.startswith("OK:0:"), (
         f"expected the grandchild to see EOF on stdin and exit cleanly, "
