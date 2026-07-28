@@ -126,11 +126,15 @@ delegation the server prunes the directory so that this call's about-to-be-writt
 log plus the retained older ones total no more than `log_retention_count`
 (default `50`) — i.e. it keeps the `log_retention_count - 1` most recent
 existing logs and lets the new one fill the last slot, so the directory stays
-bounded at the configured cap rather than one over it. Set it via the `configure`
-tool (never hand-edit `config.yaml`); it must be a strictly-positive integer. If
-`config.yaml` is nonetheless hand-edited to a non-integer or non-positive value,
-the server falls back to the default rather than failing the delegation. Pruning
-is best-effort — a failure to delete an old log never affects the delegation.
+bounded at the configured cap rather than one over it. The prune and the new
+log's creation run as one step under the same cross-process lock `configure`
+uses, so the cap holds strictly even when several delegations overlap — two
+concurrent calls cannot each prune-then-create and momentarily leave one log
+over the cap. Set it via the `configure` tool (never hand-edit `config.yaml`);
+it must be a strictly-positive integer. If `config.yaml` is nonetheless
+hand-edited to a non-integer or non-positive value, the server falls back to
+the default rather than failing the delegation. Pruning is best-effort — a
+failure to delete an old log never affects the delegation.
 
 ## Known issues
 

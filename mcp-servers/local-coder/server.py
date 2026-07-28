@@ -53,6 +53,59 @@ def _make_output_log_path() -> Path:
     )
 
 
+def _coerce_retention(raw: object) -> int:
+    """Return `raw` if it is a strictly-positive int (not a bool), else the
+    shipped default (50). configure() validates the value, but config.yaml can
+    be hand-edited to a non-int or non-positive that would otherwise crash
+    _prune_old_logs (a `<=`/slice against a str) and abort the delegation
+    before the backend even runs. Coerce defensively — matching the "invalid
+    falls back to default" intent."""
+    if not isinstance(raw, int) or isinstance(raw, bool) or raw <= 0:
+        return 50
+    return raw
+
+
+def _prune_and_create_output_log(path: Path, retention: int) -> None:
+    """Prune old per-call logs and create this call's own fresh log as one
+    atomic step, so the configured cap holds even when delegations overlap.
+
+    `retention` is the total-file cap the user configured. Keep (retention - 1)
+    OLD logs and let `path` (this call's about-to-be-created log) fill the last
+    slot: N old + 1 new == N total, matching the documented cap.
+
+    The prune and the create are serialized under the same cross-process file
+    lock configure() uses (config_module._config_lock), so two delegations
+    running at once cannot each prune-to-(N-1) and then each create, which
+    would leave N+1 on disk. Whichever call holds the lock prunes and creates
+    before the other observes the directory, so the cap is strict — not merely
+    a steady-state bound that overlapping calls could transiently exceed.
+
+    Best-effort: a failure to acquire the lock or to touch the file must never
+    abort the delegation (on_output re-creates the file lazily). Only the touch
+    is guarded here; _prune_old_logs guards its own failures internally.
+    """
+    try:
+        with config_module._config_lock():
+            _prune_old_logs(max(retention - 1, 0))
+            # Create the empty per-call log NOW (still under the lock), before
+            # it is announced. The path is otherwise only materialized on the
+            # backend's first on_output write — but during a cold load (exactly
+            # when live observation matters most) the backend produces no output
+            # for a long time, so a human who runs the announced `tail -f` would
+            # hit "no such file" and the tail would exit immediately. Touch it
+            # first so `tail -f` attaches and waits.
+            path.touch(exist_ok=True)
+    except OSError as e:
+        # A lock or touch failure is non-fatal: on_output still creates the
+        # file lazily and guards its own write failures. The pruning that did
+        # or didn't happen is pure housekeeping and never blocks the workflow.
+        print(
+            f"[local-coder] warning: could not prune/pre-create output log "
+            f"{path}: {e}",
+            file=sys.stderr, flush=True,
+        )
+
+
 def _prune_old_logs(count: int) -> None:
     """Keep only the `count` most recently modified per-call log files in the
     log directory, deleting older ones. Per-call logs otherwise accumulate
@@ -158,24 +211,7 @@ async def _delegate_implementation_impl(
         return {"success": False, "error": str(e)}
 
     cfg = config_module.load_config()
-
-    # Prune accumulated per-call logs from earlier calls, BEFORE this call's
-    # own log is touched below — so the fresh log is never a prune candidate.
-    #
-    # `log_retention_count` is the total-file cap the user configured, so keep
-    # (retention - 1) OLD logs and let this call's about-to-be-created log fill
-    # the last slot: N old + 1 new == N total, matching the documented cap.
-    #
-    # configure() validates the value, but config.yaml can be hand-edited to a
-    # non-int (or non-positive) that would crash _prune_old_logs (a `<=`/slice
-    # against a str) and abort the delegation before the backend even runs.
-    # Coerce defensively here — anything that isn't a strictly-positive int
-    # falls back to the shipped default (50), matching the "invalid falls back
-    # to default" intent. Best-effort; never aborts the call.
-    raw_retention = cfg.get("log_retention_count")
-    if not isinstance(raw_retention, int) or isinstance(raw_retention, bool) or raw_retention <= 0:
-        raw_retention = 50
-    _prune_old_logs(max(raw_retention - 1, 0))
+    retention = _coerce_retention(cfg.get("log_retention_count"))
 
     repo_path = target_repo_path or cfg.get("target_repo_path")
     if not repo_path:
@@ -200,23 +236,14 @@ async def _delegate_implementation_impl(
         return {"success": False, "error": f"unknown backend: {backend_name}"}
     backend = backend_cls()
 
-    # Create the empty per-call log NOW, before announcing it. The path is
-    # otherwise only materialized on the backend's first on_output write —
-    # but during a cold load (exactly when live observation matters most) the
-    # backend produces no output for a long time, so a human who runs the
-    # announced `tail -f` would hit "no such file" and the tail would exit
-    # immediately. Touch it first so `tail -f` attaches and waits. Best-effort:
-    # a failure here must not abort the workflow — on_output still creates the
-    # file lazily, and it guards its own write failures. The parent dir is
-    # already ensured by plugin_data_dir(), so only the file is touched here.
-    try:
-        output_log_path.touch(exist_ok=True)
-    except OSError as e:
-        print(
-            f"[local-coder] warning: could not pre-create output log "
-            f"{output_log_path}: {e}",
-            file=sys.stderr, flush=True,
-        )
+    # Prune accumulated per-call logs from earlier calls and create this call's
+    # own fresh log as one atomic, lock-guarded step (see the helper): pruning
+    # to (retention - 1) then adding this log keeps the total at the configured
+    # cap, and serializing the two under a cross-process lock keeps that cap
+    # strict even when delegations overlap. Done here, after the early returns,
+    # so a call that bails out early does no log housekeeping at all. The parent
+    # dir is already ensured by plugin_data_dir().
+    _prune_and_create_output_log(output_log_path, retention)
 
     # Announce the per-call log path up front — before run_backend — so a
     # human can start `tail -f`-ing it while the backend is still running.

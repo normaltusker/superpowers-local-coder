@@ -1,3 +1,4 @@
+import contextlib
 import os
 import subprocess
 import shutil
@@ -1202,6 +1203,81 @@ def test_prune_old_logs_is_best_effort(tmp_path, monkeypatch):
     # Make unlink raise; _prune_old_logs must swallow it and not propagate.
     with patch.object(Path, "unlink", side_effect=OSError("boom")):
         server._prune_old_logs(count=1)  # must not raise
+
+
+def test_coerce_retention_falls_back_on_bad_values():
+    # Strictly-positive ints pass through; everything else becomes the default.
+    assert server._coerce_retention(25) == 25
+    assert server._coerce_retention(1) == 1
+    # Non-int, non-positive, and bool (a bool IS an int subclass) all fall back.
+    assert server._coerce_retention("fifty") == 50
+    assert server._coerce_retention(0) == 50
+    assert server._coerce_retention(-3) == 50
+    assert server._coerce_retention(None) == 50
+    assert server._coerce_retention(2.5) == 50
+    assert server._coerce_retention(True) == 50
+
+
+def test_prune_and_create_output_log_is_atomic_under_lock(isolated_config, tmp_path, monkeypatch):
+    # The prune+create sequence must run inside config_module._config_lock so
+    # two overlapping delegations cannot each prune-to-(N-1) then each create,
+    # leaving N+1 on disk. Assert the helper (a) holds the lock across BOTH the
+    # prune and the touch, and (b) leaves exactly `retention` logs on disk.
+    base = tmp_path / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", base)
+    # Seed 5 stale per-call logs (ascending mtime).
+    for i in range(5):
+        p = tmp_path / f"local-coder-output-stale{i}.log"
+        p.write_text("old\n")
+        os.utime(p, (1000 + i, 1000 + i))
+
+    events = []
+    real_lock = config_module._config_lock
+
+    @contextlib.contextmanager
+    def tracking_lock():
+        events.append("lock-acquire")
+        with real_lock():
+            yield
+        events.append("lock-release")
+
+    real_prune = server._prune_old_logs
+
+    def tracking_prune(count):
+        events.append("prune")
+        return real_prune(count)
+
+    real_touch = Path.touch
+
+    def tracking_touch(self, *a, **k):
+        if self == new_log:
+            events.append("touch")
+        return real_touch(self, *a, **k)
+
+    new_log = server._make_output_log_path()
+    with patch.object(config_module, "_config_lock", tracking_lock), \
+         patch.object(server, "_prune_old_logs", tracking_prune), \
+         patch.object(Path, "touch", tracking_touch):
+        server._prune_and_create_output_log(new_log, retention=3)
+
+    # Both prune and touch happened strictly between acquire and release.
+    assert events == ["lock-acquire", "prune", "touch", "lock-release"], events
+    # Cap of 3 = 2 retained old logs + this call's fresh log. Exactly 3.
+    remaining = list(tmp_path.glob("local-coder-output-*.log"))
+    assert len(remaining) == 3, [p.name for p in remaining]
+    assert new_log.exists()
+
+
+def test_prune_and_create_output_log_is_best_effort_on_touch_failure(
+    isolated_config, tmp_path, monkeypatch
+):
+    # A touch (or lock) failure must never abort the delegation — on_output
+    # re-creates the file lazily. The helper swallows OSError and returns.
+    base = tmp_path / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", base)
+    new_log = server._make_output_log_path()
+    with patch.object(Path, "touch", side_effect=OSError("boom")):
+        server._prune_and_create_output_log(new_log, retention=3)  # must not raise
 
 
 async def test_delegate_prunes_logs_on_each_call(isolated_config, git_repo_no_remote, tmp_path, monkeypatch):
