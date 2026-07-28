@@ -121,6 +121,28 @@ you can start `tail -f`-ing it while the run is still in progress if you
 want the raw stream. Tailing it is a power-user convenience, not the
 normal way to follow a run.
 
+These per-call logs would otherwise accumulate one-per-call forever. On each
+delegation the server prunes the directory so that this call's about-to-be-written
+log plus the retained older ones total no more than `log_retention_count`
+(default `50`) — i.e. it keeps the `log_retention_count - 1` most recent
+existing logs and lets the new one fill the last slot, so the directory stays
+bounded at the configured cap rather than one over it. The prune and the new
+log's creation run as one step under the same cross-process lock `configure`
+uses, so the cap holds strictly even when several delegations overlap — two
+concurrent calls cannot each prune-then-create and momentarily leave one log
+over the cap. A log whose delegation is still running is never pruned, even
+while it sits quiet during a cold load with a stale modification time, so it
+is not deleted out from under a live call and then lazily recreated over the
+cap. (That protection is per-process; a rare setup where several separate
+Claude Code processes share one plugin-data dir can still drift transiently,
+never leaking.) The whole prune-and-create step runs on a worker thread so its
+blocking file lock never stalls the server's event loop. Set the cap via the
+`configure` tool (never hand-edit `config.yaml`); it must be a strictly-positive
+integer. If `config.yaml` is nonetheless hand-edited to a non-integer or
+non-positive value, the server falls back to the default rather than failing
+the delegation. Pruning is best-effort — a failure to delete an old log never
+affects the delegation.
+
 ## Known issues
 
 ### Aider crashes importing scipy on macOS 26+ (repo-map)

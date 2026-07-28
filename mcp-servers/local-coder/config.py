@@ -200,6 +200,9 @@ def _configure_with_validation_locked(overrides: dict) -> dict:
     first_output_timeout_seconds = overrides.get(
         "first_output_timeout_seconds", current.get("first_output_timeout_seconds")
     )
+    log_retention_count = overrides.get(
+        "log_retention_count", current.get("log_retention_count")
+    )
 
     # A zero or negative stall_timeout_seconds would kill every backend
     # attempt near-instantly; a zero or negative idle_notify_interval_seconds
@@ -224,6 +227,18 @@ def _configure_with_validation_locked(overrides: dict) -> dict:
         raise ConfigValidationError(
             "first_output_timeout_seconds must be strictly positive, got "
             f"{first_output_timeout_seconds!r}"
+        )
+    # log_retention_count bounds how many per-call log files are kept; a zero
+    # or negative value would delete every log (including the current call's)
+    # or make pruning meaningless. Require a strictly-positive integer.
+    if log_retention_count is not None and (
+        not isinstance(log_retention_count, int)
+        or isinstance(log_retention_count, bool)
+        or log_retention_count <= 0
+    ):
+        raise ConfigValidationError(
+            "log_retention_count must be a strictly positive integer, got "
+            f"{log_retention_count!r}"
         )
 
     # Reject an unrecognized backend name immediately at config-write time

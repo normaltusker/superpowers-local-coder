@@ -1,3 +1,5 @@
+import contextlib
+import os
 import subprocess
 import shutil
 from pathlib import Path
@@ -924,6 +926,13 @@ def test_configure_persists_first_output_timeout_seconds(isolated_config):
     assert result["first_output_timeout_seconds"] == 900
 
 
+def test_configure_persists_log_retention_count(isolated_config):
+    # Log retention must be settable through the configure MCP tool (users are
+    # told never to hand-edit config.yaml), not just present in config.py.
+    result = server._configure_impl(log_retention_count=25)
+    assert result["log_retention_count"] == 25
+
+
 def test_configure_rejects_invalid_model_with_clean_error(isolated_config):
     with patch("ollama.list_ollama_models", return_value=[]):
         result = server._configure_impl(model="ollama/nonexistent:1b")
@@ -1169,6 +1178,254 @@ async def test_per_call_log_exists_after_announce_before_output(
         "per-call log file must exist after announce and before any backend "
         "output, so a cold-load `tail -f` doesn't exit on a missing file"
     )
+
+
+def test_prune_old_logs_keeps_only_newest_n(tmp_path, monkeypatch):
+    # Per-call log files otherwise accumulate forever. _prune_old_logs keeps
+    # the N most recently modified per-call logs and deletes the rest, so the
+    # log dir stays bounded. Only files matching the per-call naming pattern
+    # are touched — unrelated files in the dir must survive.
+    base = tmp_path / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", base)
+
+    # Create 6 per-call logs with staggered mtimes (oldest first).
+    import time as _time
+    made = []
+    for i in range(6):
+        p = tmp_path / f"local-coder-output-{i:03d}.log"
+        p.write_text(f"log {i}\n")
+        os.utime(p, (1000 + i, 1000 + i))  # ascending mtime; i=5 is newest
+        made.append(p)
+    # An unrelated file that must NOT be pruned.
+    unrelated = tmp_path / "config.yaml"
+    unrelated.write_text("keep me\n")
+
+    server._prune_old_logs(count=3)
+
+    survivors = sorted(p.name for p in tmp_path.glob("local-coder-output-*.log"))
+    # Newest 3 (indices 3,4,5) kept; oldest 3 (0,1,2) deleted.
+    assert survivors == ["local-coder-output-003.log",
+                         "local-coder-output-004.log",
+                         "local-coder-output-005.log"]
+    assert unrelated.exists()
+
+
+def test_prune_old_logs_is_best_effort(tmp_path, monkeypatch):
+    # A prune failure (permission error, race with another call deleting the
+    # same file) must never abort the delegation — pruning is housekeeping,
+    # not part of the real workflow.
+    base = tmp_path / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", base)
+    for i in range(4):
+        (tmp_path / f"local-coder-output-{i:03d}.log").write_text("x\n")
+
+    # Make unlink raise; _prune_old_logs must swallow it and not propagate.
+    with patch.object(Path, "unlink", side_effect=OSError("boom")):
+        server._prune_old_logs(count=1)  # must not raise
+
+
+def test_prune_old_logs_never_deletes_in_flight_log(tmp_path, monkeypatch):
+    # A log owned by a still-running delegation (registered in _ACTIVE_OUTPUT_LOGS)
+    # must NOT be pruned even if its mtime is the oldest — a cold-loading call
+    # that hasn't emitted yet has a stale mtime, and deleting it would let its
+    # on_output lazily recreate it outside the lock and drift over the cap.
+    base = tmp_path / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", base)
+    # 4 logs; the OLDEST is the in-flight one.
+    made = []
+    for i in range(4):
+        p = tmp_path / f"local-coder-output-{i:03d}.log"
+        p.write_text("x\n")
+        os.utime(p, (1000 + i, 1000 + i))  # index 0 oldest
+        made.append(p)
+    in_flight = made[0]  # oldest → would normally be pruned first
+    monkeypatch.setattr(server, "_ACTIVE_OUTPUT_LOGS", {str(in_flight)})
+
+    server._prune_old_logs(count=2)
+
+    survivors = {p.name for p in tmp_path.glob("local-coder-output-*.log")}
+    # in-flight (oldest) is kept; it occupies a slot, so with count=2 exactly one
+    # OTHER (the newest) survives alongside it. Total survivors == 2.
+    assert in_flight.name in survivors
+    assert len(survivors) == 2, survivors
+    assert made[3].name in survivors  # newest prunable kept
+
+
+def test_prune_old_logs_deletes_all_prunable_when_active_fills_budget(tmp_path, monkeypatch):
+    # If the in-flight (always-kept) logs already meet the keep budget, every
+    # prunable log is deleted — active logs must not be double-counted into a
+    # larger total than the cap allows.
+    base = tmp_path / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", base)
+    active = []
+    for i in range(2):
+        p = tmp_path / f"local-coder-output-active{i}.log"
+        p.write_text("x\n"); active.append(p)
+    for i in range(3):
+        (tmp_path / f"local-coder-output-old{i}.log").write_text("x\n")
+    monkeypatch.setattr(server, "_ACTIVE_OUTPUT_LOGS", {str(p) for p in active})
+
+    server._prune_old_logs(count=2)  # budget == number of active logs
+
+    survivors = {p.name for p in tmp_path.glob("local-coder-output-*.log")}
+    assert survivors == {p.name for p in active}, survivors
+
+
+async def test_delegate_deregisters_in_flight_log_on_completion(
+    isolated_config, git_repo_no_remote, tmp_path, monkeypatch
+):
+    # After a delegation finishes, its log must be removed from the in-flight
+    # set so future prunes can reclaim it — otherwise the set grows forever and
+    # finished logs are never pruned.
+    base = tmp_path / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", base)
+    monkeypatch.setattr(server, "_ACTIVE_OUTPUT_LOGS", set())
+
+    def fake_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+        # While the backend runs, this call's log IS registered as in-flight.
+        assert len(server._ACTIVE_OUTPUT_LOGS) == 1
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_backend):
+        result = await server._delegate_implementation_impl(
+            task="add a.py", branch="feature-branch",
+            target_repo_path=str(git_repo_no_remote), ctx=None,
+        )
+    assert result["success"] is True
+    # Deregistered on completion.
+    assert server._ACTIVE_OUTPUT_LOGS == set()
+
+
+def test_coerce_retention_falls_back_on_bad_values():
+    # Strictly-positive ints pass through; everything else becomes the default.
+    assert server._coerce_retention(25) == 25
+    assert server._coerce_retention(1) == 1
+    # Non-int, non-positive, and bool (a bool IS an int subclass) all fall back.
+    assert server._coerce_retention("fifty") == 50
+    assert server._coerce_retention(0) == 50
+    assert server._coerce_retention(-3) == 50
+    assert server._coerce_retention(None) == 50
+    assert server._coerce_retention(2.5) == 50
+    assert server._coerce_retention(True) == 50
+
+
+def test_prune_and_create_output_log_is_atomic_under_lock(isolated_config, tmp_path, monkeypatch):
+    # The prune+create sequence must run inside config_module._config_lock so
+    # two overlapping delegations cannot each prune-to-(N-1) then each create,
+    # leaving N+1 on disk. Assert the helper (a) holds the lock across BOTH the
+    # prune and the touch, and (b) leaves exactly `retention` logs on disk.
+    base = tmp_path / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", base)
+    monkeypatch.setattr(server, "_ACTIVE_OUTPUT_LOGS", set())
+    # Seed 5 stale per-call logs (ascending mtime).
+    for i in range(5):
+        p = tmp_path / f"local-coder-output-stale{i}.log"
+        p.write_text("old\n")
+        os.utime(p, (1000 + i, 1000 + i))
+
+    events = []
+    real_lock = config_module._config_lock
+
+    @contextlib.contextmanager
+    def tracking_lock():
+        events.append("lock-acquire")
+        with real_lock():
+            yield
+        events.append("lock-release")
+
+    real_prune = server._prune_old_logs
+
+    def tracking_prune(count):
+        events.append("prune")
+        return real_prune(count)
+
+    real_touch = Path.touch
+
+    def tracking_touch(self, *a, **k):
+        if self == new_log:
+            events.append("touch")
+        return real_touch(self, *a, **k)
+
+    new_log = server._make_output_log_path()
+    with patch.object(config_module, "_config_lock", tracking_lock), \
+         patch.object(server, "_prune_old_logs", tracking_prune), \
+         patch.object(Path, "touch", tracking_touch):
+        server._prune_and_create_output_log(new_log, retention=3)
+
+    # Both prune and touch happened strictly between acquire and release.
+    assert events == ["lock-acquire", "prune", "touch", "lock-release"], events
+    # Cap of 3 = 2 retained old logs + this call's fresh log. Exactly 3.
+    remaining = list(tmp_path.glob("local-coder-output-*.log"))
+    assert len(remaining) == 3, [p.name for p in remaining]
+    assert new_log.exists()
+
+
+def test_prune_and_create_output_log_is_best_effort_on_touch_failure(
+    isolated_config, tmp_path, monkeypatch
+):
+    # A touch (or lock) failure must never abort the delegation — on_output
+    # re-creates the file lazily. The helper swallows OSError and returns.
+    base = tmp_path / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", base)
+    monkeypatch.setattr(server, "_ACTIVE_OUTPUT_LOGS", set())
+    new_log = server._make_output_log_path()
+    with patch.object(Path, "touch", side_effect=OSError("boom")):
+        server._prune_and_create_output_log(new_log, retention=3)  # must not raise
+
+
+async def test_delegate_prunes_logs_on_each_call(isolated_config, git_repo_no_remote, tmp_path, monkeypatch):
+    # A real delegation prunes old per-call logs so the TOTAL after this call's
+    # own fresh log is written stays at the configured cap — not one over it.
+    # log_retention_count is the total-file cap: keep (count - 1) old logs and
+    # let the new one fill the last slot.
+    base = tmp_path / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", base)
+    config_module.merge_config({"log_retention_count": 2})
+    # Seed 5 stale per-call logs.
+    for i in range(5):
+        p = tmp_path / f"local-coder-output-stale{i}.log"
+        p.write_text("old\n")
+        os.utime(p, (1000 + i, 1000 + i))
+
+    def fake_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_backend):
+        result = await server._delegate_implementation_impl(
+            task="add a.py", branch="feature-branch",
+            target_repo_path=str(git_repo_no_remote), ctx=None,
+        )
+    assert result["success"] is True
+    # Cap of 2 = 1 retained old log + this call's own fresh log. Exactly 2.
+    remaining = list(tmp_path.glob("local-coder-output-*.log"))
+    assert len(remaining) == 2, [p.name for p in remaining]
+    # This call's own log must be among the survivors.
+    assert Path(result["output_log"]).exists()
+
+
+async def test_delegate_survives_non_int_retention_in_config(
+    isolated_config, git_repo_no_remote, tmp_path, monkeypatch
+):
+    # configure() validates log_retention_count, but config.yaml can be
+    # hand-edited to a non-int (or non-positive) that would otherwise crash
+    # _prune_old_logs (a `<=`/slice against a str) and abort the delegation
+    # before the backend runs. The call site must coerce a bad value back to
+    # the default instead of raising.
+    base = tmp_path / "local-coder-output.log"
+    monkeypatch.setattr(server, "OUTPUT_LOG_PATH", base)
+    # Write a corrupt value straight to disk, bypassing configure()'s validation.
+    config_module.save_config({**config_module.load_config(), "log_retention_count": "fifty"})
+
+    def fake_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_backend):
+        result = await server._delegate_implementation_impl(
+            task="add a.py", branch="feature-branch",
+            target_repo_path=str(git_repo_no_remote), ctx=None,
+        )
+    # The delegation completes rather than crashing on the bad retention value.
+    assert result["success"] is True
 
 
 def test_output_log_path_lives_under_plugin_data_dir(tmp_path, monkeypatch):

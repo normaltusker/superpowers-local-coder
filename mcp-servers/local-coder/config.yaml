@@ -9,4 +9,5 @@ branch_prefix: "local-coder/"
 open_pr: false
 pr_base_branch: "main"
 idle_notify_interval_seconds: 20
+log_retention_count: 50
 extra_backend_args: []
