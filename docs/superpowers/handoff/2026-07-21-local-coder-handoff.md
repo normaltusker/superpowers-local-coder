@@ -70,9 +70,17 @@ tool fails loudly. Docs: https://code.claude.com/docs/en/mcp.md#plugin-provided-
    - **Known limitation (not a bug):** a NEW config key shipped in a future
      default (e.g. `log_retention_count`) will NOT be added to a pre-existing
      user's live `config.yaml` on update — the default only seeds when the
-     file is absent. New defaults reach existing users via the code's
+     file is absent. New defaults reach existing users via a
      `.get(key) or <default>` fallback at read time, not via config.yaml.
-     Every reader already uses that pattern, so this degrades gracefully.
+     Caveat: readers are MIXED — day-one keys are read by bracket
+     (`cfg["backend"]`, `cfg["model"]`, `cfg["pr_base_branch"]`,
+     `config["stall_timeout_seconds"]`, `config["idle_notify_interval_seconds"]`),
+     which KeyErrors on a missing key. That is safe only because those keys
+     have shipped in config.yaml since day one, so every existing file has
+     them. Any NEW key must be read with `.get(key)` (or an equivalent
+     runtime default) at each read site, or a pre-existing config that
+     predates the key will crash. `log_retention_count` already follows
+     this: it is read as `cfg.get("log_retention_count") or 50`.
 
 3. **Different sessions can use DIFFERENT data dirs** (`superpowers-inline`
    vs `superpowers-superpowers-dev`). Check the newest
