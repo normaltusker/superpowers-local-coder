@@ -353,6 +353,7 @@ def run_monitored_subprocess(
     on_tick: Callable[[], None] | None = None,
     on_output: Callable[[str], None] | None = None,
     first_output_timeout_seconds: float | None = None,
+    on_start: Callable[[int], None] | None = None,
 ) -> subprocess.CompletedProcess:
     # Run with an unbuffered binary pipe (not text=True) so we can read
     # whatever bytes are actually available via a non-blocking os.read()
@@ -378,6 +379,19 @@ def run_monitored_subprocess(
         cmd, cwd=cwd, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
+
+    # Surface the child PID once, right after spawn, so callers can record it
+    # (e.g. the status module, for orphan cleanup). Non-fatal: a raising
+    # callback must never break an otherwise-healthy run — warn and continue,
+    # matching the guard discipline on on_tick/on_output.
+    if on_start is not None:
+        try:
+            on_start(process.pid)
+        except Exception as e:
+            print(
+                f"[local-coder] warning: on_start callback failed: {e}",
+                file=sys.stderr,
+            )
 
     # Bounded tail buffer: append new text, then trim from the front
     # whenever it exceeds the cap, so memory stays flat regardless of how
