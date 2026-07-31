@@ -51,18 +51,18 @@ def _lock_path() -> Path:
 
 
 @contextlib.contextmanager
-def _config_lock():
-    """Exclusive file lock guarding the load->merge->validate->save
-    sequence, so a concurrent configure() call (or a configure() racing a
-    delegate_implementation call reading config) can't interleave and lose
-    updates or persist a combination that was never validated together.
+def file_lock(lock_path: Path):
+    """Exclusive, cross-platform file lock held on a dedicated lockfile.
 
-    Uses a dedicated lockfile (not CONFIG_PATH itself, so save_config's
-    atomic replace of CONFIG_PATH is never affected by the lock's own file
-    lifecycle). Cross-platform: fcntl.flock on POSIX, msvcrt.locking on
-    Windows — no third-party dependency needed.
+    Blocks until the lock is free (POSIX: indefinite; Windows: bounded retry
+    so a permanent lock failure surfaces instead of hanging). Callers pass
+    their own lockfile path so this primitive can guard any file, not just
+    CONFIG_PATH — e.g. the status module locks its per-workspace index with
+    its own lockfile via this same helper, rather than mutating CONFIG_PATH.
+
+    Cross-platform: fcntl.flock on POSIX, msvcrt.locking on Windows — no
+    third-party dependency needed.
     """
-    lock_path = _lock_path()
     lock_path.touch(exist_ok=True)
     # Open r+ (never "w"): "w" TRUNCATES, so a second process opening the
     # lockfile would clobber it while the first holds a lock on it.
@@ -103,6 +103,19 @@ def _config_lock():
                 yield
             finally:
                 _lock_module.flock(lock_file, _lock_module.LOCK_UN)
+
+
+def _config_lock():
+    """Exclusive file lock guarding the load->merge->validate->save
+    sequence, so a concurrent configure() call (or a configure() racing a
+    delegate_implementation call reading config) can't interleave and lose
+    updates or persist a combination that was never validated together.
+
+    Uses a dedicated lockfile (not CONFIG_PATH itself, so save_config's
+    atomic replace of CONFIG_PATH is never affected by the lock's own file
+    lifecycle).
+    """
+    return file_lock(_lock_path())
 
 
 def load_config() -> dict:
