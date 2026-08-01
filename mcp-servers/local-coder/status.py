@@ -199,8 +199,19 @@ def finalize(record, *, status, phase, commit_sha=None, error_message=None) -> N
 
 
 def list_records(target_repo, all_sessions=False, session_id=None) -> list[dict]:
-    """Return persisted records newest first, optionally scoped to a session."""
-    records = [read_record(path) for path in resolve_state_dir(target_repo).glob("lc-*.json")]
+    """Return persisted records newest first, optionally scoped to a session.
+
+    A single record file that is unreadable or mid-write (partial JSON from a
+    concurrent, non-atomic write) is skipped rather than failing the whole
+    listing — the status command and the orphan sweep must tolerate one bad
+    file. read_record stays strict for single-record reads.
+    """
+    records = []
+    for path in resolve_state_dir(target_repo).glob("lc-*.json"):
+        try:
+            records.append(read_record(path))
+        except Exception:
+            continue
     if not all_sessions and session_id is not None:
         records = [record for record in records if record.get("sessionId") == session_id]
     return sorted(records, key=lambda record: record.get("updatedAt") or "", reverse=True)

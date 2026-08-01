@@ -109,6 +109,16 @@ def test_cleanup_session_ignores_other_sessions(repo):
     assert jf["status"] == "running"  # untouched
 
 
+def test_list_records_skips_unreadable_file(repo):
+    good = status.create_record(repo, "dev", "m", "/tmp/x.log")
+    # A partial/corrupt record file must not blank the whole listing.
+    bad = status.resolve_state_dir(repo) / "lc-bad-partial.json"
+    bad.write_text("{ this is not valid json")
+    records = status.list_records(repo, all_sessions=True)
+    ids = [r["id"] for r in records]
+    assert good["id"] in ids
+
+
 def test_cleanup_session_noop_when_nothing_running(repo):
     rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S3")
     status.finalize(rec, status="completed", phase="done", commit_sha="abc")
