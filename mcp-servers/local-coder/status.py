@@ -209,9 +209,16 @@ def list_records(target_repo, all_sessions=False, session_id=None) -> list[dict]
     records = []
     for path in resolve_state_dir(target_repo).glob("lc-*.json"):
         try:
-            records.append(read_record(path))
+            parsed = read_record(path)
         except Exception:
             continue
+        # Skip valid-JSON-but-non-object files too (e.g. `[]`, `null`, `42`):
+        # they parse cleanly but every consumer here calls record.get(...),
+        # which would raise AttributeError on a non-dict and blank the whole
+        # listing / the orphan sweep.
+        if not isinstance(parsed, dict):
+            continue
+        records.append(parsed)
     if not all_sessions and session_id is not None:
         records = [record for record in records if record.get("sessionId") == session_id]
     return sorted(records, key=lambda record: record.get("updatedAt") or "", reverse=True)

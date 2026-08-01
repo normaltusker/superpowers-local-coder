@@ -119,6 +119,25 @@ def test_list_records_skips_unreadable_file(repo):
     assert good["id"] in ids
 
 
+def test_list_records_skips_valid_json_non_object(repo):
+    # Valid JSON that isn't an object (`[]`, `null`, `42`, `"s"`) parses fine
+    # but has no .get — it must be skipped, not crash the listing, including
+    # the session-filtered path (which also calls record.get).
+    good = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+    sd = status.resolve_state_dir(repo)
+    for name, body in [
+        ("lc-arr.json", "[]"),
+        ("lc-null.json", "null"),
+        ("lc-num.json", "42"),
+        ("lc-str.json", "\"hello\""),
+    ]:
+        (sd / name).write_text(body)
+    # all_sessions path (sort calls .get)
+    assert good["id"] in [r["id"] for r in status.list_records(repo, all_sessions=True)]
+    # session-filtered path (filter + sort both call .get)
+    assert good["id"] in [r["id"] for r in status.list_records(repo, session_id="S")]
+
+
 def test_cleanup_session_noop_when_nothing_running(repo):
     rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S3")
     status.finalize(rec, status="completed", phase="done", commit_sha="abc")
