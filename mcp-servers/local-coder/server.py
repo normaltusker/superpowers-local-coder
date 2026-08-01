@@ -8,6 +8,7 @@ import anyio
 from fastmcp import Context, FastMCP
 
 import config as config_module
+import status as status_module
 from backends.aider import AiderBackend
 from backends.codex import CodexBackend
 from backends.gemini import GeminiBackend
@@ -284,6 +285,14 @@ async def _delegate_implementation_impl(
     # delay unrelated tool work and progress notifications. Every other blocking
     # op in this coroutine (backend run, git checks, push, PR) is offloaded the
     # same way.
+    #
+    # Status holders declared BEFORE the try so the finally can always read
+    # them, even if an exception fires inside the try before the record is
+    # created. Default status_final = failed/failed; a reached success/commit
+    # return path overwrites it.
+    status_record = None
+    status_updater = None
+    status_final = {"status": "failed", "phase": "failed", "error_message": None}
     try:
         await anyio.to_thread.run_sync(
             _prune_and_create_output_log, output_log_path, retention
@@ -314,6 +323,29 @@ async def _delegate_implementation_impl(
                     f"[local-coder] warning: failed to announce output log path: {e}",
                     file=sys.stderr, flush=True,
                 )
+
+        # Observability: create a pollable status record for this delegation.
+        # Isolated + non-fatal — status.* swallow their own errors, and this
+        # create is additionally guarded so nothing here can abort the run.
+        # `status_record` stays None if creation fails, which every later
+        # status hook tolerates. `status_final` (declared above the try)
+        # carries the terminal outcome that the finally-block persists once,
+        # so the many return paths below don't each have to finalize.
+        try:
+            status_record = status_module.create_record(
+                target_repo=repo_path, branch=branch, model=cfg["model"],
+                output_log=str(output_log_path),
+                session_id=os.environ.get("CLAUDE_SESSION_ID"),
+            )
+            if status_record and status_record.get("id"):
+                status_updater = status_module.ProgressUpdater(
+                    repo_path, status_record["id"]
+                )
+        except Exception as e:
+            print(
+                f"[local-coder] warning: status record init failed: {e}",
+                file=sys.stderr, flush=True,
+            )
 
         attempt_models = [cfg["model"], *cfg.get("fallback_models", [])]
         attempt_errors = []
@@ -375,6 +407,11 @@ async def _delegate_implementation_impl(
                             f"call): {e}",
                             file=sys.stderr, flush=True,
                         )
+                # Observability: record the latest complete line as the status
+                # record's free-text activity. on_activity is self-guarded and
+                # deduped (rewrites only when the line changed).
+                if status_updater is not None and line:
+                    status_updater.on_activity(line)
             return on_tick
 
         def make_on_output(model_name: str):
@@ -432,6 +469,11 @@ async def _delegate_implementation_impl(
                 # Bound the carried-over partial: keep only its tail, so a long
                 # delimiter-free stream can't exhaust memory.
                 partial_line[0] = remainder[-_PARTIAL_LINE_MAX_CHARS:]
+                # Observability: flip the status phase starting->working on the
+                # first real chunk. ProgressUpdater.on_output is self-guarded
+                # and deduped, so this is a cheap no-op after the first flip.
+                if status_updater is not None:
+                    status_updater.on_output(chunk)
             return on_output
 
         for model in attempt_models:
@@ -449,6 +491,10 @@ async def _delegate_implementation_impl(
                     lambda model=model: backend.run_backend(
                         task, repo_path, branch, cfg, model=model,
                         on_tick=make_on_tick(model), on_output=make_on_output(model),
+                        on_start=(
+                            (lambda pid: status_module.set_pid(status_record, pid))
+                            if status_record else None
+                        ),
                     )
                 )
             except NotImplementedError as e:
@@ -475,6 +521,18 @@ async def _delegate_implementation_impl(
                             )
                         )
                     except subprocess.TimeoutExpired:
+                        # Implementation succeeded and committed locally; only
+                        # the push's outcome is unknown. Record it as completed
+                        # work (phase=committing) with the push blocker noted,
+                        # not a failed delegation.
+                        status_final = {
+                            "status": "completed", "phase": "committing",
+                            "commit_sha": result.commit_sha,
+                            "error_message": (
+                                f"git push timed out after "
+                                f"{NETWORK_SUBPROCESS_TIMEOUT_SECONDS}s; remote state unknown"
+                            ),
+                        }
                         return {
                             "success": False,
                             "error": (
@@ -491,6 +549,11 @@ async def _delegate_implementation_impl(
                             "output_log": str(output_log_path),
                         }
                     if push.returncode != 0:
+                        status_final = {
+                            "status": "completed", "phase": "committing",
+                            "commit_sha": result.commit_sha,
+                            "error_message": f"git push failed: {push.stderr.strip()}",
+                        }
                         return {
                             "success": False,
                             "error": f"git push failed: {push.stderr.strip()}",
@@ -559,6 +622,10 @@ async def _delegate_implementation_impl(
                 else:
                     note = "no origin remote configured; commit created locally, nothing pushed"
 
+                status_final = {
+                    "status": "completed", "phase": "done",
+                    "commit_sha": result.commit_sha,
+                }
                 return {
                     "success": True,
                     "pr_url": pr_url,
@@ -574,6 +641,10 @@ async def _delegate_implementation_impl(
             attempt_errors.append(f"{model}: {result.error}")
             last_output_tail = result.output_tail
 
+        status_final = {
+            "status": "failed", "phase": "failed",
+            "error_message": "all models failed — " + "; ".join(attempt_errors),
+        }
         return {
             "success": False,
             "error": "all models failed — " + "; ".join(attempt_errors),
@@ -581,6 +652,19 @@ async def _delegate_implementation_impl(
             "output_log": str(output_log_path),
         }
     finally:
+        # Observability: persist the terminal status once, from whatever
+        # status_final the reached return path set (default failed/failed if a
+        # validation return or an exception got here before any was set). Guard
+        # broadly: finalizing status must never mask the real result or raise
+        # out of the finally.
+        if status_record:
+            try:
+                status_module.finalize(status_record, **status_final)
+            except Exception as e:
+                print(
+                    f"[local-coder] warning: status finalize failed: {e}",
+                    file=sys.stderr, flush=True,
+                )
         # This call's log is no longer in flight — allow future prunes to
         # reclaim it. discard() is idempotent, so a helper that never
         # registered the path (lock/touch failed before add) is harmless.
