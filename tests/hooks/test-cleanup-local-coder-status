@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Integration test for the SessionEnd cleanup hook.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+HOOK="$REPO_ROOT/hooks/cleanup-local-coder-status"
+LC_DIR="$REPO_ROOT/mcp-servers/local-coder"
+
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+    echo "SKIP: no python interpreter"; exit 0
+fi
+
+FAILURES=0
+TEST_ROOT="$(mktemp -d)"
+cleanup() { rm -rf "$TEST_ROOT"; pkill -f "sleep 47" 2>/dev/null || true; }
+trap cleanup EXIT
+
+pass() { echo "  [PASS] $1"; }
+fail() { echo "  [FAIL] $1"; FAILURES=$((FAILURES+1)); }
+
+export CLAUDE_PLUGIN_DATA="$TEST_ROOT/plugindata"
+mkdir -p "$CLAUDE_PLUGIN_DATA"
+
+# A git repo to act as the workspace (hook resolves target repo via git).
+REPO="$TEST_ROOT/repo"
+mkdir -p "$REPO"
+git -C "$REPO" init -q
+git -C "$REPO" config user.email t@t.t
+git -C "$REPO" config user.name t
+
+# Seed a running record for session S with a live child pid.
+seed_record() {
+    local session="$1" pid="$2"
+    PYTHONPATH="$LC_DIR" "$PY" - "$REPO" "$session" "$pid" <<'PYEOF'
+import sys, status
+repo, session, pid = sys.argv[1], sys.argv[2], int(sys.argv[3])
+rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id=session)
+status.set_pid(rec, pid)
+print(rec["id"])
+PYEOF
+}
+
+record_status() {
+    local jobid="$1"
+    PYTHONPATH="$LC_DIR" "$PY" - "$REPO" "$jobid" <<'PYEOF'
+import sys, json, status
+repo, jobid = sys.argv[1], sys.argv[2]
+jf = status.resolve_state_dir(repo) / f"{jobid}.json"
+print(json.loads(jf.read_text())["status"])
+PYEOF
+}
+
+# --- Case 1: live orphan killed + marked orphaned ---
+sleep 47 &
+LIVE_PID=$!
+JOB1="$(seed_record "SESS-A" "$LIVE_PID")"
+printf '{"session_id":"SESS-A","cwd":"%s"}' "$REPO" | "$HOOK" >/dev/null 2>&1
+
+# process should be gone
+for _ in $(seq 1 50); do kill -0 "$LIVE_PID" 2>/dev/null || break; sleep 0.1; done
+if kill -0 "$LIVE_PID" 2>/dev/null; then fail "live orphan process terminated"; else pass "live orphan process terminated"; fi
+if [ "$(record_status "$JOB1")" = "orphaned" ]; then pass "record marked orphaned"; else fail "record marked orphaned"; fi
+
+# --- Case 2: dead pid -> orphaned, no error ---
+JOB2="$(seed_record "SESS-B" 999999)"
+printf '{"session_id":"SESS-B","cwd":"%s"}' "$REPO" | "$HOOK" >/dev/null 2>&1
+if [ "$(record_status "$JOB2")" = "orphaned" ]; then pass "dead-pid record marked orphaned"; else fail "dead-pid record marked orphaned"; fi
+
+# --- Case 3: no running records -> clean no-op exit 0 ---
+printf '{"session_id":"SESS-NONE","cwd":"%s"}' "$REPO" | "$HOOK" >/dev/null 2>&1
+if [ $? -eq 0 ]; then pass "no-op exits 0"; else fail "no-op exits 0"; fi
+
+# --- Case 4: empty stdin -> exit 0, no crash ---
+printf '' | "$HOOK" >/dev/null 2>&1
+if [ $? -eq 0 ]; then pass "empty payload exits 0"; else fail "empty payload exits 0"; fi
+
+if [ "$FAILURES" -eq 0 ]; then echo "STATUS: PASSED"; exit 0; else echo "STATUS: FAILED ($FAILURES)"; exit 1; fi

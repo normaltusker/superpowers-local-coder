@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sys
 import tempfile
 import time
@@ -233,3 +234,78 @@ def sweep_orphans(target_repo) -> None:
                 _save_record(target_repo, record)
     except Exception as exc:
         _warn("sweep_orphans", exc)
+
+
+def _terminate_process_tree(pid: int, grace_seconds: float = 3.0) -> None:
+    """Best-effort terminate a delegation process — SIGTERM, then SIGKILL
+    after a short grace. Never raises.
+
+    We signal the process GROUP only when `pid` is its OWN group leader
+    (pgid == pid), so killing the group reaches the backend's children (git,
+    the model runner) without ever touching an unrelated shared group. A
+    delegation subprocess that was NOT started in its own session shares this
+    process's group — signalling that group would kill this process (and, in
+    tests, the test runner) — so in that case we signal only the pid itself.
+    """
+    def _signal_pid(sig):
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    try:
+        group_target = None
+        if hasattr(os, "killpg") and hasattr(os, "getpgid"):
+            try:
+                pgid = os.getpgid(pid)
+                # Only safe to group-kill if pid leads its own group.
+                if pgid == pid:
+                    group_target = pgid
+            except OSError:
+                group_target = None
+
+        def _send(sig):
+            if group_target is not None:
+                try:
+                    os.killpg(group_target, sig)
+                    return
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            _signal_pid(sig)
+
+        _send(signal.SIGTERM)
+        deadline = time.monotonic() + grace_seconds
+        while time.monotonic() < deadline:
+            if not _pid_alive(pid):
+                return
+            time.sleep(0.1)
+        _send(signal.SIGKILL)
+    except Exception as exc:
+        _warn("_terminate_process_tree", exc)
+
+
+def cleanup_session(target_repo, session_id) -> list[str]:
+    """SessionEnd cleanup: terminate any still-running delegation belonging to
+    this session and mark its record orphaned. Returns the ids cleaned up.
+    Never raises — observability/cleanup must not fail session teardown."""
+    cleaned = []
+    if not session_id:
+        return cleaned
+    try:
+        for record in list_records(target_repo, all_sessions=True):
+            if record.get("sessionId") != session_id:
+                continue
+            if record.get("status") != "running":
+                continue
+            pid = record.get("pid")
+            if pid is not None and _pid_alive(pid):
+                _terminate_process_tree(pid)
+            record["status"] = "orphaned"
+            record["phase"] = "failed"
+            record["completedAt"] = _now()
+            record["pid"] = None
+            _save_record(target_repo, record)
+            cleaned.append(record.get("id"))
+    except Exception as exc:
+        _warn("cleanup_session", exc)
+    return cleaned

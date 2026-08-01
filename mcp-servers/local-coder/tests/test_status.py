@@ -69,3 +69,48 @@ def test_index_lockfile_is_workspace_local(repo):
     status.create_record(repo, "dev", "m", "/tmp/x.log")
     state_dir = status.resolve_state_dir(repo)
     assert (state_dir / ".state.json.lock").exists()
+
+
+def test_cleanup_session_kills_live_orphan_and_marks_orphaned(repo):
+    import subprocess, time
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S1")
+        status.set_pid(rec, proc.pid)
+        cleaned = status.cleanup_session(repo, "S1")
+        assert rec["id"] in cleaned
+        # process terminated
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and proc.poll() is None:
+            time.sleep(0.05)
+        assert proc.poll() is not None, "orphan process was not terminated"
+        jf = json.loads((status.resolve_state_dir(repo) / f"{rec['id']}.json").read_text())
+        assert jf["status"] == "orphaned" and jf["phase"] == "failed" and jf["pid"] is None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_cleanup_session_marks_dead_pid_orphan_without_error(repo):
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S2")
+    status.set_pid(rec, 999999)  # not alive
+    cleaned = status.cleanup_session(repo, "S2")
+    assert rec["id"] in cleaned
+    jf = json.loads((status.resolve_state_dir(repo) / f"{rec['id']}.json").read_text())
+    assert jf["status"] == "orphaned"
+
+
+def test_cleanup_session_ignores_other_sessions(repo):
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="MINE")
+    status.set_pid(rec, 999999)
+    cleaned = status.cleanup_session(repo, "OTHER")
+    assert cleaned == []
+    jf = json.loads((status.resolve_state_dir(repo) / f"{rec['id']}.json").read_text())
+    assert jf["status"] == "running"  # untouched
+
+
+def test_cleanup_session_noop_when_nothing_running(repo):
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S3")
+    status.finalize(rec, status="completed", phase="done", commit_sha="abc")
+    cleaned = status.cleanup_session(repo, "S3")
+    assert cleaned == []
