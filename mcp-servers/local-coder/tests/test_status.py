@@ -224,6 +224,28 @@ def test_cleanup_session_rereads_pid_set_after_snapshot(repo, monkeypatch):
     assert rec["id"] in cleaned
     assert terminated == [999999]  # re-read picked up the real pid
 
+def test_progress_update_does_not_revive_terminal_record(repo):
+    # A late ProgressUpdater write must not touch a record that a concurrent
+    # cleanup/finalize already retired (all writers share the per-record lock +
+    # terminal guard).
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+    up = status.ProgressUpdater(repo, rec["id"])
+    up.on_output("x")
+    status.cleanup_session(repo, "S")  # -> orphaned
+    up.on_activity("late line")
+    up.on_output("more")
+    jf = status.read_record(status._record_path(repo, rec["id"]))
+    assert jf["status"] == "orphaned"
+    assert jf["latestActivity"] is None
+
+def test_sweep_does_not_clobber_finalized_record(repo):
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log")
+    status.set_pid(rec, 999999)  # dead pid
+    status.finalize(rec, status="completed", phase="done", commit_sha="c")
+    status.sweep_orphans(repo)  # must not flip completed -> orphaned
+    jf = status.read_record(status._record_path(repo, rec["id"]))
+    assert jf["status"] == "completed"
+
 def test_patch_on_disk_preserves_concurrent_orphan(repo):
     # 3698391572: even after the record is orphaned on disk, a later patch must
     # not revive it (the terminal re-check happens inside the record lock).

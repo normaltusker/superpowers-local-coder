@@ -158,10 +158,41 @@ def _save_record(target_repo: str, record: dict, *, update_index: bool = True) -
 
 
 # States a SessionEnd cleanup (or an earlier terminal write) may have already
-# persisted. Once a record reaches one of these on disk, a late in-memory
-# patch (set_pid/finalize) from a still-running-in-memory attempt must NOT
+# persisted. Once a record reaches one of these on disk, a late patch (set_pid/
+# finalize/progress/sweep) from a still-running-in-memory attempt must NOT
 # resurrect it back to an active/other-terminal state.
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "orphaned"})
+
+
+def _locked_record_update(target_repo, job_id, mutate, *, fallback=None):
+    """Serialize a read-modify-write of ONE record under its per-record lock.
+
+    `mutate(current)` receives the freshly-read on-disk record (already checked
+    to be a dict) and should mutate it in place; it returns True to persist the
+    change or False to skip the write. Runs under the same per-record lock that
+    _patch_on_disk / cleanup_session use, so EVERY writer of a given record —
+    set_pid, finalize, ProgressUpdater, sweep_orphans, cleanup_session — is
+    mutually exclusive and always sees the latest on-disk state. Without this,
+    a stale progress/sweep write could clobber a concurrent `orphaned`
+    transition back to `running`.
+
+    Returns the persisted record dict, or None if nothing was written.
+    """
+    with file_lock(_record_lock_path(target_repo, job_id)):
+        try:
+            current = read_record(_record_path(target_repo, job_id))
+            if not isinstance(current, dict):
+                current = None
+        except Exception:
+            current = None
+        if current is None:
+            if fallback is None:
+                return None
+            current = dict(fallback)
+        if mutate(current):
+            _save_record(target_repo, current)
+            return current
+        return None
 
 
 def _patch_on_disk(record: dict, fields: dict) -> None:
@@ -179,31 +210,21 @@ def _patch_on_disk(record: dict, fields: dict) -> None:
     still record a non-status field like `pid` so a cleared pid stays cleared.
     """
     target_repo = record["targetRepo"]
-    # Serialize the whole read/merge/write under the per-record lock so a
-    # concurrent SessionEnd cleanup (separate process) can't interleave its own
-    # read-modify-write and lose (or revive) the terminal transition. The
-    # terminal check MUST happen inside the lock against the freshly-read state.
-    with file_lock(_record_lock_path(target_repo, record["id"])):
-        try:
-            current = read_record(_record_path(target_repo, record["id"]))
-            if not isinstance(current, dict):
-                current = dict(record)
-        except Exception:
-            # On-disk read failed — fall back to the in-memory record so we
-            # still persist *something* (non-fatal contract), then apply fields.
-            current = dict(record)
 
+    def _apply(current):
         disk_terminal = current.get("status") in _TERMINAL_STATUSES
         for key, value in fields.items():
             if disk_terminal and key in ("status", "phase", "completedAt",
                                          "commitSha", "errorMessage"):
-                # Preserve the terminal/orphaned outcome already on disk.
-                continue
+                continue  # preserve the terminal/orphaned outcome on disk
             current[key] = value
+        return True
 
+    persisted = _locked_record_update(
+        target_repo, record["id"], _apply, fallback=record)
+    if persisted is not None:
         # Keep the caller's in-memory view coherent with what we persisted.
-        record.update(current)
-        _save_record(target_repo, current)
+        record.update(persisted)
 
 
 def create_record(target_repo, branch, model, output_log, session_id=None) -> dict:
@@ -249,13 +270,23 @@ class ProgressUpdater:
         try:
             if not chunk or not chunk.strip() or self.last_phase != "starting":
                 return
-            record = read_record(_record_path(self.target_repo, self.job_id))
-            if record.get("phase") != "starting":
-                self.last_phase = record.get("phase")
-                return
-            record["phase"] = "working"
-            _save_record(self.target_repo, record)
-            self.last_phase = "working"
+
+            def _apply(current):
+                # Never move a record that is already terminal (orphaned by
+                # SessionEnd cleanup, or finalized) — a late progress write
+                # must not revive it. Skip once it has left "starting".
+                if current.get("status") in _TERMINAL_STATUSES:
+                    self.last_phase = current.get("phase")
+                    return False
+                if current.get("phase") != "starting":
+                    self.last_phase = current.get("phase")
+                    return False
+                current["phase"] = "working"
+                return True
+
+            _locked_record_update(self.target_repo, self.job_id, _apply)
+            if self.last_phase == "starting":
+                self.last_phase = "working"
         except Exception as exc:
             _warn("ProgressUpdater.on_output", exc)
 
@@ -263,9 +294,16 @@ class ProgressUpdater:
         try:
             if line == self.last_activity:
                 return
-            record = read_record(_record_path(self.target_repo, self.job_id))
-            record["latestActivity"] = line
-            _save_record(self.target_repo, record)
+
+            def _apply(current):
+                # A late activity write must not touch a record a concurrent
+                # cleanup/finalize already retired.
+                if current.get("status") in _TERMINAL_STATUSES:
+                    return False
+                current["latestActivity"] = line
+                return True
+
+            _locked_record_update(self.target_repo, self.job_id, _apply)
             self.last_activity = line
         except Exception as exc:
             _warn("ProgressUpdater.on_activity", exc)
@@ -425,25 +463,34 @@ def sweep_orphans(target_repo) -> None:
     record can't abort the sweep for all the others.
     """
     try:
-        for record in list_records(target_repo, all_sessions=True):
+        # Snapshot only to enumerate ids cheaply; the actual mutation re-reads
+        # and decides under the per-record lock so a concurrent
+        # finalize/cleanup/progress write can't be clobbered.
+        for snapshot in list_records(target_repo, all_sessions=True):
+            job_id = snapshot.get("id")
+            if not job_id:
+                continue
             try:
-                if record.get("status") != "running":
-                    continue
-                pid = _as_valid_pid(record.get("pid"))
-                is_orphan = False
-                if pid is not None:
-                    is_orphan = not _pid_alive(pid)
-                else:
-                    # No usable pid — orphan it only once past the startup grace
-                    # window, so an in-flight delegation that hasn't reached
-                    # on_start yet isn't mistaken for a crash.
-                    age = _age_seconds(record.get("createdAt"))
-                    is_orphan = age is not None and age > _NO_PID_ORPHAN_SECONDS
-                if is_orphan:
-                    record["status"] = "orphaned"
-                    record["phase"] = "failed"
-                    record["completedAt"] = _now()
-                    _save_record(target_repo, record)
+                def _apply(current):
+                    if current.get("status") != "running":
+                        return False  # already terminal or changed since snapshot
+                    pid = _as_valid_pid(current.get("pid"))
+                    if pid is not None:
+                        if _pid_alive(pid):
+                            return False
+                    else:
+                        # No usable pid — orphan only past the startup grace
+                        # window, so an in-flight delegation that hasn't reached
+                        # on_start yet isn't mistaken for a crash.
+                        age = _age_seconds(current.get("createdAt"))
+                        if age is None or age <= _NO_PID_ORPHAN_SECONDS:
+                            return False
+                    current["status"] = "orphaned"
+                    current["phase"] = "failed"
+                    current["completedAt"] = _now()
+                    return True
+
+                _locked_record_update(target_repo, job_id, _apply)
             except Exception as inner:
                 _warn("sweep_orphans(record)", inner)
                 continue
@@ -533,50 +580,47 @@ def cleanup_session(target_repo, session_id, deadline_seconds: float = 12.0) -> 
         return cleaned
     overall_deadline = time.monotonic() + deadline_seconds
     try:
-        for record in list_records(target_repo, all_sessions=True):
+        for snapshot in list_records(target_repo, all_sessions=True):
             # Handle each record in its own guard so one malformed record can't
             # abort cleanup for the rest of this session's delegations.
             try:
-                if record.get("sessionId") != session_id:
+                if snapshot.get("sessionId") != session_id:
+                    continue
+                job_id = snapshot.get("id")
+                if not job_id:
                     continue
 
                 # Mark the record orphaned ATOMICALLY under its per-record lock,
-                # re-reading the latest on-disk state inside the lock. This
-                # closes the check/spawn race with an in-flight delegation:
+                # re-reading the latest on-disk state inside the lock (via the
+                # shared _locked_record_update path every other writer uses).
+                # This closes the check/spawn race with an in-flight delegation:
                 #  - re-reading picks up a pid a racing on_start just set, so we
                 #    don't miss a just-started process;
                 #  - writing `orphaned` inside the lock means a concurrent
-                #    _patch_on_disk (which also locks and re-checks terminal)
-                #    can no longer revive the record.
-                # We capture the identity we need to terminate, then do the
-                # (potentially slow) SIGTERM/SIGKILL OUTSIDE the lock so we don't
-                # block workers for the grace period.
-                to_terminate = None
-                with file_lock(_record_lock_path(target_repo, record["id"])):
-                    try:
-                        fresh = read_record(_record_path(target_repo, record["id"]))
-                    except Exception:
-                        fresh = record
-                    if not isinstance(fresh, dict):
-                        continue
-                    if fresh.get("status") != "running":
-                        continue
-                    # Decide termination against the fresh record (fresh pid +
-                    # pidStart), still honoring the overall deadline and the
-                    # PID-reuse identity guard.
-                    pid = _as_valid_pid(fresh.get("pid"))
-                    if pid is not None and time.monotonic() < overall_deadline \
-                            and _pid_is_ours(fresh):
-                        to_terminate = pid
-                    fresh["status"] = "orphaned"
-                    fresh["phase"] = "failed"
-                    fresh["completedAt"] = _now()
-                    fresh["pid"] = None
-                    _save_record(target_repo, fresh)
-                    cleaned.append(fresh.get("id"))
+                #    progress/patch write can no longer revive the record.
+                # We capture the pid to terminate inside the lock, then do the
+                # (potentially slow) SIGTERM/SIGKILL OUTSIDE it so we don't block
+                # workers for the grace period.
+                holder = {"terminate": None}
 
-                if to_terminate is not None:
-                    _terminate_process_tree(to_terminate)
+                def _apply(current, _holder=holder):
+                    if current.get("status") != "running":
+                        return False
+                    pid = _as_valid_pid(current.get("pid"))
+                    if pid is not None and time.monotonic() < overall_deadline \
+                            and _pid_is_ours(current):
+                        _holder["terminate"] = pid
+                    current["status"] = "orphaned"
+                    current["phase"] = "failed"
+                    current["completedAt"] = _now()
+                    current["pid"] = None
+                    return True
+
+                persisted = _locked_record_update(target_repo, job_id, _apply)
+                if persisted is not None:
+                    cleaned.append(job_id)
+                if holder["terminate"] is not None:
+                    _terminate_process_tree(holder["terminate"])
             except Exception as inner:
                 _warn("cleanup_session(record)", inner)
                 continue
