@@ -127,7 +127,11 @@ def render_status(target_repo, job_id=None, all_sessions=False,
 def check_venv() -> dict:
     """venv provisioned: interpreter present AND the requirements stamp exists."""
     python = _venv_python()
-    stamp = plugin_data_dir() / ".venv" / "requirements.installed.txt"
+    # The provisioning hook (hooks/ensure-local-coder-venv) writes the success
+    # stamp at DATA_DIR/requirements.installed.txt — i.e. plugin_data_dir(),
+    # BESIDE .venv, not inside it. Read it from that exact path; looking inside
+    # .venv/ false-failed a fully-provisioned venv and reported NOT READY.
+    stamp = plugin_data_dir() / "requirements.installed.txt"
     if python is None:
         return {"name": "venv", "ok": False,
                 "detail": "no provisioned venv interpreter found",

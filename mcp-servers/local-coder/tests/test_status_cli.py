@@ -101,6 +101,46 @@ def test_setup_venv_missing(repo):
     assert "auto-provision" in report["nextStep"]
 
 
+def _provision_fake_venv(monkeypatch):
+    """Lay out a venv exactly as hooks/ensure-local-coder-venv does:
+    - interpreter at   plugin_data_dir()/.venv/bin/python
+    - success stamp at plugin_data_dir()/requirements.installed.txt  (DATA_DIR),
+      NOT inside .venv. check_venv must look where the hook actually writes it.
+    """
+    from paths import plugin_data_dir
+    data = plugin_data_dir()
+    (data / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+    py = data / ".venv" / "bin" / "python"
+    py.write_text("#!/bin/sh\n")
+    py.chmod(0o755)
+    (data / "requirements.installed.txt").write_text("aider-chat==0.0.0\n")
+    return data
+
+
+def test_setup_venv_passes_when_provisioned_at_hook_paths(repo, monkeypatch):
+    # Regression: check_venv must read the stamp from the SAME path the
+    # provisioning hook writes it — DATA_DIR/requirements.installed.txt, not
+    # DATA_DIR/.venv/requirements.installed.txt. The old code looked inside
+    # .venv/ and false-failed a fully-provisioned venv, so /setup reported
+    # NOT READY on a working install.
+    _provision_fake_venv(monkeypatch)
+    report = status_cli.check_venv()
+    assert report["ok"] is True, report
+    assert report["nextStep"] is None
+
+
+def test_setup_venv_fails_when_stamp_missing(repo, monkeypatch):
+    # Interpreter present but no success stamp -> incomplete provisioning.
+    from paths import plugin_data_dir
+    data = plugin_data_dir()
+    (data / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+    py = data / ".venv" / "bin" / "python"
+    py.write_text("#!/bin/sh\n"); py.chmod(0o755)
+    report = status_cli.check_venv()
+    assert report["ok"] is False
+    assert "stamp" in report["detail"]
+
+
 # ---- run_setup aggregate ---------------------------------------------------
 
 def test_run_setup_reports_not_ready_when_a_check_fails(repo, monkeypatch):
