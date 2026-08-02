@@ -39,6 +39,19 @@ def _target_repo(cwd: str | None = None) -> str:
     return cwd
 
 
+def _is_positive_finite_number(value) -> bool:
+    """True only for a real, strictly-positive, finite number. Rejects bool
+    (a subclass of int — True would otherwise read as 1) and inf/nan."""
+    import math
+    if isinstance(value, bool):
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, float) and not math.isfinite(value):
+        return False
+    return value > 0
+
+
 def _venv_python() -> Path | None:
     """Return the provisioned venv interpreter path if it exists, else None.
     Mirrors hooks/ensure-local-coder-venv: bin/python (POSIX) or
@@ -62,8 +75,9 @@ def _elapsed(record: dict) -> str:
     try:
         import datetime as _dt
         fmt = "%Y-%m-%dT%H:%M:%SZ"
-        s = _dt.datetime.strptime(start, fmt)
-        e = _dt.datetime.strptime(end, fmt) if end else _dt.datetime.utcnow()
+        s = _dt.datetime.strptime(start, fmt).replace(tzinfo=_dt.timezone.utc)
+        e = (_dt.datetime.strptime(end, fmt).replace(tzinfo=_dt.timezone.utc)
+             if end else _dt.datetime.now(_dt.timezone.utc))
         secs = int((e - s).total_seconds())
         if secs < 60:
             return f"{secs}s"
@@ -182,15 +196,21 @@ def check_config() -> dict:
     except Exception as e:
         return {"name": "config", "ok": False, "detail": f"config failed to load: {e}",
                 "nextStep": "fix config.yaml so it parses"}
+    # A parseable-but-non-mapping config (e.g. a YAML list or scalar) would
+    # crash .get with a traceback; report it as a failed check instead.
+    if not isinstance(cfg, dict):
+        return {"name": "config", "ok": False,
+                "detail": f"config is not a mapping (got {type(cfg).__name__})",
+                "nextStep": "config.yaml must be a mapping of settings"}
     model = cfg.get("model")
     if not model or not str(model).strip():
         return {"name": "config", "ok": False, "detail": "model is empty",
                 "nextStep": "set a non-empty `model` in config.yaml"}
     stall = cfg.get("stall_timeout_seconds")
-    if stall is not None and (not isinstance(stall, (int, float)) or stall <= 0):
+    if stall is not None and not _is_positive_finite_number(stall):
         return {"name": "config", "ok": False,
                 "detail": f"stall_timeout_seconds is {stall!r}",
-                "nextStep": "set `stall_timeout_seconds` to a positive number"}
+                "nextStep": "set `stall_timeout_seconds` to a positive, finite number"}
     return {"name": "config", "ok": True, "detail": f"model={model}", "nextStep": None}
 
 

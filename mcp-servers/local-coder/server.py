@@ -477,6 +477,19 @@ async def _delegate_implementation_impl(
             return on_output
 
         for model in attempt_models:
+            # If SessionEnd cleanup retired this record mid-run (marked it
+            # orphaned and killed the prior attempt's process), do not spawn
+            # another attempt — the session that requested this work is gone.
+            # Return now, leaving the terminal on-disk record untouched
+            # (status_final=None tells the finally not to finalize over it).
+            if status_record and status_module.is_terminal_on_disk(status_record):
+                status_final = None
+                return {
+                    "success": False,
+                    "error": "delegation orphaned: session ended mid-run",
+                    "output_tail": last_output_tail,
+                    "output_log": str(output_log_path),
+                }
             # Reset the per-attempt holders so this attempt starts clean:
             #  - pulse holders, so this model's first tick (before it emits
             #    anything) can't surface the PREVIOUS model's last line as its
@@ -486,6 +499,21 @@ async def _delegate_implementation_impl(
             latest_line[0] = ""
             partial_line[0] = ""
             log_write_ok[0] = True
+            # Clear any pid carried over from a previous (failed) attempt BEFORE
+            # this attempt spawns its own. Otherwise, between attempts the
+            # record would still name the previous attempt's now-dead pid while
+            # marked running — which the orphan sweep would mark orphaned
+            # mid-delegation, and which session cleanup could act on as a stale
+            # (or reused) pid. on_start below sets this attempt's real pid.
+            if status_record:
+                try:
+                    status_module.set_pid(status_record, None)
+                    # Persist the model this attempt is actually using, so
+                    # /status reports the fallback model when the primary
+                    # failed — not the primary from config.
+                    status_module.set_model(status_record, model)
+                except Exception:
+                    pass
             try:
                 result = await anyio.to_thread.run_sync(
                     lambda model=model: backend.run_backend(
@@ -498,6 +526,9 @@ async def _delegate_implementation_impl(
                     )
                 )
             except NotImplementedError as e:
+                status_final = {
+                    "status": "failed", "phase": "failed", "error_message": str(e),
+                }
                 return {"success": False, "error": str(e)}
             except Exception as e:
                 # Any other unexpected exception from a backend attempt (e.g. an
@@ -657,7 +688,10 @@ async def _delegate_implementation_impl(
         # validation return or an exception got here before any was set). Guard
         # broadly: finalizing status must never mask the real result or raise
         # out of the finally.
-        if status_record:
+        # status_final is None only when the loop broke because SessionEnd
+        # cleanup already retired the record (orphaned) — in that case there is
+        # nothing to finalize; the terminal on-disk record stands.
+        if status_record and status_final is not None:
             try:
                 status_module.finalize(status_record, **status_final)
             except Exception as e:

@@ -31,7 +31,7 @@
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" cleanup-local-coder-status",
             "shell": "bash",
             "async": false,
-            "timeout": 15
+            "timeout": 20
           }
         ]
       }

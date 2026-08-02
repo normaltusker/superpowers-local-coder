@@ -14,7 +14,13 @@ fi
 
 FAILURES=0
 TEST_ROOT="$(mktemp -d)"
-cleanup() { rm -rf "$TEST_ROOT"; pkill -f "sleep 47" 2>/dev/null || true; }
+LIVE_PID=""
+# Clean up only the specific process this test started (by PID), never a broad
+# pkill pattern that could match unrelated processes on the host.
+cleanup() {
+    rm -rf "$TEST_ROOT"
+    [ -n "$LIVE_PID" ] && kill "$LIVE_PID" 2>/dev/null || true
+}
 trap cleanup EXIT
 
 pass() { echo "  [PASS] $1"; }
@@ -64,7 +70,13 @@ if kill -0 "$LIVE_PID" 2>/dev/null; then fail "live orphan process terminated"; 
 if [ "$(record_status "$JOB1")" = "orphaned" ]; then pass "record marked orphaned"; else fail "record marked orphaned"; fi
 
 # --- Case 2: dead pid -> orphaned, no error ---
-JOB2="$(seed_record "SESS-B" 999999)"
+# Use a PID that is genuinely dead: start a process, reap it, then reuse its
+# now-freed PID (a hardcoded high number like 999999 can be a live unrelated
+# process on 64-bit hosts, which the cleanup must never terminate).
+sleep 0 &
+DEAD_PID=$!
+wait "$DEAD_PID" 2>/dev/null || true
+JOB2="$(seed_record "SESS-B" "$DEAD_PID")"
 printf '{"session_id":"SESS-B","cwd":"%s"}' "$REPO" | "$HOOK" >/dev/null 2>&1
 if [ "$(record_status "$JOB2")" = "orphaned" ]; then pass "dead-pid record marked orphaned"; else fail "dead-pid record marked orphaned"; fi
 

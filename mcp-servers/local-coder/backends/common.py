@@ -375,9 +375,18 @@ def run_monitored_subprocess(
     # reading stdin can still look "recently active" from earlier startup
     # output, so the stall timer never restarts and never fires. With
     # stdin explicitly closed, any read attempt gets immediate EOF instead.
+    # start_new_session=True puts the backend in its OWN process group and
+    # session (POSIX; a harmless no-op on Windows). That makes the child a
+    # group leader (pgid == pid), which is what lets SessionEnd orphan cleanup
+    # group-signal the WHOLE delegation tree — aider plus the git/model-runner
+    # children it spawns — instead of only the direct child. status's
+    # _terminate_process_tree only group-kills when pgid == pid, so without
+    # this the cleanup would fall back to a pid-only kill and leave those
+    # children running.
     process = subprocess.Popen(
         cmd, cwd=cwd, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        start_new_session=True,
     )
 
     # Surface the child PID once, right after spawn, so callers can record it
