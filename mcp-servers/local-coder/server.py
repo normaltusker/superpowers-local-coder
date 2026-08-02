@@ -535,8 +535,24 @@ async def _delegate_implementation_impl(
                 # uncaught CalledProcessError from a backend's own git calls)
                 # shouldn't crash the whole tool call — treat it like a failed
                 # attempt and continue the failover loop to the next model.
+                if status_record:
+                    try:
+                        status_module.set_pid(status_record, None)
+                    except Exception:
+                        pass
                 attempt_errors.append(f"{model}: {e}")
                 continue
+
+            # The attempt's process has now exited. Clear the dead pid
+            # IMMEDIATELY — before the (possibly slow) success-path git push/PR
+            # work below — so a concurrent create_record() orphan sweep in
+            # another process can't see a `running` record naming a now-dead pid
+            # and mark this in-flight delegation `orphaned`.
+            if status_record:
+                try:
+                    status_module.set_pid(status_record, None)
+                except Exception:
+                    pass
 
             if result.success:
                 note = None

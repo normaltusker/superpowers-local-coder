@@ -192,6 +192,41 @@ def test_is_terminal_on_disk_reflects_persisted_status(repo):
     status.finalize(rec, status="failed", phase="failed", error_message="boom")
     assert status.is_terminal_on_disk(rec) is True
 
+def test_cleanup_session_rereads_pid_set_after_snapshot(repo, monkeypatch):
+    # 3698391574: list_records snapshots the record; a pid set by a racing
+    # on_start AFTER the snapshot must still be seen (cleanup re-reads under the
+    # lock) so the just-started process is terminated, not stranded.
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+    # Simulate the snapshot lacking a pid, but the on-disk record having gained
+    # one after the snapshot was taken.
+    status.set_pid(rec, 999999)  # dead pid on disk (post-snapshot)
+    terminated = []
+    monkeypatch.setattr(status, "_pid_is_ours", lambda r: r.get("pid") == 999999)
+    monkeypatch.setattr(status, "_terminate_process_tree",
+                        lambda pid, **k: terminated.append(pid))
+    # Feed cleanup a stale snapshot (pid None) to prove it re-reads on disk.
+    real_list = status.list_records
+    def stale_list(target_repo, **kw):
+        recs = real_list(target_repo, **kw)
+        for r in recs:
+            if r.get("id") == rec["id"]:
+                r["pid"] = None  # snapshot is stale
+        return recs
+    monkeypatch.setattr(status, "list_records", stale_list)
+    cleaned = status.cleanup_session(repo, "S")
+    assert rec["id"] in cleaned
+    assert terminated == [999999]  # re-read picked up the real pid
+
+def test_patch_on_disk_preserves_concurrent_orphan(repo):
+    # 3698391572: even after the record is orphaned on disk, a later patch must
+    # not revive it (the terminal re-check happens inside the record lock).
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+    status.cleanup_session(repo, "S")  # marks orphaned on disk
+    status.set_pid(rec, 4242)          # a late worker patch
+    status.finalize(rec, status="completed", phase="done", commit_sha="z")
+    jf = status.read_record(status._record_path(repo, rec["id"]))
+    assert jf["status"] == "orphaned" and jf["pid"] is None
+
 def test_cleanup_session_survives_malformed_pid_record(repo):
     # A hand-corrupted record with a string pid must not abort cleanup for the
     # rest of the session's records.

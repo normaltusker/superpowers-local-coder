@@ -100,6 +100,16 @@ def _record_path(target_repo: str, job_id: str) -> Path:
     return resolve_state_dir(target_repo) / f"{job_id}.json"
 
 
+def _record_lock_path(target_repo: str, job_id: str) -> Path:
+    """Dedicated per-record lockfile beside the record. Serializes the
+    read/merge/write of a single record ACROSS PROCESSES — the in-flight
+    delegation (this MCP server) and the SessionEnd cleanup hook (a separate
+    process) can otherwise interleave their read-modify-write and clobber each
+    other's terminal transition (e.g. a worker patch reviving an `orphaned`
+    record cleanup just wrote)."""
+    return resolve_state_dir(target_repo) / f".{job_id}.json.lock"
+
+
 def _write_json(path: Path, value: dict) -> None:
     # Write to a unique temp file in the same dir, then atomically rename over
     # the target. A crash or a concurrent reader therefore never sees a
@@ -169,26 +179,31 @@ def _patch_on_disk(record: dict, fields: dict) -> None:
     still record a non-status field like `pid` so a cleared pid stays cleared.
     """
     target_repo = record["targetRepo"]
-    try:
-        current = read_record(_record_path(target_repo, record["id"]))
-        if not isinstance(current, dict):
+    # Serialize the whole read/merge/write under the per-record lock so a
+    # concurrent SessionEnd cleanup (separate process) can't interleave its own
+    # read-modify-write and lose (or revive) the terminal transition. The
+    # terminal check MUST happen inside the lock against the freshly-read state.
+    with file_lock(_record_lock_path(target_repo, record["id"])):
+        try:
+            current = read_record(_record_path(target_repo, record["id"]))
+            if not isinstance(current, dict):
+                current = dict(record)
+        except Exception:
+            # On-disk read failed — fall back to the in-memory record so we
+            # still persist *something* (non-fatal contract), then apply fields.
             current = dict(record)
-    except Exception:
-        # On-disk read failed — fall back to the in-memory record so we still
-        # persist *something* (non-fatal contract), then apply our fields.
-        current = dict(record)
 
-    disk_terminal = current.get("status") in _TERMINAL_STATUSES
-    for key, value in fields.items():
-        if disk_terminal and key in ("status", "phase", "completedAt",
-                                     "commitSha", "errorMessage"):
-            # Preserve the terminal/orphaned outcome already on disk.
-            continue
-        current[key] = value
+        disk_terminal = current.get("status") in _TERMINAL_STATUSES
+        for key, value in fields.items():
+            if disk_terminal and key in ("status", "phase", "completedAt",
+                                         "commitSha", "errorMessage"):
+                # Preserve the terminal/orphaned outcome already on disk.
+                continue
+            current[key] = value
 
-    # Keep the caller's in-memory view coherent with what we persisted.
-    record.update(current)
-    _save_record(target_repo, current)
+        # Keep the caller's in-memory view coherent with what we persisted.
+        record.update(current)
+        _save_record(target_repo, current)
 
 
 def create_record(target_repo, branch, model, output_log, session_id=None) -> dict:
@@ -524,21 +539,44 @@ def cleanup_session(target_repo, session_id, deadline_seconds: float = 12.0) -> 
             try:
                 if record.get("sessionId") != session_id:
                     continue
-                if record.get("status") != "running":
-                    continue
-                # Only terminate a process we can still positively identify as
-                # the delegation's own (guards PID reuse). If the deadline has
-                # passed, skip the (blocking) terminate and just mark the record.
-                pid = _as_valid_pid(record.get("pid"))
-                if pid is not None and time.monotonic() < overall_deadline \
-                        and _pid_is_ours(record):
-                    _terminate_process_tree(pid)
-                record["status"] = "orphaned"
-                record["phase"] = "failed"
-                record["completedAt"] = _now()
-                record["pid"] = None
-                _save_record(target_repo, record)
-                cleaned.append(record.get("id"))
+
+                # Mark the record orphaned ATOMICALLY under its per-record lock,
+                # re-reading the latest on-disk state inside the lock. This
+                # closes the check/spawn race with an in-flight delegation:
+                #  - re-reading picks up a pid a racing on_start just set, so we
+                #    don't miss a just-started process;
+                #  - writing `orphaned` inside the lock means a concurrent
+                #    _patch_on_disk (which also locks and re-checks terminal)
+                #    can no longer revive the record.
+                # We capture the identity we need to terminate, then do the
+                # (potentially slow) SIGTERM/SIGKILL OUTSIDE the lock so we don't
+                # block workers for the grace period.
+                to_terminate = None
+                with file_lock(_record_lock_path(target_repo, record["id"])):
+                    try:
+                        fresh = read_record(_record_path(target_repo, record["id"]))
+                    except Exception:
+                        fresh = record
+                    if not isinstance(fresh, dict):
+                        continue
+                    if fresh.get("status") != "running":
+                        continue
+                    # Decide termination against the fresh record (fresh pid +
+                    # pidStart), still honoring the overall deadline and the
+                    # PID-reuse identity guard.
+                    pid = _as_valid_pid(fresh.get("pid"))
+                    if pid is not None and time.monotonic() < overall_deadline \
+                            and _pid_is_ours(fresh):
+                        to_terminate = pid
+                    fresh["status"] = "orphaned"
+                    fresh["phase"] = "failed"
+                    fresh["completedAt"] = _now()
+                    fresh["pid"] = None
+                    _save_record(target_repo, fresh)
+                    cleaned.append(fresh.get("id"))
+
+                if to_terminate is not None:
+                    _terminate_process_tree(to_terminate)
             except Exception as inner:
                 _warn("cleanup_session(record)", inner)
                 continue
