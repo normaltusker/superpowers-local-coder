@@ -27,16 +27,23 @@ def test_progress_updater_first_chunk_moves_to_working(repo):
     jf = status.resolve_state_dir(repo) / f"{rec['id']}.json"
     assert status.read_record(jf)["phase"] == "working"
 
-def test_progress_updater_dedupes_unchanged_activity(repo):
+def test_progress_updater_dedupes_unchanged_activity(repo, monkeypatch):
+    # Count real writes rather than comparing bytes: updatedAt is only
+    # second-granular, so a redundant same-second write would be byte-identical
+    # and a byte comparison would miss a lost dedupe early-exit. Spying on
+    # _save_record catches the write itself.
     rec = status.create_record(repo, "dev", "m", "/tmp/x.log")
     up = status.ProgressUpdater(repo, rec["id"])
+    writes = []
+    real_save = status._save_record
+    def counting_save(target_repo, record, **kw):
+        writes.append(record.get("latestActivity"))
+        return real_save(target_repo, record, **kw)
+    monkeypatch.setattr(status, "_save_record", counting_save)
     up.on_activity("line A")
-    jf = status.resolve_state_dir(repo) / f"{rec['id']}.json"
-    after_first_activity = jf.read_bytes()
-    up.on_activity("line A")
-    assert jf.read_bytes() == after_first_activity
-    up.on_activity("line B")
-    assert jf.read_bytes() != after_first_activity
+    up.on_activity("line A")   # duplicate — must NOT write
+    up.on_activity("line B")   # change — must write
+    assert writes == ["line A", "line B"]
 
 def test_finalize_sets_terminal_state(repo):
     rec = status.create_record(repo, "dev", "m", "/tmp/x.log")
