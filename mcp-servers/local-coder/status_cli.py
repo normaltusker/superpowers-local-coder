@@ -125,9 +125,20 @@ def render_status(target_repo, job_id=None, all_sessions=False,
 # ---------------------------------------------------------------------------
 
 def check_venv() -> dict:
-    """venv provisioned: interpreter present AND the requirements stamp exists."""
+    """venv provisioned: interpreter present AND the requirements stamp exists
+    AND is up to date with the current requirements.txt.
+
+    The provisioning hook (hooks/ensure-local-coder-venv) treats the venv as
+    up to date only when `cmp -s requirements.txt stamp` — the stamp is a byte
+    copy of the requirements.txt it was installed from. We mirror that here so
+    /setup doesn't report READY on a venv whose requirements.txt has changed
+    since the last install (a stale stamp)."""
     python = _venv_python()
-    stamp = plugin_data_dir() / ".venv" / "requirements.installed.txt"
+    # The hook writes the success stamp at DATA_DIR/requirements.installed.txt —
+    # i.e. plugin_data_dir(), BESIDE .venv, not inside it. Read it from that
+    # exact path; looking inside .venv/ false-failed a provisioned venv.
+    stamp = plugin_data_dir() / "requirements.installed.txt"
+    requirements = Path(__file__).parent / "requirements.txt"
     if python is None:
         return {"name": "venv", "ok": False,
                 "detail": "no provisioned venv interpreter found",
@@ -137,6 +148,26 @@ def check_venv() -> dict:
         return {"name": "venv", "ok": False,
                 "detail": f"venv python present but stamp {stamp.name} missing",
                 "nextStep": "re-run provisioning; the venv looks incomplete"}
+    # Stale-stamp check, matching the hook's `cmp -s requirements.txt stamp`.
+    # `cmp -s` exits non-zero — so the hook re-provisions — whenever the files
+    # differ OR either is missing/unreadable. We FAIL CLOSED the same way:
+    # report NOT READY on any of those, and READY only on a byte-for-byte match.
+    # Treating an unreadable/missing file as READY here would tell the user the
+    # venv is fine while the hook would rebuild it on the next run.
+    try:
+        stamp_bytes = stamp.read_bytes()
+        requirements_bytes = requirements.read_bytes()
+    except OSError as e:
+        return {"name": "venv", "ok": False,
+                "detail": f"cannot compare venv stamp to requirements.txt: {e}",
+                "nextStep": "re-run provisioning; the venv freshness can't be "
+                            "verified"}
+    if stamp_bytes != requirements_bytes:
+        return {"name": "venv", "ok": False,
+                "detail": "venv is out of date — requirements.txt changed "
+                          "since the last install",
+                "nextStep": "re-run provisioning; the venv will reinstall "
+                            "to match requirements.txt on the next delegation"}
     return {"name": "venv", "ok": True, "detail": str(python), "nextStep": None}
 
 

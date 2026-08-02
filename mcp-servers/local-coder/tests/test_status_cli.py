@@ -101,6 +101,79 @@ def test_setup_venv_missing(repo):
     assert "auto-provision" in report["nextStep"]
 
 
+def _requirements_bytes():
+    from pathlib import Path
+    return (Path(status_cli.__file__).parent / "requirements.txt").read_bytes()
+
+
+def _make_venv_python(monkeypatch):
+    from paths import plugin_data_dir
+    data = plugin_data_dir()
+    (data / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
+    py = data / ".venv" / "bin" / "python"
+    py.write_text("#!/bin/sh\n")
+    py.chmod(0o755)
+    return data
+
+
+def _provision_fake_venv(monkeypatch):
+    """Lay out a venv exactly as hooks/ensure-local-coder-venv does:
+    - interpreter at   plugin_data_dir()/.venv/bin/python
+    - success stamp at plugin_data_dir()/requirements.installed.txt  (DATA_DIR),
+      NOT inside .venv, and a byte copy of the current requirements.txt (the
+      hook's `cmp -s requirements.txt stamp` freshness contract).
+    """
+    data = _make_venv_python(monkeypatch)
+    (data / "requirements.installed.txt").write_bytes(_requirements_bytes())
+    return data
+
+
+def test_setup_venv_passes_when_provisioned_at_hook_paths(repo, monkeypatch):
+    # Regression: check_venv must read the stamp from the SAME path the
+    # provisioning hook writes it — DATA_DIR/requirements.installed.txt, not
+    # DATA_DIR/.venv/requirements.installed.txt. The old code looked inside
+    # .venv/ and false-failed a fully-provisioned venv, so /setup reported
+    # NOT READY on a working install.
+    _provision_fake_venv(monkeypatch)
+    report = status_cli.check_venv()
+    assert report["ok"] is True, report
+    assert report["nextStep"] is None
+
+
+def test_setup_venv_fails_when_stamp_missing(repo, monkeypatch):
+    # Interpreter present but no success stamp -> incomplete provisioning.
+    _make_venv_python(monkeypatch)
+    report = status_cli.check_venv()
+    assert report["ok"] is False
+    assert "stamp" in report["detail"]
+
+
+def test_setup_venv_fails_when_stamp_is_stale(repo, monkeypatch):
+    # Interpreter + stamp present, but the stamp doesn't match the current
+    # requirements.txt (requirements changed since install). The hook's
+    # `cmp -s` would rebuild; /setup must NOT report READY on the stale venv.
+    data = _make_venv_python(monkeypatch)
+    (data / "requirements.installed.txt").write_bytes(
+        _requirements_bytes() + b"\n# drifted since install\n")
+    report = status_cli.check_venv()
+    assert report["ok"] is False
+    assert "out of date" in report["detail"]
+
+
+def test_setup_venv_fails_closed_when_stamp_unreadable(repo, monkeypatch):
+    # Fail closed like the hook's `cmp -s`, which exits non-zero (and
+    # re-provisions) when a file can't be read. A stamp that exists but can't
+    # be read as bytes (here: it's a directory) must report NOT READY, never
+    # READY.
+    from paths import plugin_data_dir
+    _make_venv_python(monkeypatch)
+    stamp = plugin_data_dir() / "requirements.installed.txt"
+    stamp.mkdir()  # exists() is True, read_bytes() raises IsADirectoryError
+    report = status_cli.check_venv()
+    assert report["ok"] is False
+    assert "cannot compare" in report["detail"]
+
+
 # ---- run_setup aggregate ---------------------------------------------------
 
 def test_run_setup_reports_not_ready_when_a_check_fails(repo, monkeypatch):
