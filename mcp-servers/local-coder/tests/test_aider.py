@@ -133,6 +133,29 @@ def test_run_backend_forwards_on_output_to_run_monitored_subprocess(git_repo):
     assert captured["on_output"] is my_on_output
 
 
+def test_run_backend_forwards_on_start_to_run_monitored_subprocess(git_repo):
+    captured = {}
+
+    def fake_run(cmd, cwd, stall_timeout_seconds, idle_notify_interval_seconds, on_tick=None, on_output=None, first_output_timeout_seconds=None, on_start=None):
+        captured["on_start"] = on_start
+        (git_repo / "new_file.py").write_text("# new\n")
+        subprocess.run(["git", "add", "new_file.py"], cwd=git_repo, check=True)
+        subprocess.run(["git", "commit", "-m", "aider commit"], cwd=git_repo, check=True, capture_output=True)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    def my_on_start(pid):
+        pass
+
+    backend = AiderBackend()
+    with patch.object(common, "run_monitored_subprocess", side_effect=fake_run):
+        backend.run_backend(
+            task="add a file", repo_path=str(git_repo), branch="test-branch",
+            config=BASE_CONFIG, model="ollama/qwen3-coder:30b", on_start=my_on_start,
+        )
+
+    assert captured["on_start"] is my_on_start
+
+
 def test_run_backend_falls_back_to_config_model_when_model_arg_is_none(git_repo):
     captured = {}
 

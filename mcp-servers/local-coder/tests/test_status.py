@@ -32,9 +32,11 @@ def test_progress_updater_dedupes_unchanged_activity(repo):
     up = status.ProgressUpdater(repo, rec["id"])
     up.on_activity("line A")
     jf = status.resolve_state_dir(repo) / f"{rec['id']}.json"
-    m1 = jf.stat().st_mtime_ns; time.sleep(0.01)
-    up.on_activity("line A"); assert jf.stat().st_mtime_ns == m1
-    up.on_activity("line B"); assert jf.stat().st_mtime_ns != m1
+    after_first_activity = jf.read_bytes()
+    up.on_activity("line A")
+    assert jf.read_bytes() == after_first_activity
+    up.on_activity("line B")
+    assert jf.read_bytes() != after_first_activity
 
 def test_finalize_sets_terminal_state(repo):
     rec = status.create_record(repo, "dev", "m", "/tmp/x.log")

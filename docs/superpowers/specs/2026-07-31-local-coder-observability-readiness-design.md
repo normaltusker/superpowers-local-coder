@@ -51,7 +51,8 @@ review-hardened logic is rewritten.
 Three artifacts per delegation, under a workspace-keyed state directory:
 
 - `state.json` — index of recent delegations, capped and pruned by `updatedAt`.
-  Writes go through the existing `config._config_lock()` for cross-process safety.
+  Writes use a dedicated per-workspace index lockfile via `locking.file_lock`
+  for cross-process safety.
 - `<job-id>.json` — the per-delegation record (full shape below).
 - the existing per-call **output log** — unchanged; the record references it by
   path.
@@ -185,12 +186,13 @@ failure:
 |---|---|---|
 | venv provisioned | reuse `ensure-local-coder-venv` stamp logic | venv will auto-provision on next delegation |
 | aider importable | venv python `-c "import aider"` | pip install failed; check scipy/dyld on macOS 27 |
-| ollama reachable + model | GET `http://localhost:11434/api/tags`; assert configured model present | start ollama / `ollama pull <model>` |
+| ollama reachable + model | local `ollama` CLI; assert configured model present | start ollama / `ollama pull <model>` |
 | config valid | parse `config.yaml`; sanity-check model + stall-timeout fields | fix the named field in `config.yaml` |
 
-**Security:** the ollama check targets `http://localhost:11434` **only** — local,
-unauthenticated. No remote endpoint, no token/credential handling. This is
-consistent with the standing no-API-credentials constraint.
+**Security:** the ollama check uses the local `ollama` CLI, which talks only to
+the local daemon — local, unauthenticated. No remote endpoint, no
+token/credential handling. This is consistent with the standing
+no-API-credentials constraint.
 
 ## Orphan Cleanup (Both)
 
@@ -221,8 +223,8 @@ New hook `hooks/cleanup-local-coder-status`, wired into `hooks.json` under
 
 Every status and cleanup operation is non-fatal-guarded. Observability must never
 break a delegation — the same discipline already applied to the announce, tick,
-and output paths. State writes reuse `config._config_lock()` for cross-process
-safety.
+and output paths. Status index writes use a dedicated per-workspace index
+lockfile via `locking.file_lock` for cross-process safety.
 
 ## Testing (TDD)
 

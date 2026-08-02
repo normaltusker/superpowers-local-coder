@@ -208,7 +208,7 @@ git commit -m "local-coder: add optional on_start(pid) callback to run_monitored
 1. After `output_log_path` is created, before backend run: `record = status.create_record(target_repo=..., branch=..., model=..., output_log=str(output_log_path), session_id=os.environ.get("CLAUDE_SESSION_ID"))`. Build a module-level `ProgressUpdater(record's repo, record["id"])`.
 2. Inside `make_on_output`'s callback, after the existing log append: `updater.on_output(chunk)`.
 3. Inside `make_on_tick`'s callback, after the existing `latest_line` capture: `updater.on_activity(latest_line)`.
-4. In the existing `try/finally`, at finalize: on success `status.finalize(record, status="completed", phase="committing"→"done", commit_sha=result.commit_sha)`; on failure/exception `status.finalize(record, status="failed", phase="failed", error_message=...)`. Place beside the existing `_ACTIVE_OUTPUT_LOGS.discard(...)`.
+4. In the existing `try/finally`, at finalize: on success `status.finalize(record, status="completed", phase="committing"→"done", commit_sha=result.commit_sha)`; when the commit succeeded locally but push failed or timed out, `status.finalize(record, status="completed", phase="committing", commit_sha=result.commit_sha, error_message=push_error)`; on failure/exception `status.finalize(record, status="failed", phase="failed", error_message=...)`. Place beside the existing `_ACTIVE_OUTPUT_LOGS.discard(...)`.
    - PID: pass an `on_start=lambda pid: status.set_pid(record, pid)` down to `run_monitored_subprocess` (through the backend's `run_backend`).
 
 - [ ] **Step 1: Write failing tests**
@@ -406,6 +406,8 @@ Expected: FAIL (hook missing)
 - [ ] **Step 3: Implement `hooks/cleanup-local-coder-status`**
 
 A hook (bash calling a small python one-liner, or node — match the repo's hook style; `session-start` is bash) that: reads the SessionEnd JSON payload from stdin, extracts the session id, resolves the workspace state dir, and for each `running` record with a matching `sessionId` and a live `pid`, process-tree-terminates it (SIGTERM then SIGKILL after a short grace) and marks the record `orphaned`. Bounded by an internal timeout so SessionEnd never hangs. Non-fatal: any error warns and exits 0. Make it executable (`chmod +x`).
+
+**Known limitation:** Orphan cleanup at SessionEnd is scoped to the current workspace's state dir: both `create_record`'s startup sweep and the SessionEnd hook resolve a single repository's dir. A session that delegated across multiple repositories leaves records in the other workspaces unswept until a later session in those repositories runs. This is accepted behavior, not a bug.
 
 - [ ] **Step 4: Add the SessionEnd entry to `hooks/hooks.json`**
 
