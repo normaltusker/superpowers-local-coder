@@ -111,7 +111,8 @@ def _make_venv_python(monkeypatch):
     data = plugin_data_dir()
     (data / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
     py = data / ".venv" / "bin" / "python"
-    py.write_text("#!/bin/sh\n"); py.chmod(0o755)
+    py.write_text("#!/bin/sh\n")
+    py.chmod(0o755)
     return data
 
 
