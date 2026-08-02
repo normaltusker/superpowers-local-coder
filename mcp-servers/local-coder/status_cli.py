@@ -148,19 +148,26 @@ def check_venv() -> dict:
         return {"name": "venv", "ok": False,
                 "detail": f"venv python present but stamp {stamp.name} missing",
                 "nextStep": "re-run provisioning; the venv looks incomplete"}
-    # Stale-stamp check: same contract as the hook's `cmp -s`. If we can't read
-    # either file, fall through to OK rather than block on an I/O hiccup — the
-    # hook remains the source of truth and re-provisions when it next runs.
+    # Stale-stamp check, matching the hook's `cmp -s requirements.txt stamp`.
+    # `cmp -s` exits non-zero — so the hook re-provisions — whenever the files
+    # differ OR either is missing/unreadable. We FAIL CLOSED the same way:
+    # report NOT READY on any of those, and READY only on a byte-for-byte match.
+    # Treating an unreadable/missing file as READY here would tell the user the
+    # venv is fine while the hook would rebuild it on the next run.
     try:
-        if requirements.exists() and \
-                stamp.read_bytes() != requirements.read_bytes():
-            return {"name": "venv", "ok": False,
-                    "detail": "venv is out of date — requirements.txt changed "
-                              "since the last install",
-                    "nextStep": "re-run provisioning; the venv will reinstall "
-                                "to match requirements.txt on the next delegation"}
-    except OSError:
-        pass
+        stamp_bytes = stamp.read_bytes()
+        requirements_bytes = requirements.read_bytes()
+    except OSError as e:
+        return {"name": "venv", "ok": False,
+                "detail": f"cannot compare venv stamp to requirements.txt: {e}",
+                "nextStep": "re-run provisioning; the venv freshness can't be "
+                            "verified"}
+    if stamp_bytes != requirements_bytes:
+        return {"name": "venv", "ok": False,
+                "detail": "venv is out of date — requirements.txt changed "
+                          "since the last install",
+                "nextStep": "re-run provisioning; the venv will reinstall "
+                            "to match requirements.txt on the next delegation"}
     return {"name": "venv", "ok": True, "detail": str(python), "nextStep": None}
 
 

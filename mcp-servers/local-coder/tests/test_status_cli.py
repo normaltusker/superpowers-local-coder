@@ -159,6 +159,20 @@ def test_setup_venv_fails_when_stamp_is_stale(repo, monkeypatch):
     assert "out of date" in report["detail"]
 
 
+def test_setup_venv_fails_closed_when_stamp_unreadable(repo, monkeypatch):
+    # Fail closed like the hook's `cmp -s`, which exits non-zero (and
+    # re-provisions) when a file can't be read. A stamp that exists but can't
+    # be read as bytes (here: it's a directory) must report NOT READY, never
+    # READY.
+    from paths import plugin_data_dir
+    _make_venv_python(monkeypatch)
+    stamp = plugin_data_dir() / "requirements.installed.txt"
+    stamp.mkdir()  # exists() is True, read_bytes() raises IsADirectoryError
+    report = status_cli.check_venv()
+    assert report["ok"] is False
+    assert "cannot compare" in report["detail"]
+
+
 # ---- run_setup aggregate ---------------------------------------------------
 
 def test_run_setup_reports_not_ready_when_a_check_fails(repo, monkeypatch):
