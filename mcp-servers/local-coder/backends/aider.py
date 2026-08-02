@@ -17,6 +17,7 @@ class AiderBackend(BackendAdapter):
         model: str | None = None,
         on_tick: Callable[[], None] | None = None,
         on_output: Callable[[str], None] | None = None,
+        on_start: Callable[[int], None] | None = None,
     ) -> CompletionResult:
         model = model or config.get("model")
         if not model:
@@ -62,6 +63,7 @@ class AiderBackend(BackendAdapter):
                 first_output_timeout_seconds=config.get("first_output_timeout_seconds"),
                 on_tick=on_tick,
                 on_output=on_output,
+                on_start=on_start,
             )
         except common.StallError as e:
             # aider writes edited files to disk before committing them (two

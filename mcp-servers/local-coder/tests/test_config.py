@@ -320,16 +320,17 @@ def test_list_available_models_with_prefix_propagates_unavailable_error(isolated
 
 
 def test_config_lock_selects_platform_lock_module():
-    # The module must pick the OS-appropriate lock primitive at import:
-    # fcntl on POSIX, msvcrt on Windows. This guards against the current
-    # unconditional `import fcntl`, which crashes import on Windows.
-    import config as config_module
-    if config_module._IS_WINDOWS:
+    # The lock primitive must pick the OS-appropriate module at import:
+    # fcntl on POSIX, msvcrt on Windows. This guards against an unconditional
+    # `import fcntl`, which crashes import on Windows. The primitive now lives
+    # in the stdlib-only `locking` module (extracted from config).
+    import locking
+    if locking._IS_WINDOWS:
         import msvcrt  # noqa: F401 — must be importable on Windows
-        assert config_module._lock_module.__name__ == "msvcrt"
+        assert locking._lock_module.__name__ == "msvcrt"
     else:
         import fcntl  # noqa: F401
-        assert config_module._lock_module.__name__ == "fcntl"
+        assert locking._lock_module.__name__ == "fcntl"
 
 
 def test_config_lock_still_guards_the_critical_section(isolated_config):

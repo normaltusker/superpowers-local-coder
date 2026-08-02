@@ -36,7 +36,7 @@ async def test_delegate_implementation_applies_configured_branch_prefix(isolated
     # passing a bare branch name should end up on the prefixed branch.
     captured = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         captured["branch"] = branch
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
@@ -56,7 +56,7 @@ async def test_delegate_implementation_does_not_double_prefix_branch(isolated_co
     # applied twice.
     captured = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         captured["branch"] = branch
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
@@ -74,7 +74,7 @@ async def test_delegate_implementation_skips_prefix_when_configured_empty(isolat
     config_module.merge_config({"branch_prefix": ""})
     captured = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         captured["branch"] = branch
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
@@ -198,7 +198,7 @@ async def test_delegate_implementation_unimplemented_backend_returns_clean_error
 async def test_delegate_implementation_on_tick_reports_progress_via_ctx(isolated_config, git_repo_no_remote):
     captured_on_tick = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         captured_on_tick["on_tick"] = on_tick
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
@@ -231,7 +231,7 @@ async def test_delegate_implementation_on_tick_reports_progress_via_ctx(isolated
 async def test_delegate_implementation_on_tick_logs_to_stderr_without_ctx(isolated_config, git_repo_no_remote, capsys):
     captured_on_tick = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         captured_on_tick["on_tick"] = on_tick
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
@@ -253,7 +253,7 @@ async def test_delegate_implementation_on_tick_logs_to_stderr_without_ctx(isolat
 async def test_on_tick_pulse_reflects_latest_output_line(isolated_config, git_repo_no_remote):
     captured = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         captured["on_tick"] = on_tick
         captured["on_output"] = on_output
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
@@ -293,7 +293,7 @@ async def test_on_tick_pulse_ignores_incomplete_trailing_line(isolated_config, g
     # finishes in a later chunk.
     captured = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         captured["on_tick"] = on_tick
         captured["on_output"] = on_output
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
@@ -336,7 +336,7 @@ async def test_pulse_holder_resets_between_failover_attempts(isolated_config, gi
 
     captured = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         # First (primary) model emits a line then "fails"; capture the
         # SECOND (fallback) model's on_tick to inspect its first pulse.
         if model == "ollama/fallback-model:1b":
@@ -378,7 +378,7 @@ async def test_delegate_implementation_on_output_writes_to_log_file(
 
     captured_on_output = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         captured_on_output["on_output"] = on_output
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
@@ -410,7 +410,7 @@ async def test_delegate_implementation_on_output_still_writes_to_stderr(
 
     captured_on_output = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         captured_on_output["on_output"] = on_output
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
@@ -441,7 +441,7 @@ async def test_each_call_uses_a_unique_output_log_path(
     base = tmp_path / "local-coder-output.log"
     monkeypatch.setattr(server, "OUTPUT_LOG_PATH", base)
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
     with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
@@ -477,7 +477,7 @@ async def test_on_output_log_write_failure_does_not_abort_the_attempt(
 
     captured_on_output = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         captured_on_output["on_output"] = on_output
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
@@ -506,7 +506,7 @@ async def test_on_output_updates_pulse_on_carriage_return_progress(isolated_conf
     # "\r" as a line delimiter too.
     captured = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         captured["on_tick"] = on_tick
         captured["on_output"] = on_output
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
@@ -538,7 +538,7 @@ async def test_on_output_bounds_partial_line_buffer(isolated_config, git_repo_no
 
     captured = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         captured["on_tick"] = on_tick
         captured["on_output"] = on_output
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
@@ -575,7 +575,7 @@ async def test_on_output_log_write_unicode_error_is_non_fatal(isolated_config, g
 
     captured = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         captured["on_output"] = on_output
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
@@ -601,7 +601,7 @@ async def test_on_output_log_write_failure_warns_only_once(isolated_config, git_
 
     captured = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         captured["on_output"] = on_output
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
@@ -627,7 +627,7 @@ async def test_output_log_path_announced_early_for_live_tailing(isolated_config,
     # result is produced.
     announced = []
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         # By the time the backend runs, the log path must already have been
         # announced (the announce happens before this call).
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
@@ -666,7 +666,7 @@ async def test_early_log_announce_failure_does_not_abort_delegation(isolated_con
     # primary implementation workflow.
     ran = {"backend": False}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         ran["backend"] = True
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
@@ -696,7 +696,7 @@ async def test_push_failure_response_includes_output_tail(isolated_config, git_r
     # backend transcript in scope — surface it so the caller can see what
     # the model did, even though the failure was in the push step, not the
     # backend. Mirrors the success + all-failed paths.
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         return CompletionResult(
             success=True, files_changed=["a.py"], commit_sha="abc123",
             output_tail="backend transcript before push failed",
@@ -964,7 +964,7 @@ def test_list_available_models_returns_clean_error_when_unreachable(isolated_con
 
 
 async def test_delegate_implementation_success_includes_output_tail(isolated_config, git_repo_no_remote):
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         return CompletionResult(
             success=True, files_changed=["a.py"], commit_sha="abc123",
             output_tail="full aider transcript here",
@@ -981,7 +981,7 @@ async def test_delegate_implementation_success_includes_output_tail(isolated_con
 
 
 async def test_delegate_implementation_all_failed_includes_last_output_tail(isolated_config, git_repo_no_remote):
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         return CompletionResult(
             success=False, error=f"{model} failed",
             output_tail=f"transcript from {model}",
@@ -1011,7 +1011,7 @@ async def test_on_tick_progress_failure_does_not_propagate(isolated_config, git_
     # the periodic tick must too. on_tick must swallow-and-warn instead.
     captured_on_tick = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         captured_on_tick["on_tick"] = on_tick
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
@@ -1041,7 +1041,7 @@ async def test_on_tick_progress_failure_warns_only_once(isolated_config, git_rep
     # on_output log-write warn-once guard.
     captured_on_tick = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         captured_on_tick["on_tick"] = on_tick
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
@@ -1159,7 +1159,7 @@ async def test_per_call_log_exists_after_announce_before_output(
 
     saw_file_at_backend_start = {}
 
-    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_run_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         # At this point the announce has already happened but no on_output
         # (backend output) has been emitted — a cold load. The per-call log
         # must already exist so `tail -f` works.
@@ -1281,7 +1281,7 @@ async def test_delegate_deregisters_in_flight_log_on_completion(
     monkeypatch.setattr(server, "OUTPUT_LOG_PATH", base)
     monkeypatch.setattr(server, "_ACTIVE_OUTPUT_LOGS", set())
 
-    def fake_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         # While the backend runs, this call's log IS registered as in-flight.
         assert len(server._ACTIVE_OUTPUT_LOGS) == 1
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
@@ -1387,7 +1387,7 @@ async def test_delegate_prunes_logs_on_each_call(isolated_config, git_repo_no_re
         p.write_text("old\n")
         os.utime(p, (1000 + i, 1000 + i))
 
-    def fake_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
     with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_backend):
@@ -1416,7 +1416,7 @@ async def test_delegate_survives_non_int_retention_in_config(
     # Write a corrupt value straight to disk, bypassing configure()'s validation.
     config_module.save_config({**config_module.load_config(), "log_retention_count": "fifty"})
 
-    def fake_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None):
+    def fake_backend(task, repo_path, branch, config, model=None, on_tick=None, on_output=None, on_start=None):
         return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
     with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_backend):
@@ -1443,3 +1443,58 @@ def test_output_log_path_lives_under_plugin_data_dir(tmp_path, monkeypatch):
     finally:
         monkeypatch.delenv("CLAUDE_PLUGIN_DATA", raising=False)
         importlib.reload(server_module)  # restore in-tree default for other tests
+
+
+async def test_delegate_creates_and_finalizes_status_record(
+    isolated_config, git_repo_no_remote, tmp_path, monkeypatch
+):
+    # A successful delegation must leave a terminal status record (completed/
+    # done) carrying the commit sha, readable via the status module.
+    import status
+    monkeypatch.setenv("CLAUDE_PLUGIN_DATA", str(tmp_path))
+
+    def fake_run_backend(task, repo_path, branch, config, model=None,
+                         on_tick=None, on_output=None, on_start=None):
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        result = await server._delegate_implementation_impl(
+            task="add a.py", branch="my-task",
+            target_repo_path=str(git_repo_no_remote),
+        )
+
+    assert result["success"] is True
+    records = status.list_records(str(git_repo_no_remote), all_sessions=True)
+    assert records, "expected a status record to be written"
+    rec = records[0]
+    assert rec["status"] == "completed"
+    assert rec["phase"] == "done"
+    assert rec["commitSha"] == "abc123"
+    assert rec["pid"] is None
+    assert rec["completedAt"]
+
+
+async def test_delegate_status_write_failure_is_nonfatal(
+    isolated_config, git_repo_no_remote, tmp_path, monkeypatch
+):
+    # If status.create_record blows up, the delegation itself must still
+    # succeed — observability is never allowed to fail the real workflow.
+    import status
+    monkeypatch.setenv("CLAUDE_PLUGIN_DATA", str(tmp_path))
+
+    def boom(*a, **k):
+        raise RuntimeError("status is broken")
+
+    monkeypatch.setattr(status, "create_record", boom)
+
+    def fake_run_backend(task, repo_path, branch, config, model=None,
+                         on_tick=None, on_output=None, on_start=None):
+        return CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+
+    with patch("backends.aider.AiderBackend.run_backend", side_effect=fake_run_backend):
+        result = await server._delegate_implementation_impl(
+            task="add a.py", branch="my-task",
+            target_repo_path=str(git_repo_no_remote),
+        )
+
+    assert result["success"] is True
