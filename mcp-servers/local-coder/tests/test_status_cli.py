@@ -101,19 +101,29 @@ def test_setup_venv_missing(repo):
     assert "auto-provision" in report["nextStep"]
 
 
-def _provision_fake_venv(monkeypatch):
-    """Lay out a venv exactly as hooks/ensure-local-coder-venv does:
-    - interpreter at   plugin_data_dir()/.venv/bin/python
-    - success stamp at plugin_data_dir()/requirements.installed.txt  (DATA_DIR),
-      NOT inside .venv. check_venv must look where the hook actually writes it.
-    """
+def _requirements_bytes():
+    from pathlib import Path
+    return (Path(status_cli.__file__).parent / "requirements.txt").read_bytes()
+
+
+def _make_venv_python(monkeypatch):
     from paths import plugin_data_dir
     data = plugin_data_dir()
     (data / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
     py = data / ".venv" / "bin" / "python"
-    py.write_text("#!/bin/sh\n")
-    py.chmod(0o755)
-    (data / "requirements.installed.txt").write_text("aider-chat==0.0.0\n")
+    py.write_text("#!/bin/sh\n"); py.chmod(0o755)
+    return data
+
+
+def _provision_fake_venv(monkeypatch):
+    """Lay out a venv exactly as hooks/ensure-local-coder-venv does:
+    - interpreter at   plugin_data_dir()/.venv/bin/python
+    - success stamp at plugin_data_dir()/requirements.installed.txt  (DATA_DIR),
+      NOT inside .venv, and a byte copy of the current requirements.txt (the
+      hook's `cmp -s requirements.txt stamp` freshness contract).
+    """
+    data = _make_venv_python(monkeypatch)
+    (data / "requirements.installed.txt").write_bytes(_requirements_bytes())
     return data
 
 
@@ -131,14 +141,22 @@ def test_setup_venv_passes_when_provisioned_at_hook_paths(repo, monkeypatch):
 
 def test_setup_venv_fails_when_stamp_missing(repo, monkeypatch):
     # Interpreter present but no success stamp -> incomplete provisioning.
-    from paths import plugin_data_dir
-    data = plugin_data_dir()
-    (data / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
-    py = data / ".venv" / "bin" / "python"
-    py.write_text("#!/bin/sh\n"); py.chmod(0o755)
+    _make_venv_python(monkeypatch)
     report = status_cli.check_venv()
     assert report["ok"] is False
     assert "stamp" in report["detail"]
+
+
+def test_setup_venv_fails_when_stamp_is_stale(repo, monkeypatch):
+    # Interpreter + stamp present, but the stamp doesn't match the current
+    # requirements.txt (requirements changed since install). The hook's
+    # `cmp -s` would rebuild; /setup must NOT report READY on the stale venv.
+    data = _make_venv_python(monkeypatch)
+    (data / "requirements.installed.txt").write_bytes(
+        _requirements_bytes() + b"\n# drifted since install\n")
+    report = status_cli.check_venv()
+    assert report["ok"] is False
+    assert "out of date" in report["detail"]
 
 
 # ---- run_setup aggregate ---------------------------------------------------
