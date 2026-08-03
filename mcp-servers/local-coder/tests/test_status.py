@@ -538,6 +538,34 @@ def test_prune_records_keeps_live_records_beyond_cap(repo, monkeypatch):
     assert (status._record_path(repo, live["id"])).exists()
 
 
+def test_prune_deletes_record_and_lockfile(repo, monkeypatch):
+    # Prune removes both the record file AND its lockfile, under the per-record
+    # lock, once the record is terminal past the grace.
+    monkeypatch.setattr(status, "_MAX_INDEX_JOBS", 0)
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+    status.finalize(rec, status="completed", phase="done", commit_sha="c")
+    _backdate(repo, rec["id"], status._PRUNE_MIN_AGE_SECONDS + 60)
+    status._prune_records(repo)
+    assert not status._record_path(repo, rec["id"]).exists()
+    assert not status._record_lock_path(repo, rec["id"]).exists()
+
+
+def test_prune_reverifies_terminal_and_age_under_lock(repo, monkeypatch):
+    # The snapshot may say prune-eligible, but a writer can refresh the record
+    # between the snapshot and the locked delete. _prune_one_record re-reads
+    # under the lock and must NOT delete a record that is no longer eligible.
+    monkeypatch.setattr(status, "_MAX_INDEX_JOBS", 0)
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+    status.finalize(rec, status="completed", phase="done", commit_sha="c")
+    _backdate(repo, rec["id"], status._PRUNE_MIN_AGE_SECONDS + 60)
+    # Between "snapshot" and prune, the record's updatedAt is refreshed to now
+    # (e.g. a late in-session write), making it no longer past the grace.
+    p = status._record_path(repo, rec["id"])
+    j = status.read_record(p); j["updatedAt"] = status._now(); status._write_json(p, j)
+    status._prune_one_record(repo, rec["id"], status.resolve_state_dir(repo))
+    assert p.exists()  # re-verified fresh under the lock -> not pruned
+
+
 def test_patch_on_disk_does_not_resurrect_a_pruned_record(repo):
     # Codex: pruning deletes a terminal record file. A worker still holding the
     # record in memory (possibly still `running`) must NOT recreate it via a

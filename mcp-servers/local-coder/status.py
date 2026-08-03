@@ -550,29 +550,68 @@ def _age_seconds(iso_ts) -> float | None:
         return None
 
 
+def _prune_one_record(target_repo, job_id, state_dir) -> None:
+    """Delete a single pruned record UNDER its per-record lock, re-verifying the
+    terminal+age condition against the freshly-read on-disk record inside the
+    lock. This serializes deletion against every _locked_record_update writer:
+    without the lock, a writer could read the record, then have prune delete the
+    file, then have the writer's _save_record recreate it (prune-then-recreate).
+    Holding the same lock the writers hold means either the write completes
+    before we delete, or we delete and the writer (seeing a missing file, with
+    _patch_on_disk's fallback=None) makes its patch a no-op."""
+    with file_lock(_record_lock_path(target_repo, job_id)):
+        record_path = _record_path(target_repo, job_id)
+        try:
+            current = read_record(record_path)
+        except Exception:
+            return  # already gone or unreadable — nothing to prune
+        if not isinstance(current, dict):
+            return
+        # Re-check under the lock: only prune a record that is STILL terminal and
+        # STILL past the grace. A writer may have revived/refreshed it between the
+        # snapshot list and here.
+        if current.get("status") not in _TERMINAL_STATUSES:
+            return
+        age = _age_seconds(current.get("updatedAt"))
+        if age is None or age <= _PRUNE_MIN_AGE_SECONDS:
+            return
+        try:
+            record_path.unlink()
+        except OSError:
+            pass
+    # The lockfile is removed OUTSIDE the lock (we can't unlink a file whose lock
+    # we still hold on all platforms). A leftover empty lockfile is harmless —
+    # job ids are unique, so it is never reused — but we reclaim it best-effort.
+    try:
+        _record_lock_path(target_repo, job_id).unlink()
+    except OSError:
+        pass
+
+
 def _prune_records(target_repo) -> None:
     """Bound the state directory: keep only the newest _MAX_INDEX_JOBS records
     (by updatedAt), and only prune TERMINAL ones — a still-running/committing
     record is never deleted regardless of age. Deletes each pruned record's
-    `<id>.json` AND its `.<id>.json.lock`. Without this, two files accumulate
-    per delegation forever and list_records re-parses the whole history on every
-    create_record / SessionEnd. Non-fatal: never raises to the caller."""
+    `<id>.json` AND its `.<id>.json.lock`, UNDER the per-record lock (see
+    _prune_one_record). Without this, two files accumulate per delegation forever
+    and list_records re-parses the whole history on every create_record /
+    SessionEnd. Non-fatal: never raises to the caller."""
     try:
         records = list_records(target_repo, all_sessions=True)
         if len(records) <= _MAX_INDEX_JOBS:
             return
         # records are newest-first; everything past the cap is a prune candidate.
+        # The authoritative terminal+age check happens under the lock inside
+        # _prune_one_record; the checks here are a cheap pre-filter on the
+        # snapshot to avoid taking a lock for records that obviously stay.
         state_dir = resolve_state_dir(target_repo)
         for record in records[_MAX_INDEX_JOBS:]:
             if record.get("status") not in _TERMINAL_STATUSES:
                 continue  # keep live records even beyond the cap
             # Do NOT prune a FRESHLY-terminal record: a worker that just
-            # finalized (or that cleanup just orphaned) may still be mid-write,
-            # and deleting the file now would let its next patch see a missing
-            # record. Since _patch_on_disk no longer resurrects a missing file,
-            # such a patch would be silently dropped — but the record would also
-            # vanish from /status prematurely. Only prune once the record has
-            # been terminal longer than the prune grace (off updatedAt).
+            # finalized (or that cleanup just orphaned) may still be mid-write.
+            # Only prune once the record has been terminal longer than the prune
+            # grace (off updatedAt). Re-verified under the lock below.
             age = _age_seconds(record.get("updatedAt"))
             if age is None or age <= _PRUNE_MIN_AGE_SECONDS:
                 continue
@@ -581,12 +620,11 @@ def _prune_records(target_repo) -> None:
                 _validated_job_id(job_id)
             except Exception:
                 continue
-            for path in (state_dir / f"{job_id}.json",
-                         state_dir / f".{job_id}.json.lock"):
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
+            try:
+                _prune_one_record(target_repo, job_id, state_dir)
+            except Exception as inner:
+                _warn("_prune_records(record)", inner)
+                continue
     except Exception as exc:
         _warn("_prune_records", exc)
 
