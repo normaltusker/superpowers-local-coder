@@ -183,3 +183,44 @@ def test_run_setup_reports_not_ready_when_a_check_fails(repo, monkeypatch):
     out, ok = status_cli.run_setup(as_json=False)
     assert ok is False
     assert "NOT READY" in out
+
+
+# ---- config model must be a string (cubic P1) ------------------------------
+
+def test_setup_config_rejects_non_string_model(monkeypatch):
+    monkeypatch.setattr(config, "load_config",
+                        lambda: {"model": 1, "stall_timeout_seconds": 300})
+    report = status_cli.check_config()
+    assert report["ok"] is False
+    assert "string" in report["detail"]
+
+
+def test_run_setup_does_not_crash_on_non_string_model(repo, monkeypatch):
+    # A parseable config with a non-string model (e.g. `model: 1`) must report
+    # NOT READY, not crash check_ollama's str operations.
+    monkeypatch.setattr(config, "load_config",
+                        lambda: {"model": 1, "stall_timeout_seconds": 300})
+    monkeypatch.setattr(ollama_module, "list_ollama_models", lambda: ["x"])
+    out, ok = status_cli.run_setup(as_json=False)
+    assert ok is False
+    assert "NOT READY" in out
+
+
+def test_status_cli_import_is_stdlib_only(repo):
+    # cubic P2: importing status_cli must not eagerly import config (which pulls
+    # in third-party yaml), so the `status` subcommand runs on a stdlib-only
+    # fallback interpreter. config is imported lazily on the setup path only.
+    import subprocess as _sp
+    import sys as _sys
+    from pathlib import Path as _Path
+    mod_dir = _Path(status_cli.__file__).parent
+    code = (
+        "import sys; import status_cli; "
+        "assert 'config' not in sys.modules, 'config imported eagerly'; "
+        "assert 'yaml' not in sys.modules, 'yaml imported eagerly'; "
+        "print('ok')"
+    )
+    proc = _sp.run([_sys.executable, "-c", code], cwd=str(mod_dir),
+                   capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert "ok" in proc.stdout

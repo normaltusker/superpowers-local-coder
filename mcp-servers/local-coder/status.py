@@ -30,6 +30,10 @@ _MAX_INDEX_JOBS = 50
 # sweep retires it as orphaned. Generous enough not to trip a normal startup
 # (backend spawn + cold model load happen well within it).
 _NO_PID_ORPHAN_SECONDS = 600
+# Default SIGTERM→SIGKILL grace for a single process-tree teardown. cleanup
+# clamps this to the budget remaining on its overall deadline so many live
+# records can't push SessionEnd past its hook timeout.
+_DEFAULT_TERMINATE_GRACE_SECONDS = 3.0
 
 
 def _warn(operation: str, exc: Exception) -> None:
@@ -54,8 +58,15 @@ def _base36(value: int) -> str:
 def resolve_state_dir(target_repo: str) -> Path:
     """Return (and create) the status directory for one real repository path."""
     try:
-        slug = _SLUG_RE.sub("-", os.path.basename(target_repo)).strip("-") or "workspace"
-        digest = hashlib.sha256(os.path.realpath(target_repo).encode()).hexdigest()[:16]
+        # Derive BOTH the slug and the digest from the canonical (realpath)
+        # form, so two paths that resolve to the same real repository — e.g. a
+        # symlinked workspace and its target — key to one state directory.
+        # Keying the slug off the raw basename instead would give symlink and
+        # target different dirs (same digest, different slug), leaving one
+        # invisible to /status and SessionEnd cleanup.
+        canonical = os.path.realpath(target_repo)
+        slug = _SLUG_RE.sub("-", os.path.basename(canonical)).strip("-") or "workspace"
+        digest = hashlib.sha256(canonical.encode()).hexdigest()[:16]
         if os.environ.get("CLAUDE_PLUGIN_DATA"):
             root = plugin_data_dir() / "status"
         else:
@@ -96,8 +107,22 @@ def read_record(job_file: Path) -> dict:
     return json.loads(job_file.read_text())
 
 
+# A generated job id looks like `lc-<base36>-<hex>` (see generate_job_id).
+# We ONLY ever address records by an id of this shape. A malformed record whose
+# `id` field carries path separators or `..` must not be able to redirect a
+# record/lock write outside the workspace state dir, so every path derivation
+# validates the id first.
+_JOB_ID_RE = re.compile(r"\Alc-[0-9a-z]+-[0-9a-f]+\Z")
+
+
+def _validated_job_id(job_id) -> str:
+    if not isinstance(job_id, str) or not _JOB_ID_RE.match(job_id):
+        raise ValueError(f"refusing to use non-conforming job id {job_id!r} as a path")
+    return job_id
+
+
 def _record_path(target_repo: str, job_id: str) -> Path:
-    return resolve_state_dir(target_repo) / f"{job_id}.json"
+    return resolve_state_dir(target_repo) / f"{_validated_job_id(job_id)}.json"
 
 
 def _record_lock_path(target_repo: str, job_id: str) -> Path:
@@ -107,7 +132,7 @@ def _record_lock_path(target_repo: str, job_id: str) -> Path:
     process) can otherwise interleave their read-modify-write and clobber each
     other's terminal transition (e.g. a worker patch reviving an `orphaned`
     record cleanup just wrote)."""
-    return resolve_state_dir(target_repo) / f".{job_id}.json.lock"
+    return resolve_state_dir(target_repo) / f".{_validated_job_id(job_id)}.json.lock"
 
 
 def _write_json(path: Path, value: dict) -> None:
@@ -214,9 +239,19 @@ def _patch_on_disk(record: dict, fields: dict) -> None:
     def _apply(current):
         disk_terminal = current.get("status") in _TERMINAL_STATUSES
         for key, value in fields.items():
-            if disk_terminal and key in ("status", "phase", "completedAt",
-                                         "commitSha", "errorMessage"):
-                continue  # preserve the terminal/orphaned outcome on disk
+            if disk_terminal:
+                # The record is already terminal (e.g. SessionEnd cleanup
+                # marked it orphaned and cleared its pid). A late attempt must
+                # NOT resurrect it:
+                #  - status/phase/completion fields: keep the terminal outcome.
+                #  - pid: only a CLEAR (None) is allowed. Writing a live pid
+                #    back onto a retired record would leave a running,
+                #    UNTRACKED process — cleanup already ran and won't revisit
+                #    a terminal record, so nothing would ever reap it.
+                #  - any other late metadata (pidStart, model, ...): ignore.
+                if key == "pid" and value is None:
+                    current[key] = None
+                continue
             current[key] = value
         return True
 
@@ -352,6 +387,26 @@ def is_terminal_on_disk(record) -> bool:
         return False
 
 
+# Phase marking a delegation whose backend has finished and whose local commit
+# exists, but which is still doing post-processing (git push, PR creation).
+# The pid is already cleared here, so an orphan sweep or SessionEnd cleanup that
+# only checks `status == "running"` would otherwise mark this LANDED work
+# `orphaned` before finalize can record it as completed. sweep_orphans and
+# cleanup_session skip a running record in this phase for that reason.
+_COMMITTING_PHASE = "committing"
+
+
+def mark_committing(record) -> None:
+    """Move a still-`running` record into the non-orphanable committing phase
+    once its backend has returned successfully and the local commit exists, so
+    slow push/PR work can't be misreported as orphaned. Leaves a terminal
+    record untouched (the terminal guard in _patch_on_disk handles that)."""
+    try:
+        _patch_on_disk(record, {"phase": _COMMITTING_PHASE})
+    except Exception as exc:
+        _warn("mark_committing", exc)
+
+
 def set_model(record, model) -> None:
     """Record the model this attempt is actually using. Called before each
     failover attempt so /status reports the model that performed (or is
@@ -474,6 +529,11 @@ def sweep_orphans(target_repo) -> None:
                 def _apply(current):
                     if current.get("status") != "running":
                         return False  # already terminal or changed since snapshot
+                    if current.get("phase") == _COMMITTING_PHASE:
+                        # Backend finished, local commit exists, push/PR in
+                        # progress — landed work, not an orphan. Leave it for
+                        # finalize to record as completed.
+                        return False
                     pid = _as_valid_pid(current.get("pid"))
                     if pid is not None:
                         if _pid_alive(pid):
@@ -498,7 +558,8 @@ def sweep_orphans(target_repo) -> None:
         _warn("sweep_orphans", exc)
 
 
-def _terminate_process_tree(pid: int, grace_seconds: float = 3.0) -> None:
+def _terminate_process_tree(pid: int,
+                            grace_seconds: float = _DEFAULT_TERMINATE_GRACE_SECONDS) -> None:
     """Best-effort terminate a delegation process — SIGTERM, then SIGKILL
     after a short grace. Never raises.
 
@@ -508,7 +569,22 @@ def _terminate_process_tree(pid: int, grace_seconds: float = 3.0) -> None:
     delegation subprocess that was NOT started in its own session shares this
     process's group — signalling that group would kill this process (and, in
     tests, the test runner) — so in that case we signal only the pid itself.
+
+    On Windows there is no POSIX process group: `start_new_session` does not
+    create one and `os.killpg`/signals don't apply. Fall back to `taskkill
+    /F /T /PID`, which terminates the process AND its whole child tree, so the
+    aider descendants (git, the model runner) are reaped rather than stranded.
     """
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, timeout=max(1.0, grace_seconds),
+            )
+        except Exception as exc:
+            _warn("_terminate_process_tree(taskkill)", exc)
+        return
+
     def _signal_pid(sig):
         try:
             os.kill(pid, sig)
@@ -601,15 +677,20 @@ def cleanup_session(target_repo, session_id, deadline_seconds: float = 12.0) -> 
                 # We capture the pid to terminate inside the lock, then do the
                 # (potentially slow) SIGTERM/SIGKILL OUTSIDE it so we don't block
                 # workers for the grace period.
-                holder = {"terminate": None}
+                holder = {"terminate": None, "token": None}
 
                 def _apply(current, _holder=holder):
                     if current.get("status") != "running":
+                        return False
+                    if current.get("phase") == _COMMITTING_PHASE:
+                        # Landed work mid push/PR (pid already cleared). Do not
+                        # orphan it — finalize will record the real outcome.
                         return False
                     pid = _as_valid_pid(current.get("pid"))
                     if pid is not None and time.monotonic() < overall_deadline \
                             and _pid_is_ours(current):
                         _holder["terminate"] = pid
+                        _holder["token"] = current.get("pidStart")
                     current["status"] = "orphaned"
                     current["phase"] = "failed"
                     current["completedAt"] = _now()
@@ -620,7 +701,21 @@ def cleanup_session(target_repo, session_id, deadline_seconds: float = 12.0) -> 
                 if persisted is not None:
                     cleaned.append(job_id)
                 if holder["terminate"] is not None:
-                    _terminate_process_tree(holder["terminate"])
+                    # Re-validate the start-time token IMMEDIATELY before
+                    # signalling. Between releasing the record lock and killing,
+                    # the OS could recycle the pid onto an unrelated process; the
+                    # token check inside _apply alone leaves that narrow window.
+                    # A token mismatch now means the pid is no longer ours — skip
+                    # the kill rather than signal a stranger's process.
+                    if _pid_start_time(holder["terminate"]) == holder["token"]:
+                        # Bound the SIGTERM grace by the budget left on the
+                        # overall deadline, not the full default grace. Otherwise
+                        # every live record could add up to the default grace on
+                        # top of the deadline, letting SessionEnd overrun its
+                        # hook timeout.
+                        remaining = overall_deadline - time.monotonic()
+                        grace = max(0.0, min(_DEFAULT_TERMINATE_GRACE_SECONDS, remaining))
+                        _terminate_process_tree(holder["terminate"], grace_seconds=grace)
             except Exception as inner:
                 _warn("cleanup_session(record)", inner)
                 continue

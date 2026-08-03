@@ -14,9 +14,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-import config
 import status
 from paths import plugin_data_dir
+
+# NOTE: `config` is intentionally NOT imported at module top. It imports the
+# third-party `yaml`, which is absent on a stdlib-only fallback interpreter.
+# The `status` subcommand needs no config, so importing config eagerly would
+# make `status` crash with a yaml ImportError on a fresh host. The `setup`
+# path imports config lazily (check_config / run_setup) instead.
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +227,7 @@ def check_ollama(model: str) -> dict:
 
 def check_config() -> dict:
     """config.yaml parses and has a sane model + positive stall timeout."""
+    import config  # lazy: keeps the `status` subcommand stdlib-only (no yaml)
     try:
         cfg = config.load_config()
     except Exception as e:
@@ -234,7 +240,14 @@ def check_config() -> dict:
                 "detail": f"config is not a mapping (got {type(cfg).__name__})",
                 "nextStep": "config.yaml must be a mapping of settings"}
     model = cfg.get("model")
-    if not model or not str(model).strip():
+    # `model` must be a non-empty string. A non-string (e.g. `model: 1`) is a
+    # misconfiguration, and letting it through crashes the ollama check, which
+    # calls str methods like .startswith on it.
+    if not isinstance(model, str):
+        return {"name": "config", "ok": False,
+                "detail": f"model must be a string, got {type(model).__name__}",
+                "nextStep": "set `model` to a string like `ollama/qwen2.5-coder:7b`"}
+    if not model.strip():
         return {"name": "config", "ok": False, "detail": "model is empty",
                 "nextStep": "set a non-empty `model` in config.yaml"}
     stall = cfg.get("stall_timeout_seconds")
@@ -248,14 +261,21 @@ def check_config() -> dict:
 def run_setup(as_json=False) -> tuple[str, bool]:
     cfg_model = None
     try:
+        import config  # lazy: setup path only; keeps `status` stdlib-only
         cfg_model = config.load_config().get("model")
     except Exception:
         pass
+    # check_ollama does string operations on the model (`.startswith`), so pass
+    # it only a string. A non-string model is reported by check_config; here we
+    # coerce to "" so the ollama check still runs (daemon reachability) without
+    # crashing on a misconfigured model type.
+    if not isinstance(cfg_model, str):
+        cfg_model = ""
 
     reports = [
         check_venv(),
         check_aider(),
-        check_ollama(cfg_model or ""),
+        check_ollama(cfg_model),
         check_config(),
     ]
     all_ok = all(r["ok"] for r in reports)

@@ -305,3 +305,105 @@ def test_terminate_sends_final_group_sigkill_after_leader_dies(monkeypatch):
     status._terminate_process_tree(1234, grace_seconds=0.2)
     assert ("pg", _sig.SIGTERM) in sent
     assert ("pg", _sig.SIGKILL) in sent  # the fix: SIGKILL still fires
+
+
+def test_terminate_uses_taskkill_tree_on_windows(monkeypatch):
+    # cubic P2: on Windows there's no POSIX process group, so tree teardown must
+    # go through `taskkill /F /T /PID <pid>` to reap aider's descendants.
+    monkeypatch.setattr(status.os, "name", "nt")
+    calls = []
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        class R: pass
+        return R()
+    monkeypatch.setattr(status.subprocess, "run", fake_run)
+    status._terminate_process_tree(4321, grace_seconds=0.2)
+    assert calls == [["taskkill", "/F", "/T", "/PID", "4321"]]
+
+
+def test_state_dir_same_for_symlinked_workspace(repo, tmp_path):
+    # cubic P1: a symlink and its target resolve to the same real repo, so they
+    # MUST key to one state dir — otherwise a delegation launched via the
+    # symlink is invisible to /status and SessionEnd cleanup.
+    import os
+    real = tmp_path / "realrepo"; real.mkdir()
+    link = tmp_path / "linkrepo"; link.symlink_to(real, target_is_directory=True)
+    assert status.resolve_state_dir(str(real)) == status.resolve_state_dir(str(link))
+
+
+def test_terminal_record_rejects_live_pid_but_allows_clear(repo):
+    # cubic P1: once a record is terminal (orphaned by cleanup, pid cleared), a
+    # late set_pid with a LIVE pid must not be written back — that would leave a
+    # running, untracked process cleanup never revisits. A pid=None clear is
+    # still allowed.
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+    status.finalize(rec, status="orphaned", phase="failed")
+    status.set_pid(rec, 424242)  # racing on_start after cleanup retired it
+    disk = status.read_record(status._record_path(repo, rec["id"]))
+    assert disk["pid"] is None and disk["status"] == "orphaned"
+    status.set_pid(rec, None)  # a clear is still permitted on a terminal record
+    assert status.read_record(status._record_path(repo, rec["id"]))["pid"] is None
+
+
+def test_terminal_record_rejects_late_model_patch(repo):
+    # A late set_model on a retired record must not mutate it either.
+    rec = status.create_record(repo, "dev", "ollama/primary", "/tmp/x.log")
+    status.finalize(rec, status="orphaned", phase="failed")
+    status.set_model(rec, "ollama/late")
+    assert status.read_record(status._record_path(repo, rec["id"]))["model"] == "ollama/primary"
+
+
+def test_record_path_rejects_path_traversal_id(repo):
+    # cubic P2: a malformed record `id` (path separators / ..) must never be
+    # used as a path component, or a write could escape the workspace state dir.
+    for bad in ("../evil", "lc-../x", "/etc/passwd", "no-prefix", "lc-x"):
+        with pytest.raises(ValueError):
+            status._record_path(repo, bad)
+        with pytest.raises(ValueError):
+            status._record_lock_path(repo, bad)
+    # A well-formed generated id is accepted.
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log")
+    assert status._record_path(repo, rec["id"]).name == rec["id"] + ".json"
+
+
+def test_committing_phase_is_not_orphaned_by_sweep(repo):
+    # cubic P2 (#3/#17): a record whose backend finished (pid cleared) and is in
+    # the committing phase is LANDED work doing push/PR — the orphan sweep must
+    # not mark it orphaned.
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+    status.set_pid(rec, None)
+    status.mark_committing(rec)
+    status.sweep_orphans(repo)
+    disk = status.read_record(status._record_path(repo, rec["id"]))
+    assert disk["status"] == "running" and disk["phase"] == "committing"
+
+
+def test_committing_phase_is_not_orphaned_by_cleanup(repo):
+    # Same guarantee for SessionEnd cleanup: a committing (pid-cleared) record
+    # must survive teardown so finalize can record its real outcome.
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+    status.set_pid(rec, None)
+    status.mark_committing(rec)
+    cleaned = status.cleanup_session(repo, "S")
+    disk = status.read_record(status._record_path(repo, rec["id"]))
+    assert rec["id"] not in cleaned
+    assert disk["status"] == "running" and disk["phase"] == "committing"
+
+
+def test_cleanup_grace_is_clamped_to_remaining_budget(repo, monkeypatch):
+    # cubic P2: the SIGTERM grace passed to _terminate_process_tree must be
+    # bounded by the budget left on the overall cleanup deadline, so many live
+    # records can't push SessionEnd past its hook timeout.
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+    status.set_pid(rec, 555001)
+    rec_token = status.read_record(status._record_path(repo, rec["id"])).get("pidStart")
+    monkeypatch.setattr(status, "_pid_is_ours", lambda cur: True)
+    # Make the pre-signal revalidation pass so terminate is reached.
+    monkeypatch.setattr(status, "_pid_start_time", lambda pid: rec_token)
+    grabbed = {}
+    def fake_term(pid, grace_seconds=3.0):
+        grabbed["grace"] = grace_seconds
+    monkeypatch.setattr(status, "_terminate_process_tree", fake_term)
+    # Tiny overall budget -> grace must be clamped well below the 3s default.
+    status.cleanup_session(repo, "S", deadline_seconds=0.5)
+    assert "grace" in grabbed and grabbed["grace"] <= 0.5

@@ -555,6 +555,16 @@ async def _delegate_implementation_impl(
                     pass
 
             if result.success:
+                # The backend committed locally. Move the record into the
+                # non-orphanable `committing` phase BEFORE the (possibly slow)
+                # push/PR work below, so a concurrent SessionEnd cleanup or
+                # orphan sweep can't mark this already-landed work `orphaned`
+                # while the pid is cleared and the status is still `running`.
+                if status_record:
+                    try:
+                        status_module.mark_committing(status_record)
+                    except Exception:
+                        pass
                 note = None
                 pr_url = None
                 has_remote = await anyio.to_thread.run_sync(_has_origin_remote, repo_path)
