@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# SessionEnd hook: terminate any local-coder delegation still running for the
+# ending session and mark its status record orphaned.
+#
+# The SessionEnd payload arrives as JSON on stdin (fields: session_id, cwd,
+# ...). We hand both to status.cleanup_session, which does the record scan,
+# the process-tree kill, and the record update. Everything here is
+# best-effort and MUST NOT fail session teardown: on any error we warn to
+# stderr and exit 0. A bounded read/timeout keeps SessionEnd from hanging.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+LOCAL_CODER_DIR="${PLUGIN_ROOT}/mcp-servers/local-coder"
+
+# Read the hook payload from stdin (may be empty).
+PAYLOAD="$(cat 2>/dev/null || true)"
+
+# Pick an interpreter: prefer the provisioned venv python, else python3.
+# status.cleanup_session only needs stdlib, so python3 is sufficient.
+PY=""
+for candidate in \
+    "${CLAUDE_PLUGIN_DATA:-}/local-coder/.venv/bin/python" \
+    "${CLAUDE_PLUGIN_DATA:-}/local-coder/.venv/Scripts/python.exe" \
+    "$(command -v python3 || true)" \
+    "$(command -v python || true)"; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+        PY="$candidate"
+        break
+    fi
+done
+
+if [ -z "$PY" ]; then
+    # No interpreter available — nothing we can do; do not fail teardown.
+    exit 0
+fi
+
+# Hand the payload to the cleanup function. The Python side resolves the
+# target repo from cwd, filters to this session, kills live orphans, and
+# marks records orphaned. It never raises.
+printf '%s' "$PAYLOAD" | PYTHONPATH="${LOCAL_CODER_DIR}${PYTHONPATH:+:$PYTHONPATH}" "$PY" -c '
+import json, os, subprocess, sys, time
+# One deadline spans BOTH repository resolution and cleanup, so the two
+# steps together stay inside the hook timeout (registered at 20s in
+# hooks.json). Without this, a slow git lookup plus cleanup_session own
+# independent deadline could sum past the hook timeout and be killed
+# mid-teardown. Leave headroom under 20s for interpreter startup + the final
+# terminate grace.
+HOOK_BUDGET_SECONDS = 16.0
+GIT_LOOKUP_MAX_SECONDS = 5.0
+deadline = time.monotonic() + HOOK_BUDGET_SECONDS
+
+try:
+    raw = sys.stdin.read()
+    data = json.loads(raw) if raw.strip() else {}
+except Exception:
+    data = {}
+
+session_id = data.get("session_id") or os.environ.get("CLAUDE_SESSION_ID")
+cwd = data.get("cwd") or os.getcwd()
+
+# Resolve the git top-level of cwd (the same workspace key delegations use);
+# fall back to cwd if git cannot answer. Cap the lookup by both its own limit
+# and whatever is left of the shared budget.
+target_repo = cwd
+git_timeout = max(0.0, min(GIT_LOOKUP_MAX_SECONDS, deadline - time.monotonic()))
+if git_timeout > 0:
+    try:
+        out = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, timeout=git_timeout)
+        if out.returncode == 0 and out.stdout.strip():
+            target_repo = out.stdout.strip()
+    except Exception:
+        pass
+
+try:
+    import status
+    # Hand cleanup only the budget left after repo resolution, so the whole
+    # hook (lookup + cleanup + terminate grace) stays within the timeout.
+    cleanup_budget = max(0.0, deadline - time.monotonic())
+    cleaned = status.cleanup_session(target_repo, session_id,
+                                     deadline_seconds=cleanup_budget)
+    if cleaned:
+        sys.stderr.write(
+            "[local-coder] SessionEnd: orphaned {} delegation(s): {}\n".format(
+                len(cleaned), ", ".join(c for c in cleaned if c)))
+except Exception as e:
+    sys.stderr.write("[local-coder] SessionEnd cleanup failed: {}\n".format(e))
+' 2>&1 || true
+
+exit 0

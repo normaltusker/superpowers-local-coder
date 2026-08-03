@@ -8,6 +8,7 @@ import anyio
 from fastmcp import Context, FastMCP
 
 import config as config_module
+import status as status_module
 from backends.aider import AiderBackend
 from backends.codex import CodexBackend
 from backends.gemini import GeminiBackend
@@ -214,17 +215,106 @@ class GhPrStatusUnknown(Exception):
     duplicate PR) or silently mask a real `gh` problem."""
 
 
-def _has_open_pr(repo_path: str, branch: str) -> bool:
-    result = subprocess.run(
+def _has_open_pr(repo_path: str, branch: str, status_record=None) -> bool:
+    # Tracked so a SessionEnd during this network call can terminate it; the pid
+    # is recorded on the committing record and cleared on return.
+    result = _run_tracked_subprocess(
         ["gh", "pr", "view", branch],
-        cwd=repo_path, capture_output=True, text=True,
-        timeout=NETWORK_SUBPROCESS_TIMEOUT_SECONDS,
+        cwd=repo_path, timeout=NETWORK_SUBPROCESS_TIMEOUT_SECONDS,
+        status_record=status_record,
     )
     if result.returncode == 0:
         return True
     if "no pull requests found" in result.stderr.lower():
         return False
     raise GhPrStatusUnknown(result.stderr.strip() or "gh pr view failed with no stderr output")
+
+
+class _DelegationCancelled(Exception):
+    """Raised when a tracked post-processing subprocess is cancelled because a
+    concurrent SessionEnd cleanup retired the record after the child spawned.
+    The record is already terminal on disk; the caller must stop post-processing
+    and NOT set its own terminal status over the cleanup's."""
+
+
+class _TrackedResult:
+    """Minimal subprocess.run-like result for the tracked post-processing
+    helper: exposes returncode/stdout/stderr so existing call sites are
+    unchanged."""
+    __slots__ = ("returncode", "stdout", "stderr")
+
+    def __init__(self, returncode, stdout, stderr):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _run_tracked_subprocess(cmd, *, cwd, timeout, status_record):
+    """Run a post-processing subprocess (git push / gh pr) as a TRACKED,
+    session-isolated child so SessionEnd cleanup can terminate it.
+
+    The push/PR phase runs after the backend pid was cleared. Without tracking,
+    a SessionEnd during a live push would leave that subprocess running
+    untracked (cleanup has no pid to kill) — so we spawn it in its OWN session
+    (start_new_session=True, making it a group leader) and record its pid on the
+    status record via set_pid, exactly like the backend. cleanup_session's
+    _terminate_process_tree then group-kills the whole push/PR tree.
+
+    On return (success, failure, or timeout) the pid is cleared again so a later
+    orphan sweep can't see a dead pid. Raises subprocess.TimeoutExpired on
+    timeout (after killing the tree), matching subprocess.run so the existing
+    TimeoutExpired handlers apply. OSError (e.g. `gh` not installed) propagates
+    as before.
+    """
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True,
+    )
+    if status_record is not None:
+        try:
+            status_module.set_pid(status_record, proc.pid)
+        except Exception:
+            pass
+        # Cancellation handshake for the SessionEnd-right-after-Popen race:
+        # cleanup may have run in the tiny gap between spawn and set_pid, seen a
+        # committing record with no pid, and retired it — leaving this freshly
+        # spawned child to run after its session ended. Now that the pid is
+        # recorded, re-check the on-disk record: if it went terminal, this child
+        # was started after cleanup, so kill it and abort rather than leave an
+        # untracked live process.
+        try:
+            if status_module.is_terminal_on_disk(status_record):
+                status_module._terminate_process_tree(proc.pid)
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
+                raise _DelegationCancelled(
+                    "session ended: post-processing subprocess cancelled")
+        except _DelegationCancelled:
+            raise
+        except Exception:
+            pass
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Kill the whole session-group tree, then reap, then re-raise so the
+            # caller's existing TimeoutExpired branch records the outcome.
+            status_module._terminate_process_tree(proc.pid)
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                pass
+            raise
+        return _TrackedResult(proc.returncode, stdout, stderr)
+    finally:
+        if status_record is not None:
+            try:
+                status_module.set_pid(status_record, None)
+            except Exception:
+                pass
 
 
 async def _delegate_implementation_impl(
@@ -284,6 +374,14 @@ async def _delegate_implementation_impl(
     # delay unrelated tool work and progress notifications. Every other blocking
     # op in this coroutine (backend run, git checks, push, PR) is offloaded the
     # same way.
+    #
+    # Status holders declared BEFORE the try so the finally can always read
+    # them, even if an exception fires inside the try before the record is
+    # created. Default status_final = failed/failed; a reached success/commit
+    # return path overwrites it.
+    status_record = None
+    status_updater = None
+    status_final = {"status": "failed", "phase": "failed", "error_message": None}
     try:
         await anyio.to_thread.run_sync(
             _prune_and_create_output_log, output_log_path, retention
@@ -314,6 +412,29 @@ async def _delegate_implementation_impl(
                     f"[local-coder] warning: failed to announce output log path: {e}",
                     file=sys.stderr, flush=True,
                 )
+
+        # Observability: create a pollable status record for this delegation.
+        # Isolated + non-fatal — status.* swallow their own errors, and this
+        # create is additionally guarded so nothing here can abort the run.
+        # `status_record` stays None if creation fails, which every later
+        # status hook tolerates. `status_final` (declared above the try)
+        # carries the terminal outcome that the finally-block persists once,
+        # so the many return paths below don't each have to finalize.
+        try:
+            status_record = status_module.create_record(
+                target_repo=repo_path, branch=branch, model=cfg["model"],
+                output_log=str(output_log_path),
+                session_id=os.environ.get("CLAUDE_SESSION_ID"),
+            )
+            if status_record and status_record.get("id"):
+                status_updater = status_module.ProgressUpdater(
+                    repo_path, status_record["id"]
+                )
+        except Exception as e:
+            print(
+                f"[local-coder] warning: status record init failed: {e}",
+                file=sys.stderr, flush=True,
+            )
 
         attempt_models = [cfg["model"], *cfg.get("fallback_models", [])]
         attempt_errors = []
@@ -375,6 +496,11 @@ async def _delegate_implementation_impl(
                             f"call): {e}",
                             file=sys.stderr, flush=True,
                         )
+                # Observability: record the latest complete line as the status
+                # record's free-text activity. on_activity is self-guarded and
+                # deduped (rewrites only when the line changed).
+                if status_updater is not None and line:
+                    status_updater.on_activity(line)
             return on_tick
 
         def make_on_output(model_name: str):
@@ -432,9 +558,27 @@ async def _delegate_implementation_impl(
                 # Bound the carried-over partial: keep only its tail, so a long
                 # delimiter-free stream can't exhaust memory.
                 partial_line[0] = remainder[-_PARTIAL_LINE_MAX_CHARS:]
+                # Observability: flip the status phase starting->working on the
+                # first real chunk. ProgressUpdater.on_output is self-guarded
+                # and deduped, so this is a cheap no-op after the first flip.
+                if status_updater is not None:
+                    status_updater.on_output(chunk)
             return on_output
 
         for model in attempt_models:
+            # If SessionEnd cleanup retired this record mid-run (marked it
+            # orphaned and killed the prior attempt's process), do not spawn
+            # another attempt — the session that requested this work is gone.
+            # Return now, leaving the terminal on-disk record untouched
+            # (status_final=None tells the finally not to finalize over it).
+            if status_record and status_module.is_terminal_on_disk(status_record):
+                status_final = None
+                return {
+                    "success": False,
+                    "error": "delegation orphaned: session ended mid-run",
+                    "output_tail": last_output_tail,
+                    "output_log": str(output_log_path),
+                }
             # Reset the per-attempt holders so this attempt starts clean:
             #  - pulse holders, so this model's first tick (before it emits
             #    anything) can't surface the PREVIOUS model's last line as its
@@ -444,37 +588,102 @@ async def _delegate_implementation_impl(
             latest_line[0] = ""
             partial_line[0] = ""
             log_write_ok[0] = True
+            # Clear any pid carried over from a previous (failed) attempt BEFORE
+            # this attempt spawns its own. Otherwise, between attempts the
+            # record would still name the previous attempt's now-dead pid while
+            # marked running — which the orphan sweep would mark orphaned
+            # mid-delegation, and which session cleanup could act on as a stale
+            # (or reused) pid. on_start below sets this attempt's real pid.
+            if status_record:
+                try:
+                    status_module.set_pid(status_record, None)
+                    # Persist the model this attempt is actually using, so
+                    # /status reports the fallback model when the primary
+                    # failed — not the primary from config.
+                    status_module.set_model(status_record, model)
+                except Exception:
+                    pass
             try:
                 result = await anyio.to_thread.run_sync(
                     lambda model=model: backend.run_backend(
                         task, repo_path, branch, cfg, model=model,
                         on_tick=make_on_tick(model), on_output=make_on_output(model),
+                        on_start=(
+                            (lambda pid: status_module.set_pid(status_record, pid))
+                            if status_record else None
+                        ),
                     )
                 )
             except NotImplementedError as e:
+                status_final = {
+                    "status": "failed", "phase": "failed", "error_message": str(e),
+                }
                 return {"success": False, "error": str(e)}
             except Exception as e:
                 # Any other unexpected exception from a backend attempt (e.g. an
                 # uncaught CalledProcessError from a backend's own git calls)
                 # shouldn't crash the whole tool call — treat it like a failed
                 # attempt and continue the failover loop to the next model.
+                if status_record:
+                    try:
+                        status_module.set_pid(status_record, None)
+                    except Exception:
+                        pass
                 attempt_errors.append(f"{model}: {e}")
                 continue
 
+            # The attempt's process has now exited.
             if result.success:
+                # Clear the dead pid AND enter the non-orphanable `committing`
+                # phase in ONE locked transition (begin_committing). Doing these
+                # as two separate writes left a gap where the record was
+                # `running` with pid=None — a concurrent SessionEnd cleanup could
+                # observe that intermediate state and orphan an already-committed
+                # delegation. The single transition closes that window before the
+                # (possibly slow) push/PR work below.
+                if status_record:
+                    try:
+                        status_module.begin_committing(status_record)
+                    except Exception:
+                        pass
+                # Safe intermediate terminal state: the backend already committed
+                # locally, but status_final still holds the loop's default
+                # failed/failed here. If an UNhandled exception escapes the push/PR
+                # block below (e.g. an OSError from git push, which only the
+                # TimeoutExpired branch catches), the finally would finalize this
+                # already-committed delegation as `failed`. Record it as
+                # completed/committing now; the push-timeout, push-failure, and
+                # final-success paths overwrite this as needed.
+                status_final = {
+                    "status": "completed", "phase": "committing",
+                    "commit_sha": result.commit_sha,
+                }
                 note = None
                 pr_url = None
                 has_remote = await anyio.to_thread.run_sync(_has_origin_remote, repo_path)
                 if has_remote:
                     try:
                         push = await anyio.to_thread.run_sync(
-                            lambda: subprocess.run(
+                            lambda: _run_tracked_subprocess(
                                 ["git", "-C", repo_path, "push", "-u", "origin", branch],
-                                capture_output=True, text=True,
+                                cwd=None,
                                 timeout=NETWORK_SUBPROCESS_TIMEOUT_SECONDS,
+                                status_record=status_record,
                             )
                         )
                     except subprocess.TimeoutExpired:
+                        # Implementation succeeded and committed locally; only
+                        # the push's outcome is unknown. Record it as completed
+                        # work (phase=committing) with the push blocker noted,
+                        # not a failed delegation.
+                        status_final = {
+                            "status": "completed", "phase": "committing",
+                            "commit_sha": result.commit_sha,
+                            "error_message": (
+                                f"git push timed out after "
+                                f"{NETWORK_SUBPROCESS_TIMEOUT_SECONDS}s; remote state unknown"
+                            ),
+                        }
                         return {
                             "success": False,
                             "error": (
@@ -491,6 +700,11 @@ async def _delegate_implementation_impl(
                             "output_log": str(output_log_path),
                         }
                     if push.returncode != 0:
+                        status_final = {
+                            "status": "completed", "phase": "committing",
+                            "commit_sha": result.commit_sha,
+                            "error_message": f"git push failed: {push.stderr.strip()}",
+                        }
                         return {
                             "success": False,
                             "error": f"git push failed: {push.stderr.strip()}",
@@ -503,7 +717,8 @@ async def _delegate_implementation_impl(
 
                     if cfg.get("open_pr"):
                         try:
-                            has_open_pr = await anyio.to_thread.run_sync(_has_open_pr, repo_path, branch)
+                            has_open_pr = await anyio.to_thread.run_sync(
+                                _has_open_pr, repo_path, branch, status_record)
                         except GhPrStatusUnknown as e:
                             # gh pr view failed for a reason other than "no PR" —
                             # don't guess; skip PR creation rather than risk a
@@ -526,11 +741,12 @@ async def _delegate_implementation_impl(
                         if not has_open_pr:
                             try:
                                 pr = await anyio.to_thread.run_sync(
-                                    lambda: subprocess.run(
+                                    lambda: _run_tracked_subprocess(
                                         ["gh", "pr", "create", "--fill", "--head", branch,
                                          "--base", cfg["pr_base_branch"]],
-                                        cwd=repo_path, capture_output=True, text=True,
+                                        cwd=repo_path,
                                         timeout=NETWORK_SUBPROCESS_TIMEOUT_SECONDS,
+                                        status_record=status_record,
                                     )
                                 )
                             except subprocess.TimeoutExpired:
@@ -559,6 +775,10 @@ async def _delegate_implementation_impl(
                 else:
                     note = "no origin remote configured; commit created locally, nothing pushed"
 
+                status_final = {
+                    "status": "completed", "phase": "done",
+                    "commit_sha": result.commit_sha,
+                }
                 return {
                     "success": True,
                     "pr_url": pr_url,
@@ -571,16 +791,57 @@ async def _delegate_implementation_impl(
                     **({"note": note} if note else {}),
                 }
 
+            # Failed attempt. Clear the now-dead backend pid before looping to
+            # the next model (or exiting to the failed finalize), so a
+            # concurrent sweep doesn't see a `running` record naming a dead pid.
+            if status_record:
+                try:
+                    status_module.set_pid(status_record, None)
+                except Exception:
+                    pass
             attempt_errors.append(f"{model}: {result.error}")
             last_output_tail = result.output_tail
 
+        status_final = {
+            "status": "failed", "phase": "failed",
+            "error_message": "all models failed — " + "; ".join(attempt_errors),
+        }
         return {
             "success": False,
             "error": "all models failed — " + "; ".join(attempt_errors),
             "output_tail": last_output_tail,
             "output_log": str(output_log_path),
         }
+    except _DelegationCancelled as e:
+        # A tracked push/PR child was cancelled because SessionEnd cleanup
+        # retired this record after the child spawned. The record is already
+        # terminal on disk (orphaned) — leave it: status_final=None tells the
+        # finally not to finalize over the cleanup's outcome. The dead child was
+        # already killed inside the tracked helper.
+        status_final = None
+        return {
+            "success": False,
+            "error": str(e),
+            "output_tail": last_output_tail,
+            "output_log": str(output_log_path),
+        }
     finally:
+        # Observability: persist the terminal status once, from whatever
+        # status_final the reached return path set (default failed/failed if a
+        # validation return or an exception got here before any was set). Guard
+        # broadly: finalizing status must never mask the real result or raise
+        # out of the finally.
+        # status_final is None only when the loop broke because SessionEnd
+        # cleanup already retired the record (orphaned) — in that case there is
+        # nothing to finalize; the terminal on-disk record stands.
+        if status_record and status_final is not None:
+            try:
+                status_module.finalize(status_record, **status_final)
+            except Exception as e:
+                print(
+                    f"[local-coder] warning: status finalize failed: {e}",
+                    file=sys.stderr, flush=True,
+                )
         # This call's log is no longer in flight — allow future prunes to
         # reclaim it. discard() is idempotent, so a helper that never
         # registered the path (lock/touch failed before add) is harmless.

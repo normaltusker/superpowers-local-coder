@@ -2,6 +2,7 @@ import codecs
 import os
 import re
 import selectors
+import signal
 import subprocess
 import sys
 import time
@@ -353,6 +354,7 @@ def run_monitored_subprocess(
     on_tick: Callable[[], None] | None = None,
     on_output: Callable[[str], None] | None = None,
     first_output_timeout_seconds: float | None = None,
+    on_start: Callable[[int], None] | None = None,
 ) -> subprocess.CompletedProcess:
     # Run with an unbuffered binary pipe (not text=True) so we can read
     # whatever bytes are actually available via a non-blocking os.read()
@@ -374,10 +376,53 @@ def run_monitored_subprocess(
     # reading stdin can still look "recently active" from earlier startup
     # output, so the stall timer never restarts and never fires. With
     # stdin explicitly closed, any read attempt gets immediate EOF instead.
+    # start_new_session=True puts the backend in its OWN process group and
+    # session (POSIX; a harmless no-op on Windows). That makes the child a
+    # group leader (pgid == pid), which is what lets SessionEnd orphan cleanup
+    # group-signal the WHOLE delegation tree — aider plus the git/model-runner
+    # children it spawns — instead of only the direct child. status's
+    # _terminate_process_tree only group-kills when pgid == pid, so without
+    # this the cleanup would fall back to a pid-only kill and leave those
+    # children running.
     process = subprocess.Popen(
         cmd, cwd=cwd, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        start_new_session=True,
     )
+
+    def _kill_process_tree():
+        # The child was started with start_new_session=True, so it leads its own
+        # process group and its descendants (git, the model runner) joined that
+        # group. A plain process.kill() reaches only the direct child, leaving
+        # those descendants orphaned mid-session (SessionEnd cleanup wouldn't run
+        # until teardown). Group-kill when the child leads its own group; fall
+        # back to the direct kill otherwise (and on Windows, where there is no
+        # POSIX group).
+        try:
+            if hasattr(os, "killpg") and hasattr(os, "getpgid"):
+                try:
+                    pgid = os.getpgid(process.pid)
+                    if pgid == process.pid:
+                        os.killpg(pgid, signal.SIGKILL)
+                        return
+                except OSError:
+                    pass
+            process.kill()
+        except OSError:
+            pass
+
+    # Surface the child PID once, right after spawn, so callers can record it
+    # (e.g. the status module, for orphan cleanup). Non-fatal: a raising
+    # callback must never break an otherwise-healthy run — warn and continue,
+    # matching the guard discipline on on_tick/on_output.
+    if on_start is not None:
+        try:
+            on_start(process.pid)
+        except Exception as e:
+            print(
+                f"[local-coder] warning: on_start callback failed: {e}",
+                file=sys.stderr,
+            )
 
     # Bounded tail buffer: append new text, then trim from the front
     # whenever it exceeds the cap, so memory stays flat regardless of how
@@ -518,7 +563,7 @@ def run_monitored_subprocess(
                     and now - last_activity > stall_timeout_seconds
                 )
             if stalled:
-                process.kill()
+                _kill_process_tree()
                 process.wait()
                 if never_emitted:
                     # No output was ever produced, so there is no tail to
@@ -530,8 +575,8 @@ def run_monitored_subprocess(
         if process.poll() is None:
             # An unexpected exception (e.g. from on_tick, or from
             # selector.select()/os.read()) left the subprocess running.
-            # Don't leak it — kill and reap it here.
-            process.kill()
+            # Don't leak it — kill the whole group and reap it here.
+            _kill_process_tree()
             process.wait()
         process.stdout.close()
 

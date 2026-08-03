@@ -1,4 +1,3 @@
-import contextlib
 import os
 import tempfile
 import time
@@ -8,23 +7,8 @@ import yaml
 
 import ollama as ollama_module
 from backends.common import KNOWN_BACKENDS
+from locking import file_lock  # re-exported: existing callers use config.file_lock
 from paths import plugin_data_dir
-
-# Select the OS-appropriate file-locking primitive at import time. `fcntl`
-# does not exist on Windows (importing it unconditionally crashes the
-# server there); `msvcrt` is the Windows stdlib equivalent. Both are wrapped
-# behind _config_lock() below so callers are platform-agnostic.
-# How long _config_lock() waits for a contended lock on Windows before
-# giving up. Generous relative to the guarded critical section (a
-# load->merge->validate->save of one small YAML file), so this is only
-# reached when something is genuinely wrong rather than merely busy.
-_WINDOWS_LOCK_TIMEOUT_SECONDS = 60.0
-
-_IS_WINDOWS = os.name == "nt"
-if _IS_WINDOWS:
-    import msvcrt as _lock_module
-else:
-    import fcntl as _lock_module
 
 # The bundled default config that ships with the plugin — used as a
 # read-only template to seed the real config on first use.
@@ -50,7 +34,6 @@ def _lock_path() -> Path:
     return CONFIG_PATH.parent / f".{CONFIG_PATH.name}.lock"
 
 
-@contextlib.contextmanager
 def _config_lock():
     """Exclusive file lock guarding the load->merge->validate->save
     sequence, so a concurrent configure() call (or a configure() racing a
@@ -59,50 +42,9 @@ def _config_lock():
 
     Uses a dedicated lockfile (not CONFIG_PATH itself, so save_config's
     atomic replace of CONFIG_PATH is never affected by the lock's own file
-    lifecycle). Cross-platform: fcntl.flock on POSIX, msvcrt.locking on
-    Windows — no third-party dependency needed.
+    lifecycle).
     """
-    lock_path = _lock_path()
-    lock_path.touch(exist_ok=True)
-    # Open r+ (never "w"): "w" TRUNCATES, so a second process opening the
-    # lockfile would clobber it while the first holds a lock on it.
-    with open(lock_path, "r+b") as lock_file:
-        if _IS_WINDOWS:
-            # Lock 1 byte at offset 0. Do NOT write before locking — on
-            # Windows a write into a range another process has locked fails,
-            # so writing first made contenders error out instead of waiting.
-            # Windows locks a byte RANGE and the range need not contain data,
-            # so locking offset 0 of an empty file is valid.
-            #
-            # LK_LOCK does not block indefinitely: it retries ~10 times at
-            # 1-second intervals, then raises OSError. That contradicts this
-            # function's "blocks until free" contract, so retry around it —
-            # matching flock's indefinite wait on POSIX.
-            # Bounded, so a PERMANENT failure (bad descriptor, permissions,
-            # a filesystem that cannot lock) surfaces as an error instead of
-            # hanging the MCP call forever. Retrying indefinitely would turn
-            # every fatal lock error into an infinite tool call.
-            deadline = time.monotonic() + _WINDOWS_LOCK_TIMEOUT_SECONDS
-            while True:
-                try:
-                    lock_file.seek(0)
-                    _lock_module.locking(lock_file.fileno(), _lock_module.LK_LOCK, 1)
-                    break
-                except OSError:
-                    if time.monotonic() >= deadline:
-                        raise
-                    time.sleep(0.1)
-            try:
-                yield
-            finally:
-                lock_file.seek(0)
-                _lock_module.locking(lock_file.fileno(), _lock_module.LK_UNLCK, 1)
-        else:
-            _lock_module.flock(lock_file, _lock_module.LOCK_EX)
-            try:
-                yield
-            finally:
-                _lock_module.flock(lock_file, _lock_module.LOCK_UN)
+    return file_lock(_lock_path())
 
 
 def load_config() -> dict:

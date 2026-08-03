@@ -15,5 +15,6 @@ class CodexBackend(BackendAdapter):
         model: str | None = None,
         on_tick: Callable[[], None] | None = None,
         on_output: Callable[[str], None] | None = None,
+        on_start: Callable[[int], None] | None = None,
     ) -> CompletionResult:
         raise NotImplementedError("Codex backend not yet implemented")

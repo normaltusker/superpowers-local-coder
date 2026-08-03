@@ -478,6 +478,34 @@ def test_run_monitored_subprocess_calls_on_tick():
     assert len(ticks) >= 1
 
 
+def test_run_monitored_subprocess_invokes_on_start_with_pid():
+    seen = []
+    common.run_monitored_subprocess(
+        ["sh", "-c", "echo hi"], cwd=".",
+        stall_timeout_seconds=30, idle_notify_interval_seconds=5,
+        on_start=lambda pid: seen.append(pid),
+    )
+    assert len(seen) == 1 and isinstance(seen[0], int) and seen[0] > 0
+
+
+def test_run_monitored_subprocess_without_on_start_unchanged():
+    result = common.run_monitored_subprocess(
+        ["sh", "-c", "echo hi"], cwd=".",
+        stall_timeout_seconds=30, idle_notify_interval_seconds=5,
+    )
+    assert result.returncode == 0
+
+
+def test_run_monitored_subprocess_on_start_failure_is_nonfatal():
+    # A raising on_start must NOT break an otherwise-healthy run.
+    result = common.run_monitored_subprocess(
+        ["sh", "-c", "echo hi"], cwd=".",
+        stall_timeout_seconds=30, idle_notify_interval_seconds=5,
+        on_start=lambda pid: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    assert result.returncode == 0
+
+
 def test_run_monitored_subprocess_bounds_output_to_tail():
     # A subprocess that writes far more than _MAX_OUTPUT_CHARS must not have
     # its full transcript accumulated in memory — only a bounded tail should
