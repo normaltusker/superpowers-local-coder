@@ -42,6 +42,11 @@ _COMMITTING_ORPHAN_SECONDS = 1800
 # clamps this to the budget remaining on its overall deadline so many live
 # records can't push SessionEnd past its hook timeout.
 _DEFAULT_TERMINATE_GRACE_SECONDS = 3.0
+# A terminal record is only pruned once it has been terminal at least this long
+# (off updatedAt). Guards against deleting a record a worker just finalized (or
+# cleanup just orphaned) while that worker may still be mid-write — a
+# prune-then-resurrect race. Generous: prune reclaims disk lazily, not urgently.
+_PRUNE_MIN_AGE_SECONDS = 3600
 
 
 def _warn(operation: str, exc: Exception) -> None:
@@ -255,6 +260,11 @@ def _patch_on_disk(record: dict, fields: dict) -> None:
     it `orphaned` — we do NOT overwrite its status/phase/completion; a killed
     attempt must not revive a record the session teardown already retired. We
     still record a non-status field like `pid` so a cleared pid stays cleared.
+
+    If the on-disk record is MISSING (pruned after it went terminal), we do NOT
+    recreate it from the caller's stale in-memory copy — that copy may still say
+    `running`, which would resurrect a finished/cleaned-up record and defeat
+    SessionEnd cleanup. `fallback=None` makes a missing record a no-op.
     """
     target_repo = record["targetRepo"]
 
@@ -278,7 +288,7 @@ def _patch_on_disk(record: dict, fields: dict) -> None:
         return True
 
     persisted = _locked_record_update(
-        target_repo, record["id"], _apply, fallback=record)
+        target_repo, record["id"], _apply, fallback=None)
     if persisted is not None:
         # Keep the caller's in-memory view coherent with what we persisted.
         record.update(persisted)
@@ -556,6 +566,16 @@ def _prune_records(target_repo) -> None:
         for record in records[_MAX_INDEX_JOBS:]:
             if record.get("status") not in _TERMINAL_STATUSES:
                 continue  # keep live records even beyond the cap
+            # Do NOT prune a FRESHLY-terminal record: a worker that just
+            # finalized (or that cleanup just orphaned) may still be mid-write,
+            # and deleting the file now would let its next patch see a missing
+            # record. Since _patch_on_disk no longer resurrects a missing file,
+            # such a patch would be silently dropped — but the record would also
+            # vanish from /status prematurely. Only prune once the record has
+            # been terminal longer than the prune grace (off updatedAt).
+            age = _age_seconds(record.get("updatedAt"))
+            if age is None or age <= _PRUNE_MIN_AGE_SECONDS:
+                continue
             job_id = record.get("id")
             try:
                 _validated_job_id(job_id)

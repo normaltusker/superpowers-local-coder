@@ -482,6 +482,14 @@ def test_upsert_index_rebuilds_corrupt_index(repo):
     assert isinstance(parsed, dict) and "jobs" in parsed
 
 
+def _backdate(repo, job_id, seconds):
+    p = status._record_path(repo, job_id)
+    j = status.read_record(p)
+    j["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                   time.gmtime(time.time() - seconds))
+    status._write_json(p, j)
+
+
 def test_prune_records_bounds_state_dir(repo, monkeypatch):
     # CodeRabbit Major: the state dir must not grow without bound. Terminal
     # records beyond the cap are deleted (files + lockfiles); live ones are kept.
@@ -491,6 +499,10 @@ def test_prune_records_bounds_state_dir(repo, monkeypatch):
         r = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
         status.finalize(r, status="completed", phase="done", commit_sha="c")
         ids.append(r["id"])
+    # Age every record past the prune grace so the age guard (which protects a
+    # freshly-terminal record from a prune-then-resurrect race) allows pruning.
+    for job_id in ids:
+        _backdate(repo, job_id, status._PRUNE_MIN_AGE_SECONDS + 60)
     status._prune_records(repo)
     state_dir = status.resolve_state_dir(repo)
     remaining = list(state_dir.glob("lc-*.json"))
@@ -498,6 +510,21 @@ def test_prune_records_bounds_state_dir(repo, monkeypatch):
     # oldest record's lockfile is gone too
     oldest = ids[0]
     assert not (state_dir / f".{oldest}.json.lock").exists()
+
+
+def test_prune_records_keeps_freshly_terminal_record(repo, monkeypatch):
+    # Codex: a freshly-terminal record must NOT be pruned — a worker that just
+    # finalized/was-orphaned may still be mid-write, and deleting the file could
+    # race its next patch. Only records terminal past the grace are pruned.
+    monkeypatch.setattr(status, "_MAX_INDEX_JOBS", 1)
+    ids = []
+    for _ in range(4):
+        r = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+        status.finalize(r, status="completed", phase="done", commit_sha="c")
+        ids.append(r["id"])
+    status._prune_records(repo)  # all fresh -> nothing prunes despite the cap
+    state_dir = status.resolve_state_dir(repo)
+    assert len(list(state_dir.glob("lc-*.json"))) == 4
 
 
 def test_prune_records_keeps_live_records_beyond_cap(repo, monkeypatch):
@@ -509,6 +536,20 @@ def test_prune_records_keeps_live_records_beyond_cap(repo, monkeypatch):
     status._prune_records(repo)
     # the still-running record must survive even though it's beyond the cap
     assert (status._record_path(repo, live["id"])).exists()
+
+
+def test_patch_on_disk_does_not_resurrect_a_pruned_record(repo):
+    # Codex: pruning deletes a terminal record file. A worker still holding the
+    # record in memory (possibly still `running`) must NOT recreate it via a
+    # late set_pid/finalize — that would resurrect a finished/cleaned-up record
+    # and defeat SessionEnd cleanup. A missing record makes the patch a no-op.
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+    p = status._record_path(repo, rec["id"])
+    p.unlink()  # simulate prune
+    status.set_pid(rec, 4321)          # stale worker patch (in-memory: running)
+    assert not p.exists()              # not resurrected
+    status.finalize(rec, status="completed", phase="done", commit_sha="c")
+    assert not p.exists()              # finalize doesn't resurrect it either
 
 
 def test_stale_committing_record_is_retired_by_sweep(repo):
