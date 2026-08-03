@@ -230,6 +230,13 @@ def _has_open_pr(repo_path: str, branch: str, status_record=None) -> bool:
     raise GhPrStatusUnknown(result.stderr.strip() or "gh pr view failed with no stderr output")
 
 
+class _DelegationCancelled(Exception):
+    """Raised when a tracked post-processing subprocess is cancelled because a
+    concurrent SessionEnd cleanup retired the record after the child spawned.
+    The record is already terminal on disk; the caller must stop post-processing
+    and NOT set its own terminal status over the cleanup's."""
+
+
 class _TrackedResult:
     """Minimal subprocess.run-like result for the tracked post-processing
     helper: exposes returncode/stdout/stderr so existing call sites are
@@ -267,6 +274,26 @@ def _run_tracked_subprocess(cmd, *, cwd, timeout, status_record):
     if status_record is not None:
         try:
             status_module.set_pid(status_record, proc.pid)
+        except Exception:
+            pass
+        # Cancellation handshake for the SessionEnd-right-after-Popen race:
+        # cleanup may have run in the tiny gap between spawn and set_pid, seen a
+        # committing record with no pid, and retired it — leaving this freshly
+        # spawned child to run after its session ended. Now that the pid is
+        # recorded, re-check the on-disk record: if it went terminal, this child
+        # was started after cleanup, so kill it and abort rather than leave an
+        # untracked live process.
+        try:
+            if status_module.is_terminal_on_disk(status_record):
+                status_module._terminate_process_tree(proc.pid)
+                try:
+                    proc.communicate(timeout=5)
+                except Exception:
+                    pass
+                raise _DelegationCancelled(
+                    "session ended: post-processing subprocess cancelled")
+        except _DelegationCancelled:
+            raise
         except Exception:
             pass
     try:
@@ -605,28 +632,32 @@ async def _delegate_implementation_impl(
                 attempt_errors.append(f"{model}: {e}")
                 continue
 
-            # The attempt's process has now exited. Clear the dead pid
-            # IMMEDIATELY — before the (possibly slow) success-path git push/PR
-            # work below — so a concurrent create_record() orphan sweep in
-            # another process can't see a `running` record naming a now-dead pid
-            # and mark this in-flight delegation `orphaned`.
-            if status_record:
-                try:
-                    status_module.set_pid(status_record, None)
-                except Exception:
-                    pass
-
+            # The attempt's process has now exited.
             if result.success:
-                # The backend committed locally. Move the record into the
-                # non-orphanable `committing` phase BEFORE the (possibly slow)
-                # push/PR work below, so a concurrent SessionEnd cleanup or
-                # orphan sweep can't mark this already-landed work `orphaned`
-                # while the pid is cleared and the status is still `running`.
+                # Clear the dead pid AND enter the non-orphanable `committing`
+                # phase in ONE locked transition (begin_committing). Doing these
+                # as two separate writes left a gap where the record was
+                # `running` with pid=None — a concurrent SessionEnd cleanup could
+                # observe that intermediate state and orphan an already-committed
+                # delegation. The single transition closes that window before the
+                # (possibly slow) push/PR work below.
                 if status_record:
                     try:
-                        status_module.mark_committing(status_record)
+                        status_module.begin_committing(status_record)
                     except Exception:
                         pass
+                # Safe intermediate terminal state: the backend already committed
+                # locally, but status_final still holds the loop's default
+                # failed/failed here. If an UNhandled exception escapes the push/PR
+                # block below (e.g. an OSError from git push, which only the
+                # TimeoutExpired branch catches), the finally would finalize this
+                # already-committed delegation as `failed`. Record it as
+                # completed/committing now; the push-timeout, push-failure, and
+                # final-success paths overwrite this as needed.
+                status_final = {
+                    "status": "completed", "phase": "committing",
+                    "commit_sha": result.commit_sha,
+                }
                 note = None
                 pr_url = None
                 has_remote = await anyio.to_thread.run_sync(_has_origin_remote, repo_path)
@@ -760,6 +791,14 @@ async def _delegate_implementation_impl(
                     **({"note": note} if note else {}),
                 }
 
+            # Failed attempt. Clear the now-dead backend pid before looping to
+            # the next model (or exiting to the failed finalize), so a
+            # concurrent sweep doesn't see a `running` record naming a dead pid.
+            if status_record:
+                try:
+                    status_module.set_pid(status_record, None)
+                except Exception:
+                    pass
             attempt_errors.append(f"{model}: {result.error}")
             last_output_tail = result.output_tail
 
@@ -770,6 +809,19 @@ async def _delegate_implementation_impl(
         return {
             "success": False,
             "error": "all models failed — " + "; ".join(attempt_errors),
+            "output_tail": last_output_tail,
+            "output_log": str(output_log_path),
+        }
+    except _DelegationCancelled as e:
+        # A tracked push/PR child was cancelled because SessionEnd cleanup
+        # retired this record after the child spawned. The record is already
+        # terminal on disk (orphaned) — leave it: status_final=None tells the
+        # finally not to finalize over the cleanup's outcome. The dead child was
+        # already killed inside the tracked helper.
+        status_final = None
+        return {
+            "success": False,
+            "error": str(e),
             "output_tail": last_output_tail,
             "output_log": str(output_log_path),
         }

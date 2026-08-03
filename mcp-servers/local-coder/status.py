@@ -173,11 +173,25 @@ def _upsert_index(target_repo: str, record: dict) -> None:
     # via the shared stdlib-only locking primitive.
     lock_path = index_path.parent / f".{index_path.name}.lock"
     with file_lock(lock_path):
+        index = None
         if index_path.exists():
-            index = json.loads(index_path.read_text())
-        else:
+            # Tolerate a truncated/partial index (json.loads raises) or a valid-
+            # but-non-object index (`[]`, `null` -> .get raises AttributeError),
+            # exactly like list_records tolerates bad record files. Without this,
+            # a corrupt index would make EVERY later upsert fail — and worse, in
+            # cleanup_session it would raise AFTER the record was marked orphaned
+            # on disk but BEFORE the id is appended to `cleaned`, so SessionEnd
+            # reports the wrong cleaned set. Rebuild from empty instead.
+            try:
+                parsed = json.loads(index_path.read_text())
+                if isinstance(parsed, dict):
+                    index = parsed
+            except Exception as exc:
+                _warn("_upsert_index: rebuilding corrupt index", exc)
+        if index is None:
             index = {"version": 1, "jobs": []}
-        jobs = [job for job in index.get("jobs", []) if job.get("id") != summary["id"]]
+        jobs = [job for job in index.get("jobs", [])
+                if isinstance(job, dict) and job.get("id") != summary["id"]]
         jobs.append(summary)
         jobs.sort(key=lambda job: job.get("updatedAt") or "", reverse=True)
         _write_json(index_path, {"version": 1, "jobs": jobs[:_MAX_INDEX_JOBS]})
@@ -415,6 +429,20 @@ def mark_committing(record) -> None:
         _warn("mark_committing", exc)
 
 
+def begin_committing(record) -> None:
+    """Clear the backend pid AND enter the committing phase in ONE locked
+    transition. Doing these as two writes (set_pid(None) then mark_committing)
+    left an intermediate `running`/pid=None state a concurrent SessionEnd
+    cleanup could observe and orphan — even though the delegation had already
+    committed. Applying both fields under a single _patch_on_disk closes that
+    window. A terminal on-disk record is preserved by the guard."""
+    try:
+        _patch_on_disk(record, {"pid": None, "pidStart": None,
+                                "phase": _COMMITTING_PHASE})
+    except Exception as exc:
+        _warn("begin_committing", exc)
+
+
 def set_model(record, model) -> None:
     """Record the model this attempt is actually using. Called before each
     failover attempt so /status reports the model that performed (or is
@@ -512,6 +540,37 @@ def _age_seconds(iso_ts) -> float | None:
         return None
 
 
+def _prune_records(target_repo) -> None:
+    """Bound the state directory: keep only the newest _MAX_INDEX_JOBS records
+    (by updatedAt), and only prune TERMINAL ones — a still-running/committing
+    record is never deleted regardless of age. Deletes each pruned record's
+    `<id>.json` AND its `.<id>.json.lock`. Without this, two files accumulate
+    per delegation forever and list_records re-parses the whole history on every
+    create_record / SessionEnd. Non-fatal: never raises to the caller."""
+    try:
+        records = list_records(target_repo, all_sessions=True)
+        if len(records) <= _MAX_INDEX_JOBS:
+            return
+        # records are newest-first; everything past the cap is a prune candidate.
+        state_dir = resolve_state_dir(target_repo)
+        for record in records[_MAX_INDEX_JOBS:]:
+            if record.get("status") not in _TERMINAL_STATUSES:
+                continue  # keep live records even beyond the cap
+            job_id = record.get("id")
+            try:
+                _validated_job_id(job_id)
+            except Exception:
+                continue
+            for path in (state_dir / f"{job_id}.json",
+                         state_dir / f".{job_id}.json.lock"):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+    except Exception as exc:
+        _warn("_prune_records", exc)
+
+
 def sweep_orphans(target_repo) -> None:
     """Mark no-longer-running processes as orphaned without raising to callers.
 
@@ -578,6 +637,8 @@ def sweep_orphans(target_repo) -> None:
                 continue
     except Exception as exc:
         _warn("sweep_orphans", exc)
+    # Bound the state dir after each sweep (sweep runs on every create_record).
+    _prune_records(target_repo)
 
 
 def _terminate_process_tree(pid: int,
@@ -598,10 +659,17 @@ def _terminate_process_tree(pid: int,
     aider descendants (git, the model runner) are reaped rather than stranded.
     """
     if os.name == "nt":
+        # Respect an exhausted budget: with no grace left, don't spend even the
+        # taskkill wait — SessionEnd clamps grace to the deadline remainder, and
+        # a forced ≥1s wait per record would let several records overrun the
+        # hook timeout. The pid is already marked orphaned; leave it to the next
+        # run's sweep.
+        if grace_seconds <= 0:
+            return
         try:
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(pid)],
-                capture_output=True, timeout=max(1.0, grace_seconds),
+                capture_output=True, timeout=grace_seconds,
             )
         except Exception as exc:
             _warn("_terminate_process_tree(taskkill)", exc)
@@ -706,20 +774,41 @@ def cleanup_session(target_repo, session_id, deadline_seconds: float = 12.0) -> 
                         return False
                     pid = _as_valid_pid(current.get("pid"))
                     if current.get("phase") == _COMMITTING_PHASE and pid is None:
-                        # Committing with no tracked pid: we're in the brief
-                        # window BETWEEN two tracked push/PR subprocesses (or the
-                        # in-flight call is about to finalize). Nothing is running
-                        # to terminate, and orphaning here would trip the terminal
-                        # guard so the real finalize(completed) couldn't be
-                        # recorded. Leave it — the in-flight call finalizes it,
-                        # and the sweep's age-based committing recovery retires a
-                        # genuine crash. When a tracked push/PR IS live, pid is
-                        # set and we fall through to terminate it below.
-                        return False
+                        # Committing with no tracked pid: either the brief window
+                        # BETWEEN two tracked push/PR subprocesses (in-flight call
+                        # about to finalize), or a crashed committing record no
+                        # one will finalize. Distinguish by age off updatedAt,
+                        # exactly like sweep_orphans: a FRESH committing record is
+                        # left alone (the in-flight call finalizes it, and
+                        # orphaning it would trip the terminal guard); a STALE one
+                        # past the committing grace is retired here so it doesn't
+                        # stay reported `running` until another delegation starts.
+                        age = _age_seconds(current.get("updatedAt"))
+                        if age is None or age <= _COMMITTING_ORPHAN_SECONDS:
+                            return False
+                        current["status"] = "orphaned"
+                        current["phase"] = "failed"
+                        current["completedAt"] = _now()
+                        current["errorMessage"] = (
+                            "stuck in committing (push/PR) past "
+                            f"{_COMMITTING_ORPHAN_SECONDS}s; retired by cleanup"
+                        )
+                        return True
                     if pid is not None and time.monotonic() < overall_deadline \
                             and _pid_is_ours(current):
                         _holder["terminate"] = pid
                         _holder["token"] = current.get("pidStart")
+                    elif pid is not None:
+                        # We're about to mark the record terminal and clear its
+                        # pid, but we are NOT terminating this process (deadline
+                        # expired, or _pid_is_ours was false — e.g. no pidStart
+                        # token). Clearing pid outright would erase the only
+                        # record of a possibly-still-live process: no later sweep
+                        # can act (record is terminal), and _patch_on_disk refuses
+                        # to write a live pid back. Preserve it under a
+                        # non-authoritative key so /status and an operator can see
+                        # the potential leak.
+                        current["leakedPid"] = pid
                     current["status"] = "orphaned"
                     current["phase"] = "failed"
                     current["completedAt"] = _now()
@@ -729,7 +818,15 @@ def cleanup_session(target_repo, session_id, deadline_seconds: float = 12.0) -> 
                 persisted = _locked_record_update(target_repo, job_id, _apply)
                 if persisted is not None:
                     cleaned.append(job_id)
-                if holder["terminate"] is not None:
+                if holder["terminate"] is not None \
+                        and time.monotonic() < overall_deadline:
+                    # Once the overall deadline has passed, SKIP the revalidation
+                    # and termination entirely: the record is already marked
+                    # orphaned, and the revalidation alone (_pid_start_time runs
+                    # a `ps` with its own multi-second timeout) plus the grace
+                    # wait could push SessionEnd past its hook timeout. The pid is
+                    # left for the next run's sweep.
+                    #
                     # Re-validate the start-time token IMMEDIATELY before
                     # signalling. Between releasing the record lock and killing,
                     # the OS could recycle the pid onto an unrelated process; the

@@ -413,6 +413,90 @@ def test_committing_between_tracked_calls_survives_cleanup(repo):
     assert disk["status"] == "running" and disk["phase"] == "committing"
 
 
+def test_begin_committing_clears_pid_and_sets_phase_atomically(repo):
+    # cubic P2: pid clear + committing must be ONE transition so a concurrent
+    # cleanup never sees an intermediate running/pid=None record.
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+    status.set_pid(rec, 4321)
+    status.begin_committing(rec)
+    disk = status.read_record(status._record_path(repo, rec["id"]))
+    assert disk["pid"] is None
+    assert disk["pidStart"] is None
+    assert disk["phase"] == "committing" and disk["status"] == "running"
+
+
+def test_stale_committing_record_is_retired_by_session_end_cleanup(repo):
+    # cubic P2: a committing record with no pid that has sat past the grace
+    # (crash during push/PR) must be retired by cleanup too, not left running
+    # until the next delegation's sweep.
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+    status.begin_committing(rec)
+    p = status._record_path(repo, rec["id"])
+    j = status.read_record(p)
+    j["updatedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                   time.gmtime(time.time() - status._COMMITTING_ORPHAN_SECONDS - 60))
+    status._write_json(p, j)
+    cleaned = status.cleanup_session(repo, "S")
+    disk = status.read_record(p)
+    assert rec["id"] in cleaned
+    assert disk["status"] == "orphaned" and disk["phase"] == "failed"
+
+
+def test_cleanup_preserves_leaked_pid_when_not_terminated(repo, monkeypatch):
+    # CodeRabbit Major: when cleanup marks a record orphaned WITHOUT terminating
+    # its process (e.g. _pid_is_ours false — no pidStart token), the pid must be
+    # preserved under a non-authoritative key so the potential leak is visible.
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+    status.set_pid(rec, 700700)
+    monkeypatch.setattr(status, "_pid_is_ours", lambda cur: False)  # not ours -> no kill
+    status.cleanup_session(repo, "S")
+    disk = status.read_record(status._record_path(repo, rec["id"]))
+    assert disk["pid"] is None
+    assert disk["status"] == "orphaned"
+    assert disk.get("leakedPid") == 700700
+
+
+def test_upsert_index_rebuilds_corrupt_index(repo):
+    # CodeRabbit Major: a corrupt/non-object state.json must not make every later
+    # upsert fail. The index is rebuilt from empty instead.
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+    index_path = status.resolve_state_dir(repo) / status._INDEX_NAME
+    index_path.write_text("[]")  # valid JSON but non-object
+    # A subsequent write must not raise, and must produce a valid object index.
+    status.finalize(rec, status="completed", phase="done", commit_sha="z")
+    parsed = json.loads(index_path.read_text())
+    assert isinstance(parsed, dict) and "jobs" in parsed
+
+
+def test_prune_records_bounds_state_dir(repo, monkeypatch):
+    # CodeRabbit Major: the state dir must not grow without bound. Terminal
+    # records beyond the cap are deleted (files + lockfiles); live ones are kept.
+    monkeypatch.setattr(status, "_MAX_INDEX_JOBS", 3)
+    ids = []
+    for _ in range(6):
+        r = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+        status.finalize(r, status="completed", phase="done", commit_sha="c")
+        ids.append(r["id"])
+    status._prune_records(repo)
+    state_dir = status.resolve_state_dir(repo)
+    remaining = list(state_dir.glob("lc-*.json"))
+    assert len(remaining) <= 3
+    # oldest record's lockfile is gone too
+    oldest = ids[0]
+    assert not (state_dir / f".{oldest}.json.lock").exists()
+
+
+def test_prune_records_keeps_live_records_beyond_cap(repo, monkeypatch):
+    monkeypatch.setattr(status, "_MAX_INDEX_JOBS", 1)
+    live = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+    for _ in range(3):
+        r = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+        status.finalize(r, status="completed", phase="done", commit_sha="c")
+    status._prune_records(repo)
+    # the still-running record must survive even though it's beyond the cap
+    assert (status._record_path(repo, live["id"])).exists()
+
+
 def test_stale_committing_record_is_retired_by_sweep(repo):
     # A crash/cancellation during push/PR leaves a committing record with no
     # finalizer. The sweep must retire it once it exceeds the committing grace

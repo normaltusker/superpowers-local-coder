@@ -227,8 +227,13 @@ def check_ollama(model: str) -> dict:
 
 def check_config() -> dict:
     """config.yaml parses and has a sane model + positive stall timeout."""
-    import config  # lazy: keeps the `status` subcommand stdlib-only (no yaml)
     try:
+        # Lazy AND inside the try: config.py imports third-party yaml at module
+        # top, so on a stdlib-only fallback interpreter (venv not provisioned —
+        # exactly what check_venv diagnoses) `import config` raises ImportError.
+        # Catching it here reports config as NOT READY instead of crashing the
+        # whole `setup` command with a traceback.
+        import config
         cfg = config.load_config()
     except Exception as e:
         return {"name": "config", "ok": False, "detail": f"config failed to load: {e}",
