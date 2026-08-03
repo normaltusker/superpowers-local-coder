@@ -121,8 +121,11 @@ async def test_delegate_implementation_pushes_when_remote_exists(isolated_config
         check=True, capture_output=True,
     )
     fake_result = CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
+    # push now runs through the tracked-subprocess helper; spy on it (wraps, so
+    # the real push still happens against the test remote).
     with patch("backends.aider.AiderBackend.run_backend", return_value=fake_result):
-        with patch("subprocess.run", wraps=subprocess.run) as spy:
+        with patch("server._run_tracked_subprocess",
+                   wraps=server._run_tracked_subprocess) as spy:
             result = await server._delegate_implementation_impl(
                 task="add a.py", branch="local-coder/feature-branch",
                 target_repo_path=str(git_repo_with_remote),
@@ -774,15 +777,14 @@ async def test_delegate_implementation_push_timeout_returns_clean_error(isolated
     )
     fake_result = CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
-    real_run = subprocess.run
-
-    def fake_subprocess_run(cmd, *args, **kwargs):
+    # push/PR now run through the tracked-subprocess helper; intercept it.
+    def fake_tracked(cmd, **kwargs):
         if "push" in cmd:
             raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 30))
-        return real_run(cmd, *args, **kwargs)
+        raise AssertionError(f"unexpected tracked cmd: {cmd}")
 
     with patch("backends.aider.AiderBackend.run_backend", return_value=fake_result):
-        with patch("subprocess.run", side_effect=fake_subprocess_run):
+        with patch("server._run_tracked_subprocess", side_effect=fake_tracked):
             result = await server._delegate_implementation_impl(
                 task="add a.py", branch="feature-branch",
                 target_repo_path=str(git_repo_with_remote),
@@ -802,15 +804,13 @@ async def test_delegate_implementation_push_failure_includes_evidence(isolated_c
     )
     fake_result = CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
-    real_run = subprocess.run
-
-    def fake_subprocess_run(cmd, *args, **kwargs):
+    def fake_tracked(cmd, **kwargs):
         if "push" in cmd:
             return MagicMock(returncode=1, stdout="", stderr="rejected: non-fast-forward")
-        return real_run(cmd, *args, **kwargs)
+        raise AssertionError(f"unexpected tracked cmd: {cmd}")
 
     with patch("backends.aider.AiderBackend.run_backend", return_value=fake_result):
-        with patch("subprocess.run", side_effect=fake_subprocess_run):
+        with patch("server._run_tracked_subprocess", side_effect=fake_tracked):
             result = await server._delegate_implementation_impl(
                 task="add a.py", branch="feature-branch",
                 target_repo_path=str(git_repo_with_remote),
@@ -825,13 +825,14 @@ async def test_delegate_implementation_push_failure_includes_evidence(isolated_c
 
 def test_has_open_pr_returns_false_for_clean_no_pr_case():
     fake_result = MagicMock(returncode=1, stdout="", stderr='no pull requests found for branch "feature-x"\n')
-    with patch("subprocess.run", return_value=fake_result):
+    # gh pr view now goes through the tracked-subprocess helper.
+    with patch("server._run_tracked_subprocess", return_value=fake_result):
         assert server._has_open_pr("/some/repo", "feature-x") is False
 
 
 def test_has_open_pr_returns_true_when_pr_exists():
     fake_result = MagicMock(returncode=0, stdout="https://github.com/org/repo/pull/1\n", stderr="")
-    with patch("subprocess.run", return_value=fake_result):
+    with patch("server._run_tracked_subprocess", return_value=fake_result):
         assert server._has_open_pr("/some/repo", "feature-x") is True
 
 
@@ -841,7 +842,7 @@ def test_has_open_pr_raises_on_ambiguous_gh_failure():
     # that could trigger an unwanted `gh pr create` and either mask a real
     # `gh` problem or create a duplicate PR.
     fake_result = MagicMock(returncode=1, stdout="", stderr="error connecting to api.github.com\n")
-    with patch("subprocess.run", return_value=fake_result):
+    with patch("server._run_tracked_subprocess", return_value=fake_result):
         with pytest.raises(server.GhPrStatusUnknown):
             server._has_open_pr("/some/repo", "feature-x")
 
@@ -856,17 +857,17 @@ async def test_delegate_implementation_ambiguous_pr_status_skips_pr_create_with_
     config_module.merge_config({"open_pr": True})
     fake_result = CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
-    real_run = subprocess.run
-
-    def fake_subprocess_run(cmd, *args, **kwargs):
+    def fake_tracked(cmd, **kwargs):
+        if "push" in cmd:
+            return MagicMock(returncode=0, stdout="", stderr="")
         if "gh" in cmd and "view" in cmd:
             return MagicMock(returncode=1, stdout="", stderr="error connecting to api.github.com\n")
         if "gh" in cmd and "create" in cmd:
             raise AssertionError("gh pr create should not be attempted when PR status is ambiguous")
-        return real_run(cmd, *args, **kwargs)
+        raise AssertionError(f"unexpected tracked cmd: {cmd}")
 
     with patch("backends.aider.AiderBackend.run_backend", return_value=fake_result):
-        with patch("subprocess.run", side_effect=fake_subprocess_run):
+        with patch("server._run_tracked_subprocess", side_effect=fake_tracked):
             result = await server._delegate_implementation_impl(
                 task="add a.py", branch="local-coder/feature-branch",
                 target_repo_path=str(git_repo_with_remote),
@@ -888,17 +889,17 @@ async def test_delegate_implementation_pr_create_failure_reported_as_note_not_si
     config_module.merge_config({"open_pr": True})
     fake_result = CompletionResult(success=True, files_changed=["a.py"], commit_sha="abc123")
 
-    real_run = subprocess.run
-
-    def fake_subprocess_run(cmd, *args, **kwargs):
+    def fake_tracked(cmd, **kwargs):
+        if "push" in cmd:
+            return MagicMock(returncode=0, stdout="", stderr="")
         if "gh" in cmd and "view" in cmd:
             return MagicMock(returncode=1, stdout="", stderr='no pull requests found for branch "local-coder/feature-branch"\n')
         if "gh" in cmd and "create" in cmd:
             return MagicMock(returncode=1, stdout="", stderr="pull request create failed: already exists")
-        return real_run(cmd, *args, **kwargs)
+        raise AssertionError(f"unexpected tracked cmd: {cmd}")
 
     with patch("backends.aider.AiderBackend.run_backend", return_value=fake_result):
-        with patch("subprocess.run", side_effect=fake_subprocess_run):
+        with patch("server._run_tracked_subprocess", side_effect=fake_tracked):
             result = await server._delegate_implementation_impl(
                 task="add a.py", branch="local-coder/feature-branch",
                 target_repo_path=str(git_repo_with_remote),

@@ -378,13 +378,32 @@ def test_committing_phase_is_not_orphaned_by_sweep(repo):
     assert disk["status"] == "running" and disk["phase"] == "committing"
 
 
-def test_committing_record_survives_session_end_cleanup(repo):
-    # A committing record's push/PR runs inside the synchronous delegation call
-    # in the MCP server process — it has no tracked child pid. SessionEnd
-    # cleanup must NOT mark it orphaned: doing so would retire a record whose
-    # work is still live and untracked, and trip the terminal guard so the real
-    # finalize(completed) could never be recorded. The in-flight call finalizes
-    # it; the sweep's age-based recovery covers a genuine crash.
+def test_committing_with_live_tracked_pid_is_terminated_by_cleanup(repo, monkeypatch):
+    # When a push/PR subprocess is live during committing, its pid is tracked on
+    # the record. SessionEnd cleanup must terminate that process AND mark the
+    # record orphaned truthfully — not leave a live untracked subprocess.
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+    status.mark_committing(rec)
+    status.set_pid(rec, 550050)  # a tracked, live push/PR pid
+    monkeypatch.setattr(status, "_pid_is_ours", lambda cur: True)
+    monkeypatch.setattr(status, "_pid_start_time",
+                        lambda pid: status.read_record(
+                            status._record_path(repo, rec["id"])).get("pidStart"))
+    killed = {}
+    monkeypatch.setattr(status, "_terminate_process_tree",
+                        lambda pid, grace_seconds=3.0: killed.setdefault("pid", pid))
+    cleaned = status.cleanup_session(repo, "S")
+    disk = status.read_record(status._record_path(repo, rec["id"]))
+    assert killed.get("pid") == 550050        # the live push/PR was terminated
+    assert rec["id"] in cleaned
+    assert disk["status"] == "orphaned" and disk["phase"] == "failed"
+
+
+def test_committing_between_tracked_calls_survives_cleanup(repo):
+    # Committing with NO tracked pid (the brief window between two push/PR
+    # subprocesses, or just before finalize): nothing is running to kill, and
+    # orphaning would trip the terminal guard. Leave it for the in-flight call
+    # to finalize (sweep age-recovery covers a real crash).
     rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
     status.set_pid(rec, None)
     status.mark_committing(rec)

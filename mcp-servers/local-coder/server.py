@@ -215,17 +215,79 @@ class GhPrStatusUnknown(Exception):
     duplicate PR) or silently mask a real `gh` problem."""
 
 
-def _has_open_pr(repo_path: str, branch: str) -> bool:
-    result = subprocess.run(
+def _has_open_pr(repo_path: str, branch: str, status_record=None) -> bool:
+    # Tracked so a SessionEnd during this network call can terminate it; the pid
+    # is recorded on the committing record and cleared on return.
+    result = _run_tracked_subprocess(
         ["gh", "pr", "view", branch],
-        cwd=repo_path, capture_output=True, text=True,
-        timeout=NETWORK_SUBPROCESS_TIMEOUT_SECONDS,
+        cwd=repo_path, timeout=NETWORK_SUBPROCESS_TIMEOUT_SECONDS,
+        status_record=status_record,
     )
     if result.returncode == 0:
         return True
     if "no pull requests found" in result.stderr.lower():
         return False
     raise GhPrStatusUnknown(result.stderr.strip() or "gh pr view failed with no stderr output")
+
+
+class _TrackedResult:
+    """Minimal subprocess.run-like result for the tracked post-processing
+    helper: exposes returncode/stdout/stderr so existing call sites are
+    unchanged."""
+    __slots__ = ("returncode", "stdout", "stderr")
+
+    def __init__(self, returncode, stdout, stderr):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _run_tracked_subprocess(cmd, *, cwd, timeout, status_record):
+    """Run a post-processing subprocess (git push / gh pr) as a TRACKED,
+    session-isolated child so SessionEnd cleanup can terminate it.
+
+    The push/PR phase runs after the backend pid was cleared. Without tracking,
+    a SessionEnd during a live push would leave that subprocess running
+    untracked (cleanup has no pid to kill) — so we spawn it in its OWN session
+    (start_new_session=True, making it a group leader) and record its pid on the
+    status record via set_pid, exactly like the backend. cleanup_session's
+    _terminate_process_tree then group-kills the whole push/PR tree.
+
+    On return (success, failure, or timeout) the pid is cleared again so a later
+    orphan sweep can't see a dead pid. Raises subprocess.TimeoutExpired on
+    timeout (after killing the tree), matching subprocess.run so the existing
+    TimeoutExpired handlers apply. OSError (e.g. `gh` not installed) propagates
+    as before.
+    """
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True,
+    )
+    if status_record is not None:
+        try:
+            status_module.set_pid(status_record, proc.pid)
+        except Exception:
+            pass
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Kill the whole session-group tree, then reap, then re-raise so the
+            # caller's existing TimeoutExpired branch records the outcome.
+            status_module._terminate_process_tree(proc.pid)
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                pass
+            raise
+        return _TrackedResult(proc.returncode, stdout, stderr)
+    finally:
+        if status_record is not None:
+            try:
+                status_module.set_pid(status_record, None)
+            except Exception:
+                pass
 
 
 async def _delegate_implementation_impl(
@@ -571,10 +633,11 @@ async def _delegate_implementation_impl(
                 if has_remote:
                     try:
                         push = await anyio.to_thread.run_sync(
-                            lambda: subprocess.run(
+                            lambda: _run_tracked_subprocess(
                                 ["git", "-C", repo_path, "push", "-u", "origin", branch],
-                                capture_output=True, text=True,
+                                cwd=None,
                                 timeout=NETWORK_SUBPROCESS_TIMEOUT_SECONDS,
+                                status_record=status_record,
                             )
                         )
                     except subprocess.TimeoutExpired:
@@ -623,7 +686,8 @@ async def _delegate_implementation_impl(
 
                     if cfg.get("open_pr"):
                         try:
-                            has_open_pr = await anyio.to_thread.run_sync(_has_open_pr, repo_path, branch)
+                            has_open_pr = await anyio.to_thread.run_sync(
+                                _has_open_pr, repo_path, branch, status_record)
                         except GhPrStatusUnknown as e:
                             # gh pr view failed for a reason other than "no PR" —
                             # don't guess; skip PR creation rather than risk a
@@ -646,11 +710,12 @@ async def _delegate_implementation_impl(
                         if not has_open_pr:
                             try:
                                 pr = await anyio.to_thread.run_sync(
-                                    lambda: subprocess.run(
+                                    lambda: _run_tracked_subprocess(
                                         ["gh", "pr", "create", "--fill", "--head", branch,
                                          "--base", cfg["pr_base_branch"]],
-                                        cwd=repo_path, capture_output=True, text=True,
+                                        cwd=repo_path,
                                         timeout=NETWORK_SUBPROCESS_TIMEOUT_SECONDS,
+                                        status_record=status_record,
                                     )
                                 )
                             except subprocess.TimeoutExpired:

@@ -704,19 +704,18 @@ def cleanup_session(target_repo, session_id, deadline_seconds: float = 12.0) -> 
                 def _apply(current, _holder=holder):
                     if current.get("status") != "running":
                         return False
-                    if current.get("phase") == _COMMITTING_PHASE:
-                        # Landed work mid push/PR. Its pid is already None — the
-                        # push/PR runs IN the (synchronous) delegation call in
-                        # the MCP server process, not a tracked child — so we
-                        # have no process to terminate here. Marking it orphaned
-                        # would (a) retire a record whose work is still live and
-                        # untracked, and (b) trip the terminal guard so the real
-                        # finalize(completed) can never be recorded. Leave it
-                        # alone: the in-flight call finalizes it on its own, and
-                        # the sweep's age-based committing recovery retires it if
-                        # the process genuinely crashed.
-                        return False
                     pid = _as_valid_pid(current.get("pid"))
+                    if current.get("phase") == _COMMITTING_PHASE and pid is None:
+                        # Committing with no tracked pid: we're in the brief
+                        # window BETWEEN two tracked push/PR subprocesses (or the
+                        # in-flight call is about to finalize). Nothing is running
+                        # to terminate, and orphaning here would trip the terminal
+                        # guard so the real finalize(completed) couldn't be
+                        # recorded. Leave it — the in-flight call finalizes it,
+                        # and the sweep's age-based committing recovery retires a
+                        # genuine crash. When a tracked push/PR IS live, pid is
+                        # set and we fall through to terminate it below.
+                        return False
                     if pid is not None and time.monotonic() < overall_deadline \
                             and _pid_is_ours(current):
                         _holder["terminate"] = pid
