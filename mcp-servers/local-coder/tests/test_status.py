@@ -378,16 +378,37 @@ def test_committing_phase_is_not_orphaned_by_sweep(repo):
     assert disk["status"] == "running" and disk["phase"] == "committing"
 
 
-def test_committing_phase_is_not_orphaned_by_cleanup(repo):
-    # Same guarantee for SessionEnd cleanup: a committing (pid-cleared) record
-    # must survive teardown so finalize can record its real outcome.
+def test_committing_record_is_retired_by_session_end_cleanup(repo):
+    # SessionEnd for the record's OWN session: the MCP server that would
+    # finalize the push/PR is being torn down, so a committing record can't
+    # complete. It must be retired (pid already None -> no kill) rather than
+    # left stuck running/committing forever.
     rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
     status.set_pid(rec, None)
     status.mark_committing(rec)
     cleaned = status.cleanup_session(repo, "S")
     disk = status.read_record(status._record_path(repo, rec["id"]))
-    assert rec["id"] not in cleaned
-    assert disk["status"] == "running" and disk["phase"] == "committing"
+    assert rec["id"] in cleaned
+    assert disk["status"] == "orphaned" and disk["phase"] == "failed"
+
+
+def test_stale_committing_record_is_retired_by_sweep(repo):
+    # A crash/cancellation during push/PR leaves a committing record with no
+    # finalizer. The sweep must retire it once it exceeds the committing grace
+    # window (aged off updatedAt), so it can't stay running forever.
+    rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
+    status.set_pid(rec, None)
+    status.mark_committing(rec)
+    # Backdate updatedAt beyond the committing grace.
+    p = status._record_path(repo, rec["id"])
+    j = status.read_record(p)
+    old = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                        time.gmtime(time.time() - status._COMMITTING_ORPHAN_SECONDS - 60))
+    j["updatedAt"] = old
+    status._write_json(p, j)
+    status.sweep_orphans(repo)
+    disk = status.read_record(p)
+    assert disk["status"] == "orphaned" and disk["phase"] == "failed"
 
 
 def test_cleanup_grace_is_clamped_to_remaining_budget(repo, monkeypatch):

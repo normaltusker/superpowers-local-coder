@@ -30,6 +30,14 @@ _MAX_INDEX_JOBS = 50
 # sweep retires it as orphaned. Generous enough not to trip a normal startup
 # (backend spawn + cold model load happen well within it).
 _NO_PID_ORPHAN_SECONDS = 600
+# A record in the non-orphanable `committing` phase (backend done, doing the
+# network-bound git push / PR creation) is protected from the sweep so landed
+# work isn't misreported orphaned mid-push. But if the process crashes or is
+# cancelled during that work, nothing finalizes the record — without a bound it
+# would stay `running`/`committing` forever with no recovery path. So the sweep
+# retires a committing record too once it exceeds this window. Generous, since
+# push/PR is network-bound and slower than a local backend run.
+_COMMITTING_ORPHAN_SECONDS = 1800
 # Default SIGTERM→SIGKILL grace for a single process-tree teardown. cleanup
 # clamps this to the budget remaining on its overall deadline so many live
 # records can't push SessionEnd past its hook timeout.
@@ -531,9 +539,23 @@ def sweep_orphans(target_repo) -> None:
                         return False  # already terminal or changed since snapshot
                     if current.get("phase") == _COMMITTING_PHASE:
                         # Backend finished, local commit exists, push/PR in
-                        # progress — landed work, not an orphan. Leave it for
-                        # finalize to record as completed.
-                        return False
+                        # progress — landed work, not an orphan while it's still
+                        # progressing. But a crash/cancellation during push/PR
+                        # leaves nothing to finalize it, so retire it once it has
+                        # sat in committing past the grace window (aged off
+                        # updatedAt, which mark_committing refreshed). Fresh
+                        # committing records stay protected.
+                        age = _age_seconds(current.get("updatedAt"))
+                        if age is None or age <= _COMMITTING_ORPHAN_SECONDS:
+                            return False
+                        current["status"] = "orphaned"
+                        current["phase"] = "failed"
+                        current["completedAt"] = _now()
+                        current["errorMessage"] = (
+                            "stuck in committing (push/PR) past "
+                            f"{_COMMITTING_ORPHAN_SECONDS}s; retired by sweep"
+                        )
+                        return True
                     pid = _as_valid_pid(current.get("pid"))
                     if pid is not None:
                         if _pid_alive(pid):
@@ -682,10 +704,13 @@ def cleanup_session(target_repo, session_id, deadline_seconds: float = 12.0) -> 
                 def _apply(current, _holder=holder):
                     if current.get("status") != "running":
                         return False
-                    if current.get("phase") == _COMMITTING_PHASE:
-                        # Landed work mid push/PR (pid already cleared). Do not
-                        # orphan it — finalize will record the real outcome.
-                        return False
+                    # NOTE: a `committing` record is NOT exempt here. This is
+                    # SessionEnd for the record's own session — the MCP server
+                    # that would finalize the push/PR is being torn down, so the
+                    # committing work can't complete. Retire it (its pid is
+                    # already None, so no process is killed) rather than leave it
+                    # stuck `running`/`committing` forever. The sweep's age-based
+                    # committing recovery covers the cross-session case.
                     pid = _as_valid_pid(current.get("pid"))
                     if pid is not None and time.monotonic() < overall_deadline \
                             and _pid_is_ours(current):
