@@ -704,13 +704,18 @@ def cleanup_session(target_repo, session_id, deadline_seconds: float = 12.0) -> 
                 def _apply(current, _holder=holder):
                     if current.get("status") != "running":
                         return False
-                    # NOTE: a `committing` record is NOT exempt here. This is
-                    # SessionEnd for the record's own session — the MCP server
-                    # that would finalize the push/PR is being torn down, so the
-                    # committing work can't complete. Retire it (its pid is
-                    # already None, so no process is killed) rather than leave it
-                    # stuck `running`/`committing` forever. The sweep's age-based
-                    # committing recovery covers the cross-session case.
+                    if current.get("phase") == _COMMITTING_PHASE:
+                        # Landed work mid push/PR. Its pid is already None — the
+                        # push/PR runs IN the (synchronous) delegation call in
+                        # the MCP server process, not a tracked child — so we
+                        # have no process to terminate here. Marking it orphaned
+                        # would (a) retire a record whose work is still live and
+                        # untracked, and (b) trip the terminal guard so the real
+                        # finalize(completed) can never be recorded. Leave it
+                        # alone: the in-flight call finalizes it on its own, and
+                        # the sweep's age-based committing recovery retires it if
+                        # the process genuinely crashed.
+                        return False
                     pid = _as_valid_pid(current.get("pid"))
                     if pid is not None and time.monotonic() < overall_deadline \
                             and _pid_is_ours(current):

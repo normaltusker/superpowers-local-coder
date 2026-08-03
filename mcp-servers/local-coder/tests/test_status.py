@@ -378,18 +378,20 @@ def test_committing_phase_is_not_orphaned_by_sweep(repo):
     assert disk["status"] == "running" and disk["phase"] == "committing"
 
 
-def test_committing_record_is_retired_by_session_end_cleanup(repo):
-    # SessionEnd for the record's OWN session: the MCP server that would
-    # finalize the push/PR is being torn down, so a committing record can't
-    # complete. It must be retired (pid already None -> no kill) rather than
-    # left stuck running/committing forever.
+def test_committing_record_survives_session_end_cleanup(repo):
+    # A committing record's push/PR runs inside the synchronous delegation call
+    # in the MCP server process — it has no tracked child pid. SessionEnd
+    # cleanup must NOT mark it orphaned: doing so would retire a record whose
+    # work is still live and untracked, and trip the terminal guard so the real
+    # finalize(completed) could never be recorded. The in-flight call finalizes
+    # it; the sweep's age-based recovery covers a genuine crash.
     rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S")
     status.set_pid(rec, None)
     status.mark_committing(rec)
     cleaned = status.cleanup_session(repo, "S")
     disk = status.read_record(status._record_path(repo, rec["id"]))
-    assert rec["id"] in cleaned
-    assert disk["status"] == "orphaned" and disk["phase"] == "failed"
+    assert rec["id"] not in cleaned
+    assert disk["status"] == "running" and disk["phase"] == "committing"
 
 
 def test_stale_committing_record_is_retired_by_sweep(repo):
