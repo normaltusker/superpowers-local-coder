@@ -1,4 +1,6 @@
 import json, time
+import subprocess
+import sys
 from pathlib import Path
 import pytest
 import config
@@ -10,6 +12,18 @@ def repo(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_PLUGIN_DATA", str(data))
     r = tmp_path / "repo"; r.mkdir()
     return str(r)
+
+
+def dead_pid():
+    """A deterministically-dead pid: spawn a trivial child, reap it, return its
+    pid. A hardcoded sentinel like 999999 can be a LIVE pid on a busy host
+    (pid_max is 4194304 on 64-bit Linux), which makes sweep/cleanup tests flaky
+    and — worse — can send real SIGTERM/SIGKILL to an unrelated process, since
+    set_pid captures a live foreign pid's start token and _pid_is_ours accepts
+    it. Reaping our own child guarantees the pid is dead and unclaimed."""
+    proc = subprocess.Popen([sys.executable, "-c", ""])
+    proc.wait()
+    return proc.pid
 
 def test_create_record_writes_running_record(repo):
     rec = status.create_record(repo, branch="dev", model="ollama/qwen2.5-coder:7b",
@@ -54,7 +68,7 @@ def test_finalize_sets_terminal_state(repo):
 
 def test_sweep_marks_dead_pid_running_as_orphaned(repo):
     rec = status.create_record(repo, "dev", "m", "/tmp/x.log")
-    status.set_pid(rec, 999999)
+    status.set_pid(rec, dead_pid())
     status.sweep_orphans(repo)
     jf = json.loads((status.resolve_state_dir(repo) / f"{rec['id']}.json").read_text())
     assert jf["status"] == "orphaned"
@@ -102,7 +116,7 @@ def test_cleanup_session_kills_live_orphan_and_marks_orphaned(repo):
 
 def test_cleanup_session_marks_dead_pid_orphan_without_error(repo):
     rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="S2")
-    status.set_pid(rec, 999999)  # not alive
+    status.set_pid(rec, dead_pid())  # deterministically dead
     cleaned = status.cleanup_session(repo, "S2")
     assert rec["id"] in cleaned
     jf = json.loads((status.resolve_state_dir(repo) / f"{rec['id']}.json").read_text())
@@ -111,7 +125,7 @@ def test_cleanup_session_marks_dead_pid_orphan_without_error(repo):
 
 def test_cleanup_session_ignores_other_sessions(repo):
     rec = status.create_record(repo, "dev", "m", "/tmp/x.log", session_id="MINE")
-    status.set_pid(rec, 999999)
+    status.set_pid(rec, dead_pid())
     cleaned = status.cleanup_session(repo, "OTHER")
     assert cleaned == []
     jf = json.loads((status.resolve_state_dir(repo) / f"{rec['id']}.json").read_text())
@@ -240,7 +254,7 @@ def test_progress_update_does_not_revive_terminal_record(repo):
 
 def test_sweep_does_not_clobber_finalized_record(repo):
     rec = status.create_record(repo, "dev", "m", "/tmp/x.log")
-    status.set_pid(rec, 999999)  # dead pid
+    status.set_pid(rec, dead_pid())  # deterministically dead
     status.finalize(rec, status="completed", phase="done", commit_sha="c")
     status.sweep_orphans(repo)  # must not flip completed -> orphaned
     jf = status.read_record(status._record_path(repo, rec["id"]))
@@ -263,7 +277,7 @@ def test_cleanup_session_survives_malformed_pid_record(repo):
     d = status.read_record(status._record_path(repo, bad["id"])); d["pid"] = "123"
     status._write_json(status._record_path(repo, bad["id"]), d)
     good = status.create_record(repo, "dev", "m", "/tmp/y.log", session_id="S")
-    status.set_pid(good, 999999)  # dead pid
+    status.set_pid(good, dead_pid())  # deterministically dead
     cleaned = status.cleanup_session(repo, "S")
     assert bad["id"] in cleaned and good["id"] in cleaned
 
@@ -272,7 +286,7 @@ def test_sweep_survives_malformed_pid_record(repo):
     d = status.read_record(status._record_path(repo, bad["id"])); d["pid"] = "abc"
     status._write_json(status._record_path(repo, bad["id"]), d)
     other = status.create_record(repo, "dev", "m", "/tmp/y.log")
-    status.set_pid(other, 999999)
+    status.set_pid(other, dead_pid())
     status.sweep_orphans(repo)  # must not raise
     assert status.read_record(status._record_path(repo, other["id"]))["status"] == "orphaned"
 
